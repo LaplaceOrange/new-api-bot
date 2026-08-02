@@ -158,6 +158,8 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		)
 		return
 	}
+	// 兼容用户按帮助文本输入 <参数> 且未额外添加空格的情况。
+	content = strings.TrimSpace(strings.NewReplacer("<", " ", ">", " ").Replace(content))
 	fields := strings.Fields(content)
 	if len(fields) == 0 {
 		return
