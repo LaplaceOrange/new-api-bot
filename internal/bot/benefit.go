@@ -166,7 +166,9 @@ func (s *Service) decryptBenefitCodes(campaign model.BenefitCampaign) ([]string,
 }
 
 func benefitMessage(campaign model.BenefitCampaign, codes []string) string {
-	lines := []string{"<@everyone>", fmt.Sprintf("🎁 发放福利：每个 $%s，共 %d 个，有效期 %d h。", campaign.DisplayCredit, campaign.Count, campaign.ValidHours), fmt.Sprintf("⚠️ 每个用户限领一个；有效期内领取超过一个将被封禁 %d day。", campaign.BanDays)}
+	// QQ 官方消息语法中 @全体成员使用纯文本标记 @everyone，
+	// <@...> 仅适用于指定用户 OpenID，不能用于 everyone。
+	lines := []string{"@everyone", fmt.Sprintf("🎁 发放福利：每个 $%s，共 %d 个，有效期 %d h。", campaign.DisplayCredit, campaign.Count, campaign.ValidHours), fmt.Sprintf("⚠️ 每个用户限领一个；有效期内领取超过一个将被封禁 %d day。", campaign.BanDays)}
 	return strings.Join(append(lines, codes...), "\n")
 }
 
