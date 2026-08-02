@@ -1039,6 +1039,9 @@ func publicError(err error) string {
 		return "操作失败"
 	}
 	text := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(err.Error(), "\r", " "), "\n", " "))
+	if strings.Contains(strings.ToLower(text), "no permission to update users of same or higher permission level") {
+		return "该用户已经是管理员。"
+	}
 	if len([]rune(text)) > 350 {
 		text = string([]rune(text)[:350]) + "…"
 	}
