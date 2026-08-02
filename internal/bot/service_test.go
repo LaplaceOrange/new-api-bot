@@ -24,6 +24,8 @@ type fakeNewAPI struct {
 	quotaSubs     int
 	lastQuotaUser int
 	lastQuota     int64
+	subscriptions map[int][]newapi.UserSubscriptionRecord
+	nextSubID     int
 }
 
 func (f *fakeNewAPI) GetStatus(context.Context, bool) (newapi.Status, error) {
@@ -47,6 +49,33 @@ func (f *fakeNewAPI) SubtractQuota(_ context.Context, userID int, quota int64) e
 	f.quotaSubs++
 	f.lastQuotaUser = userID
 	f.lastQuota = quota
+	return nil
+}
+func (f *fakeNewAPI) ListUserSubscriptions(_ context.Context, userID int) ([]newapi.UserSubscriptionRecord, error) {
+	records := f.subscriptions[userID]
+	return append([]newapi.UserSubscriptionRecord(nil), records...), nil
+}
+func (f *fakeNewAPI) CreateUserSubscription(_ context.Context, userID, planID int) error {
+	f.nextSubID++
+	now := time.Now().Unix()
+	record := newapi.UserSubscriptionRecord{Subscription: newapi.UserSubscription{
+		ID: f.nextSubID, UserID: userID, PlanID: planID, Status: "active",
+		StartTime: now, EndTime: now + 30*24*60*60, CreatedAt: now,
+	}}
+	f.subscriptions[userID] = append(f.subscriptions[userID], record)
+	return nil
+}
+func (f *fakeNewAPI) InvalidateUserSubscription(_ context.Context, subscriptionID int) error {
+	for userID, records := range f.subscriptions {
+		for index := range records {
+			if records[index].Subscription.ID == subscriptionID {
+				records[index].Subscription.Status = "cancelled"
+				records[index].Subscription.EndTime = time.Now().Unix()
+				f.subscriptions[userID] = records
+				return nil
+			}
+		}
+	}
 	return nil
 }
 
@@ -102,7 +131,10 @@ func testService(t *testing.T) (*Service, *store.Store, *fakeNewAPI, *fakeQQ, *f
 		GatewayWorkers:      2,
 		MessageDedupTTL:     time.Hour,
 	}
-	api := &fakeNewAPI{user: newapi.User{ID: 42, Username: "alice", Email: "alice@example.com", Status: 1}}
+	api := &fakeNewAPI{
+		user:          newapi.User{ID: 42, Username: "alice", Email: "alice@example.com", Status: 1},
+		subscriptions: make(map[int][]newapi.UserSubscriptionRecord),
+	}
 	qqAPI := &fakeQQ{}
 	mail := &fakeMailer{}
 	service := New(cfg, storage, box, api, qqAPI, mail, slog.New(slog.NewTextHandler(bytes.NewBuffer(nil), nil)))
@@ -259,6 +291,57 @@ func TestCreditMentionTargetAndSubtractFloor(t *testing.T) {
 	service.process(context.Background(), event)
 	if api.quotaSubs != 1 || api.lastQuotaUser != 42 || api.lastQuota != 500000 {
 		t.Fatalf("subtract: subs=%d user=%d quota=%d", api.quotaSubs, api.lastQuotaUser, api.lastQuota)
+	}
+}
+
+func TestPlanAdminAndSelfViewFlow(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 7, Email: "admin@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:target", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	event := groupEvent("g1", "admin", "/plan add 3 @alice")
+	event.Message.Mentions = []qq.MessageAuthor{{MemberOpenID: "target", Username: "alice"}}
+	service.process(context.Background(), event)
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "订阅添加成功") || !strings.Contains(reply, "当前订阅编号：1") {
+		t.Fatalf("unexpected add reply: %q", reply)
+	}
+	newer := time.Now().Unix() + 10
+	api.subscriptions[42] = append(api.subscriptions[42], newapi.UserSubscriptionRecord{Subscription: newapi.UserSubscription{
+		ID: 2, UserID: 42, PlanID: 4, Status: "expired", StartTime: newer, EndTime: newer + 60, CreatedAt: newer,
+	}})
+	api.nextSubID = 2
+
+	service.process(context.Background(), groupEvent("g1", "target", "/plan view"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "订阅编号：1") || !strings.Contains(reply, "订阅编号：2") || !strings.Contains(reply, "生效中") || !strings.Contains(reply, "开始时间") || !strings.Contains(reply, "结束时间") {
+		t.Fatalf("unexpected self view reply: %q", reply)
+	} else if strings.Index(reply, "订阅编号：2") > strings.Index(reply, "订阅编号：1") {
+		t.Fatalf("subscriptions are not sorted newest first: %q", reply)
+	}
+
+	event.Message.ID = "plan-sub"
+	event.Message.Content = "/plan sub 1 @alice"
+	service.process(context.Background(), event)
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "取消订阅成功") || !strings.Contains(reply, "当前订阅编号：1") {
+		t.Fatalf("unexpected sub reply: %q", reply)
+	}
+	if got := api.subscriptions[42][0].Subscription.Status; got != "cancelled" {
+		t.Fatalf("subscription status=%q", got)
+	}
+}
+
+func TestPlanViewOtherRequiresAdmin(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:u1", NewAPIID: 9, Email: "u1@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	service.process(context.Background(), groupEvent("g1", "u1", "/plan view 42"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "没有查看其他用户订阅的权限") {
+		t.Fatalf("unexpected permission reply: %q", reply)
 	}
 }
 

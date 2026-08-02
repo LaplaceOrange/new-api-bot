@@ -71,6 +71,24 @@ type Redemption struct {
 	ExpiredTime int64  `json:"expired_time"`
 }
 
+type UserSubscription struct {
+	ID          int    `json:"id"`
+	UserID      int    `json:"user_id"`
+	PlanID      int    `json:"plan_id"`
+	Status      string `json:"status"`
+	Source      string `json:"source"`
+	StartTime   int64  `json:"start_time"`
+	EndTime     int64  `json:"end_time"`
+	AmountTotal int64  `json:"amount_total"`
+	AmountUsed  int64  `json:"amount_used"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+}
+
+type UserSubscriptionRecord struct {
+	Subscription UserSubscription `json:"subscription"`
+}
+
 type envelope struct {
 	Success bool            `json:"success"`
 	Message string          `json:"message"`
@@ -208,6 +226,43 @@ func (c *Client) adjustQuota(ctx context.Context, userID int, rawQuota int64, mo
 		"value":  rawQuota,
 	}
 	_, err := c.do(ctx, http.MethodPost, "/api/user/manage", body, true)
+	return err
+}
+
+func (c *Client) ListUserSubscriptions(ctx context.Context, userID int) ([]UserSubscriptionRecord, error) {
+	if userID <= 0 {
+		return nil, errors.New("New API 用户 ID 必须是正整数")
+	}
+	path := "/api/subscription/admin/users/" + strconv.Itoa(userID) + "/subscriptions"
+	env, err := c.do(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var records []UserSubscriptionRecord
+	if err := decodeRaw(env.Data, &records); err != nil {
+		return nil, fmt.Errorf("解析用户订阅列表失败: %w", err)
+	}
+	if records == nil {
+		records = []UserSubscriptionRecord{}
+	}
+	return records, nil
+}
+
+func (c *Client) CreateUserSubscription(ctx context.Context, userID, planID int) error {
+	if userID <= 0 || planID <= 0 {
+		return errors.New("用户 ID 和订阅套餐 ID 必须是正整数")
+	}
+	path := "/api/subscription/admin/users/" + strconv.Itoa(userID) + "/subscriptions"
+	_, err := c.do(ctx, http.MethodPost, path, map[string]any{"plan_id": planID}, true)
+	return err
+}
+
+func (c *Client) InvalidateUserSubscription(ctx context.Context, subscriptionID int) error {
+	if subscriptionID <= 0 {
+		return errors.New("订阅编号必须是正整数")
+	}
+	path := "/api/subscription/admin/user_subscriptions/" + strconv.Itoa(subscriptionID) + "/invalidate"
+	_, err := c.do(ctx, http.MethodPost, path, nil, true)
 	return err
 }
 
