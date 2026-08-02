@@ -302,6 +302,36 @@ func TestCreditMentionTargetAndSubtractFloor(t *testing.T) {
 	}
 }
 
+func TestAdminUnbindSupportsMentionTarget(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 7, Email: "admin@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:target", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	event := groupEvent("g1", "admin", "/admin unbind @alice")
+	event.Message.Mentions = []qq.MessageAuthor{{MemberOpenID: "target", Username: "alice"}}
+	service.process(context.Background(), event)
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已解除被 @ 用户绑定的 New API 用户 42") {
+		t.Fatalf("unexpected admin unbind reply: %q", reply)
+	}
+	if _, err := storage.GetBinding("member:g1:target"); err == nil {
+		t.Fatal("binding still exists after mention-based admin unbind")
+	}
+}
+
+func TestBindDoesNotTreatMentionAsUserTarget(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+	event := groupEvent("g1", "u1", "/bind @alice")
+	event.Message.Mentions = []qq.MessageAuthor{{MemberOpenID: "target", Username: "alice"}}
+	service.process(context.Background(), event)
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "/bind 不支持使用 @群成员") {
+		t.Fatalf("unexpected bind mention reply: %q", reply)
+	}
+}
+
 func TestPlanAdminAndSelfViewFlow(t *testing.T) {
 	service, storage, api, qqAPI, _ := testService(t)
 	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}

@@ -223,6 +223,9 @@ func (s *Service) handleBind(ctx context.Context, event qq.MessageEvent, canonic
 		return s.reply(ctx, event, "格式错误。正确用法：/bind <邮箱或New API用户ID>；收到邮件后使用 /bind vertify <6位验证码>。")
 	}
 	argument := strings.TrimSpace(fields[1])
+	if strings.HasPrefix(argument, "@") || strings.HasPrefix(argument, "<@") {
+		return s.reply(ctx, event, "/bind 不支持使用 @群成员，请填写目标账户的邮箱或正整数 New API 用户 ID。")
+	}
 	if _, err := s.store.GetBinding(canonical); err == nil {
 		return s.reply(ctx, event, "当前 QQ 身份已经完成绑定，如需改绑请联系机器人管理员。")
 	}
@@ -505,7 +508,7 @@ func (s *Service) handleCredit(ctx context.Context, event qq.MessageEvent, canon
 	switch action {
 	case "show":
 		if len(fields) != 3 {
-			return s.reply(ctx, event, "用法：/credit show <用户ID>")
+			return s.reply(ctx, event, "用法：/credit show <用户ID或@用户>")
 		}
 		user, err := s.newAPI.GetUser(ctx, userID)
 		if err != nil {
@@ -570,7 +573,7 @@ func (s *Service) resolveUserTarget(event qq.MessageEvent, token string) (int, s
 		return 0, "", errors.New("目标用户必须是正整数 New API 用户 ID，或当前群内被 @ 的已绑定用户。")
 	}
 	if event.Message.GroupOpenID == "" {
-		return 0, "", errors.New("@用户作为额度目标仅支持群聊消息。")
+		return 0, "", errors.New("@用户作为目标仅支持群聊消息。")
 	}
 	mention, err := selectTargetMention(event.Message.Mentions, token)
 	if err != nil {
@@ -833,7 +836,7 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 		return s.reply(ctx, event, "你没有执行管理员指令的权限。")
 	}
 	if len(fields) < 2 {
-		return s.reply(ctx, event, "用法：/admin bindings [页码] 或 /admin unbind <用户ID>")
+		return s.reply(ctx, event, "用法：/admin bindings [页码] 或 /admin unbind <用户ID或@用户>")
 	}
 	switch strings.ToLower(fields[1]) {
 	case "bindings":
@@ -862,20 +865,20 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 		return s.reply(ctx, event, strings.Join(lines, "\n"))
 	case "unbind":
 		if len(fields) != 3 {
-			return s.reply(ctx, event, "用法：/admin unbind <用户ID>")
+			return s.reply(ctx, event, "用法：/admin unbind <用户ID或@用户>")
 		}
-		id, err := strconv.Atoi(fields[2])
-		if err != nil || id <= 0 {
-			return s.reply(ctx, event, "用户 ID 必须是正整数。")
+		id, targetDescription, err := s.resolveUserTarget(event, fields[2])
+		if err != nil {
+			return s.reply(ctx, event, err.Error())
 		}
 		removed, err := s.store.UnbindByNewAPIID(id)
 		if err != nil {
 			return s.reply(ctx, event, "未找到该用户的绑定记录。")
 		}
 		_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "binding.delete", Target: strconv.Itoa(id), Success: true, Metadata: map[string]any{"old_identity": removed.CanonicalID}})
-		return s.reply(ctx, event, fmt.Sprintf("已解除 New API 用户 %d 的 QQ 绑定。", id))
+		return s.reply(ctx, event, fmt.Sprintf("已解除%s绑定的 New API 用户 %d 的 QQ 绑定。", targetDescription, id))
 	default:
-		return s.reply(ctx, event, "用法：/admin bindings [页码] 或 /admin unbind <用户ID>")
+		return s.reply(ctx, event, "用法：/admin bindings [页码] 或 /admin unbind <用户ID或@用户>")
 	}
 }
 
@@ -1091,6 +1094,6 @@ func helpText() string {
 		"/whoami - 查看当前 OpenID",
 		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）",
 		"管理员：/plan add、/plan sub、/plan view <用户ID或@群成员>",
-		"管理员：/admin bindings、/admin unbind",
+		"管理员：/admin bindings、/admin unbind <用户ID或@群成员>",
 	}, "\n")
 }
