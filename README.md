@@ -13,7 +13,7 @@
 - 一个 QQ 主身份与一个 New API 用户 ID 的双向唯一绑定。
 - SMTP 邮箱验证码，每个 QQ 身份和目标账户每小时默认最多发送两封。
 - 按自然日、自然周或自然月直接给已绑定 New API 用户增加签到额度。
-- 管理员增加额度、查询额度、查看绑定和解除绑定。
+- 管理员增加/扣除额度、管理用户订阅、查看绑定和解除绑定。
 - bbolt 单文件持久化、AES-256-GCM 敏感数据加密、JSON 结构化日志。
 - `/healthz` 和 `/readyz` 健康检查。
 
@@ -33,6 +33,10 @@
 | `/credit add <用户ID或@用户> <额度>` | 管理员 | 增加用户额度 |
 | `/credit sub <用户ID或@用户> <额度>` | 管理员 | 在余额不会变成负数时扣除用户额度 |
 | `/credit show <用户ID或@用户>` | 管理员 | 查询用户额度 |
+| `/plan view` | 已绑定用户 | 查看自己的全部订阅，按创建时间从新到旧排列 |
+| `/plan view <用户ID或@用户>` | 管理员 | 查看目标用户的全部订阅 |
+| `/plan add <套餐ID> <用户ID或@用户>` | 管理员 | 给目标用户添加订阅并返回订阅编号 |
+| `/plan sub <订阅编号> <用户ID或@用户>` | 管理员 | 验证订阅归属后立即取消订阅 |
 | `/admin bindings [页码]` | 管理员 | 分页查看绑定 |
 | `/admin unbind <用户ID>` | 管理员 | 解除绑定 |
 
@@ -67,6 +71,9 @@ QQ_ADMIN_OPENIDS=union:ABCDEF,user:123456,member:GROUP_OPENID:MEMBER_OPENID
 - `GET /api/user/{id}`
 - `GET /api/user/search`
 - `POST /api/user/manage`
+- `GET /api/subscription/admin/users/{id}/subscriptions`
+- `POST /api/subscription/admin/users/{id}/subscriptions`
+- `POST /api/subscription/admin/user_subscriptions/{id}/invalidate`
 
 所有受保护请求都会同时携带：
 

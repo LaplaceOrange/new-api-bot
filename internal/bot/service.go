@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,9 @@ type NewAPI interface {
 	FindUserByEmail(context.Context, string) (newapi.User, error)
 	AddQuota(context.Context, int, int64) error
 	SubtractQuota(context.Context, int, int64) error
+	ListUserSubscriptions(context.Context, int) ([]newapi.UserSubscriptionRecord, error)
+	CreateUserSubscription(context.Context, int, int) error
+	InvalidateUserSubscription(context.Context, int) error
 }
 
 type QQAPI interface {
@@ -47,6 +51,7 @@ type Service struct {
 	workers  sync.WaitGroup
 	checkins sync.Map
 	credits  sync.Map
+	plans    sync.Map
 	stopOnce sync.Once
 }
 
@@ -165,6 +170,8 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 			}
 		case "/credit":
 			err = s.handleCredit(ctx, event, canonical, identity, fields)
+		case "/plan":
+			err = s.handlePlan(ctx, event, canonical, identity, fields)
 		case "/unbind":
 			err = s.handleUnbind(ctx, event, canonical, fields)
 		case "/admin":
@@ -491,7 +498,7 @@ func (s *Service) handleCredit(ctx context.Context, event qq.MessageEvent, canon
 		return s.reply(ctx, event, "用法：/credit add|sub <用户ID或@用户> <额度>，或 /credit show <用户ID或@用户>")
 	}
 	action := strings.ToLower(fields[1])
-	userID, targetDescription, err := s.resolveCreditTarget(event, fields[2])
+	userID, targetDescription, err := s.resolveUserTarget(event, fields[2])
 	if err != nil {
 		return s.reply(ctx, event, err.Error())
 	}
@@ -555,7 +562,7 @@ func (s *Service) handleCredit(ctx context.Context, event qq.MessageEvent, canon
 	}
 }
 
-func (s *Service) resolveCreditTarget(event qq.MessageEvent, token string) (int, string, error) {
+func (s *Service) resolveUserTarget(event qq.MessageEvent, token string) (int, string, error) {
 	if userID, err := strconv.Atoi(token); err == nil && userID > 0 {
 		return userID, "指定目标", nil
 	}
@@ -619,6 +626,206 @@ func selectTargetMention(mentions []qq.MessageAuthor, token string) (qq.MessageA
 		return qq.MessageAuthor{}, errors.New("指令中存在多个被 @ 用户，请每次只操作一个目标用户。")
 	}
 	return qq.MessageAuthor{}, errors.New("没有从 QQ 消息事件中识别到被 @ 的目标用户。")
+}
+
+func (s *Service) handlePlan(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
+	if len(fields) < 2 {
+		return s.reply(ctx, event, planUsage())
+	}
+	action := strings.ToLower(fields[1])
+	switch action {
+	case "view":
+		var userID int
+		var targetDescription string
+		if len(fields) == 2 {
+			binding, err := s.store.GetBinding(canonical)
+			if err != nil {
+				return s.reply(ctx, event, "当前 QQ 身份尚未绑定 New API 账户，请先使用 /bind 完成绑定。")
+			}
+			userID = binding.NewAPIID
+			targetDescription = "你的账户"
+		} else if len(fields) == 3 {
+			if !s.isAdmin(identity) {
+				return s.reply(ctx, event, "你没有查看其他用户订阅的权限；可使用 /plan view 查看自己的订阅。")
+			}
+			var err error
+			userID, targetDescription, err = s.resolveUserTarget(event, fields[2])
+			if err != nil {
+				return s.reply(ctx, event, err.Error())
+			}
+		} else {
+			return s.reply(ctx, event, "格式错误。正确用法：/plan view，管理员可使用 /plan view <用户ID或@用户>")
+		}
+		records, err := s.newAPI.ListUserSubscriptions(ctx, userID)
+		if err != nil {
+			return s.reply(ctx, event, publicError(err))
+		}
+		return s.replySubscriptionList(ctx, event, userID, targetDescription, records)
+
+	case "add":
+		if !s.isAdmin(identity) {
+			return s.reply(ctx, event, "你没有添加用户订阅的权限。")
+		}
+		if len(fields) != 4 {
+			return s.reply(ctx, event, "格式错误。正确用法：/plan add <订阅套餐ID> <用户ID或@用户>")
+		}
+		planID, err := strconv.Atoi(fields[2])
+		if err != nil || planID <= 0 {
+			return s.reply(ctx, event, "订阅套餐 ID 必须是正整数。")
+		}
+		userID, targetDescription, err := s.resolveUserTarget(event, fields[3])
+		if err != nil {
+			return s.reply(ctx, event, err.Error())
+		}
+		lock := s.planLock(userID)
+		lock.Lock()
+		defer lock.Unlock()
+		before, err := s.newAPI.ListUserSubscriptions(ctx, userID)
+		if err != nil {
+			return s.reply(ctx, event, publicError(err))
+		}
+		if err := s.newAPI.CreateUserSubscription(ctx, userID, planID); err != nil {
+			_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "plan.add", Target: strconv.Itoa(userID), Success: false, Description: publicError(err), Metadata: map[string]any{"plan_id": planID}})
+			return s.reply(ctx, event, "添加订阅失败："+publicError(err))
+		}
+		after, listErr := s.newAPI.ListUserSubscriptions(ctx, userID)
+		subscriptionID := findCreatedSubscriptionID(before, after, planID)
+		_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "plan.add", Target: strconv.Itoa(userID), Success: true, Metadata: map[string]any{"plan_id": planID, "subscription_id": subscriptionID}})
+		if listErr != nil || subscriptionID <= 0 {
+			return s.reply(ctx, event, fmt.Sprintf("订阅添加成功：%s绑定的 New API 用户 %d 已获得套餐 %d；但读取当前订阅编号失败，请使用 /plan view 查询。", targetDescription, userID, planID))
+		}
+		return s.reply(ctx, event, fmt.Sprintf("订阅添加成功！\n目标：%s（New API 用户 %d）\n套餐 ID：%d\n当前订阅编号：%d", targetDescription, userID, planID, subscriptionID))
+
+	case "sub":
+		if !s.isAdmin(identity) {
+			return s.reply(ctx, event, "你没有取消用户订阅的权限。")
+		}
+		if len(fields) != 4 {
+			return s.reply(ctx, event, "格式错误。正确用法：/plan sub <订阅编号> <用户ID或@用户>")
+		}
+		subscriptionID, err := strconv.Atoi(fields[2])
+		if err != nil || subscriptionID <= 0 {
+			return s.reply(ctx, event, "订阅编号必须是正整数。")
+		}
+		userID, targetDescription, err := s.resolveUserTarget(event, fields[3])
+		if err != nil {
+			return s.reply(ctx, event, err.Error())
+		}
+		lock := s.planLock(userID)
+		lock.Lock()
+		defer lock.Unlock()
+		records, err := s.newAPI.ListUserSubscriptions(ctx, userID)
+		if err != nil {
+			return s.reply(ctx, event, publicError(err))
+		}
+		record, found := findSubscription(records, subscriptionID)
+		if !found {
+			return s.reply(ctx, event, fmt.Sprintf("取消订阅失败：订阅编号 %d 不属于%s绑定的 New API 用户 %d，本次未执行取消操作。", subscriptionID, targetDescription, userID))
+		}
+		if record.Subscription.Status != "active" {
+			return s.reply(ctx, event, fmt.Sprintf("取消订阅失败：订阅编号 %d 当前状态为%s，无需重复取消。", subscriptionID, subscriptionStatusText(record.Subscription.Status)))
+		}
+		if err := s.newAPI.InvalidateUserSubscription(ctx, subscriptionID); err != nil {
+			_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "plan.sub", Target: strconv.Itoa(userID), Success: false, Description: publicError(err), Metadata: map[string]any{"subscription_id": subscriptionID}})
+			return s.reply(ctx, event, "取消订阅失败："+publicError(err))
+		}
+		_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "plan.sub", Target: strconv.Itoa(userID), Success: true, Metadata: map[string]any{"subscription_id": subscriptionID, "plan_id": record.Subscription.PlanID}})
+		return s.reply(ctx, event, fmt.Sprintf("取消订阅成功！\n目标：%s（New API 用户 %d）\n当前订阅编号：%d\n订阅状态：已取消", targetDescription, userID, subscriptionID))
+	default:
+		return s.reply(ctx, event, planUsage())
+	}
+}
+
+func (s *Service) planLock(userID int) *sync.Mutex {
+	value, _ := s.plans.LoadOrStore(userID, &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
+func findCreatedSubscriptionID(before, after []newapi.UserSubscriptionRecord, planID int) int {
+	existing := make(map[int]struct{}, len(before))
+	for _, record := range before {
+		existing[record.Subscription.ID] = struct{}{}
+	}
+	bestID := 0
+	for _, record := range after {
+		sub := record.Subscription
+		if sub.PlanID != planID {
+			continue
+		}
+		if _, ok := existing[sub.ID]; ok {
+			continue
+		}
+		if sub.ID > bestID {
+			bestID = sub.ID
+		}
+	}
+	return bestID
+}
+
+func findSubscription(records []newapi.UserSubscriptionRecord, subscriptionID int) (newapi.UserSubscriptionRecord, bool) {
+	for _, record := range records {
+		if record.Subscription.ID == subscriptionID {
+			return record, true
+		}
+	}
+	return newapi.UserSubscriptionRecord{}, false
+}
+
+func (s *Service) replySubscriptionList(ctx context.Context, event qq.MessageEvent, userID int, targetDescription string, records []newapi.UserSubscriptionRecord) error {
+	sort.SliceStable(records, func(i, j int) bool {
+		left := records[i].Subscription
+		right := records[j].Subscription
+		leftTime := left.CreatedAt
+		if leftTime == 0 {
+			leftTime = left.StartTime
+		}
+		rightTime := right.CreatedAt
+		if rightTime == 0 {
+			rightTime = right.StartTime
+		}
+		if leftTime != rightTime {
+			return leftTime > rightTime
+		}
+		return left.ID > right.ID
+	})
+	if len(records) == 0 {
+		return s.reply(ctx, event, fmt.Sprintf("%s（New API 用户 %d）当前没有订阅记录。", targetDescription, userID))
+	}
+	lines := []string{fmt.Sprintf("%s（New API 用户 %d）的全部订阅，共 %d 条（从新到旧）：", targetDescription, userID, len(records))}
+	for _, record := range records {
+		sub := record.Subscription
+		lines = append(lines,
+			fmt.Sprintf("\n订阅编号：%d｜套餐 ID：%d", sub.ID, sub.PlanID),
+			"开始时间："+formatSubscriptionTime(sub.StartTime, s.cfg.CheckinTimezone),
+			"结束时间："+formatSubscriptionTime(sub.EndTime, s.cfg.CheckinTimezone),
+			"订阅状态："+subscriptionStatusText(sub.Status),
+		)
+	}
+	return s.replyChunked(ctx, event, strings.Join(lines, "\n"), 1700)
+}
+
+func formatSubscriptionTime(timestamp int64, location *time.Location) string {
+	if timestamp <= 0 {
+		return "-"
+	}
+	return time.Unix(timestamp, 0).In(location).Format("2006-01-02 15:04:05 MST")
+}
+
+func subscriptionStatusText(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "active":
+		return "生效中（active）"
+	case "expired":
+		return "已过期（expired）"
+	case "cancelled", "canceled":
+		return "已取消（cancelled）"
+	default:
+		return nonEmpty(status, "未知")
+	}
+}
+
+func planUsage() string {
+	return "用法：\n/plan view - 查看自己的全部订阅\n管理员：/plan view <用户ID或@用户>\n管理员：/plan add <订阅套餐ID> <用户ID或@用户>\n管理员：/plan sub <订阅编号> <用户ID或@用户>"
 }
 
 func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
@@ -690,6 +897,77 @@ func (s *Service) reply(ctx context.Context, event qq.MessageEvent, content stri
 		return s.qq.ReplyC2C(ctx, openID, event.Message.ID, content)
 	}
 	return s.qq.ReplyGroup(ctx, event.Message.GroupOpenID, event.Message.ID, content)
+}
+
+func (s *Service) replyChunked(ctx context.Context, event qq.MessageEvent, content string, maxRunes int) error {
+	if maxRunes < 200 || len([]rune(content)) <= maxRunes {
+		return s.reply(ctx, event, content)
+	}
+	chunks := splitMessage(content, maxRunes)
+	for index, chunk := range chunks {
+		if index == 0 {
+			if err := s.reply(ctx, event, chunk); err != nil {
+				return err
+			}
+			continue
+		}
+		if event.EventType == "C2C_MESSAGE_CREATE" {
+			openID := firstNonEmpty(event.Message.Author.UserOpenID, event.Message.Author.ID)
+			if err := s.qq.ReplyC2C(ctx, openID, "", chunk); err != nil {
+				return err
+			}
+		} else if err := s.qq.ReplyGroup(ctx, event.Message.GroupOpenID, "", chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitMessage(content string, maxRunes int) []string {
+	lines := strings.Split(content, "\n")
+	chunks := make([]string, 0, 2)
+	current := make([]rune, 0, maxRunes)
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		chunks = append(chunks, string(current))
+		current = current[:0]
+	}
+	for _, line := range lines {
+		runes := []rune(line)
+		for len(runes) > 0 {
+			separator := 0
+			if len(current) > 0 {
+				separator = 1
+			}
+			remaining := maxRunes - len(current) - separator
+			if remaining <= 0 {
+				flush()
+				continue
+			}
+			if separator == 1 {
+				current = append(current, '\n')
+			}
+			if len(runes) <= remaining {
+				current = append(current, runes...)
+				runes = nil
+				continue
+			}
+			current = append(current, runes[:remaining]...)
+			runes = runes[remaining:]
+			flush()
+		}
+		if len(runes) == 0 && len(line) == 0 {
+			if len(current) < maxRunes {
+				current = append(current, '\n')
+			} else {
+				flush()
+			}
+		}
+	}
+	flush()
+	return chunks
 }
 
 func periodKey(now time.Time, period string, location *time.Location) (string, time.Time) {
@@ -806,7 +1084,10 @@ func helpText() string {
 		"/checkin - 签到并直接增加绑定账户额度",
 		"/checkin status - 查看签到状态",
 		"/me - 查看账户与额度",
+		"/plan view - 查看自己的全部订阅",
 		"/whoami - 查看当前 OpenID",
-		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）、/admin bindings、/admin unbind",
+		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）",
+		"管理员：/plan add、/plan sub、/plan view <用户ID或@群成员>",
+		"管理员：/admin bindings、/admin unbind",
 	}, "\n")
 }
