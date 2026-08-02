@@ -3,6 +3,7 @@ package bot
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,13 @@ import (
 	"github.com/fsykk/new-api-bot/internal/secure"
 	"github.com/fsykk/new-api-bot/internal/store"
 )
+
+func TestPublicErrorMapsExistingAdministratorPermissionFailure(t *testing.T) {
+	err := errors.New("New API 请求失败（HTTP 200）：No permission to update users of same or higher permission level")
+	if got := publicError(err); got != "该用户已经是管理员。" {
+		t.Fatalf("publicError() = %q", got)
+	}
+}
 
 type fakeNewAPI struct {
 	user          newapi.User
