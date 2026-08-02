@@ -29,6 +29,9 @@ func (s *Service) handleUsage(ctx context.Context, event qq.MessageEvent, canoni
 		return s.reply(ctx, event, usageHelp())
 	}
 	if len(fields) >= 2 && strings.EqualFold(fields[1], "chart") {
+		if !s.cfg.UsageChartEnabled {
+			return s.reply(ctx, event, "用量图表功能当前已关闭。")
+		}
 		duration := "7d"
 		if len(fields) == 3 {
 			duration = fields[2]
