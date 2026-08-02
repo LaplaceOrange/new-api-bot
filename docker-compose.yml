@@ -1,0 +1,40 @@
+# 定义 QQ × New API 机器人服务集合。
+services:
+  # 定义唯一的机器人后端服务。
+  bot:
+    # 使用当前目录的 Dockerfile 构建镜像。
+    build:
+      # 指定 Docker 构建上下文为当前目录。
+      context: .
+    # 设置便于运维识别的固定容器名称。
+    container_name: new-api-bot
+    # 加载逐项注释的 .env 配置文件。
+    env_file:
+      # 指定部署时使用的环境变量文件。
+      - .env
+    # 设置 Go 运行时软内存上限，未在 .env 覆盖时使用 64MiB。
+    environment:
+      # 将 GOMEMLIMIT 传入容器并提供低内存默认值。
+      GOMEMLIMIT: ${GOMEMLIMIT:-64MiB}
+      # 将 GOGC 传入容器并提供偏低内存的默认值。
+      GOGC: ${GOGC:-50}
+    # 映射健康检查 HTTP 服务端口。
+    ports:
+      # 默认仅将宿主机回环地址 18080 映射到容器 8080；可通过 HEALTH_HOST_PORT 修改宿主机端口。
+      - "127.0.0.1:${HEALTH_HOST_PORT:-18080}:8080"
+    # 持久化机器人 bbolt 数据库。
+    volumes:
+      # 将宿主机 data 目录挂载到容器 /data 目录。
+      - ./data:/data
+    # 限制异常时的自动重启行为。
+    restart: unless-stopped
+    # 设置容器日志轮转，防止日志无限增长。
+    logging:
+      # 使用 Docker 默认的 json-file 日志驱动。
+      driver: json-file
+      # 配置日志文件大小和保留数量。
+      options:
+        # 每个日志文件最大 10 MiB。
+        max-size: "10m"
+        # 最多保留三个日志文件。
+        max-file: "3"
