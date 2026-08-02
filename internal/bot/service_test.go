@@ -317,6 +317,20 @@ func TestCommandRuleListsAreAvailableWithoutBinding(t *testing.T) {
 	}
 }
 
+func TestCommandInputAcceptsAngleBracketArgumentsWithoutSpaces(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+
+	service.process(context.Background(), c2cEvent("ordinary", "/whoami<>"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "user:ordinary") {
+		t.Fatalf("angle brackets were not normalized for a command without arguments: %q", reply)
+	}
+
+	service.process(context.Background(), c2cEvent("admin", `/disable<"bind view">`))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已禁用") || !strings.Contains(reply, "bind view") {
+		t.Fatalf("angle brackets were not normalized for command arguments: %q", reply)
+	}
+}
+
 func TestOnlyAdminCanManageCommandRules(t *testing.T) {
 	service, storage, _, qqAPI, _ := testService(t)
 
