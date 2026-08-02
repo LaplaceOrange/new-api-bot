@@ -118,6 +118,10 @@ func (c *Client) listUsage(ctx context.Context, endpoint string, start, end time
 }
 
 func (c *Client) ListLogs(ctx context.Context, start, end time.Time, username string, page, pageSize int) (LogPage, error) {
+	return c.ListLogsByType(ctx, start, end, username, 0, page, pageSize)
+}
+
+func (c *Client) ListLogsByType(ctx context.Context, start, end time.Time, username string, logType, page, pageSize int) (LogPage, error) {
 	if start.IsZero() || end.IsZero() || !start.Before(end) {
 		return LogPage{}, errors.New("日志查询时间范围无效")
 	}
@@ -131,8 +135,7 @@ func (c *Client) ListLogs(ctx context.Context, start, end time.Time, username st
 		pageSize = 100
 	}
 	query := url.Values{}
-	// type=0 表示全部日志，调用成功(type=2)和失败(type=5)均返回。
-	query.Set("type", "0")
+	query.Set("type", strconv.Itoa(logType))
 	query.Set("start_timestamp", strconv.FormatInt(start.Unix(), 10))
 	query.Set("end_timestamp", strconv.FormatInt(end.Unix(), 10))
 	query.Set("username", strings.TrimSpace(username))

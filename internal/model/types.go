@@ -86,6 +86,38 @@ type SentBotMessage struct {
 	SentAt      time.Time `json:"sent_at"`
 }
 
+type BenefitCampaign struct {
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	Actor          string    `json:"actor"`
+	GroupOpenID    string    `json:"group_openid"`
+	DisplayCredit  string    `json:"display_credit"`
+	RawQuota       int64     `json:"raw_quota"`
+	Count          int       `json:"count"`
+	ValidHours     int       `json:"valid_hours"`
+	BanDays        int       `json:"ban_days"`
+	RedemptionIDs  []int     `json:"redemption_ids"`
+	EncryptedCodes []string  `json:"encrypted_codes"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	Status         string    `json:"status"`
+	Announced      bool      `json:"announced"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type BenefitBan struct {
+	Key         string    `json:"key"`
+	CampaignID  string    `json:"campaign_id"`
+	GroupOpenID string    `json:"group_openid"`
+	UserID      int       `json:"user_id"`
+	RedeemCount int       `json:"redeem_count"`
+	DisabledAt  time.Time `json:"disabled_at"`
+	EnableAt    time.Time `json:"enable_at"`
+	Status      string    `json:"status"`
+	LastError   string    `json:"last_error,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 type QQIdentity struct {
 	UnionOpenID  string
 	UserOpenID   string

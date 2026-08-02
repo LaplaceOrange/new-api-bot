@@ -41,6 +41,8 @@ var buckets = [][]byte{
 	[]byte("group_welcome"),
 	[]byte("pending_admin_actions"),
 	[]byte("sent_bot_messages"),
+	[]byte("benefit_campaigns"),
+	[]byte("benefit_bans"),
 }
 
 type Store struct {
@@ -754,6 +756,89 @@ func (s *Store) GetSentBotMessage(group, reference string) (model.SentBotMessage
 			return ErrNotFound
 		}
 		return json.Unmarshal(data, &result)
+	})
+	return result, err
+}
+
+func (s *Store) PutBenefitCampaign(campaign model.BenefitCampaign) error {
+	if campaign.ID == "" || campaign.GroupOpenID == "" {
+		return errors.New("福利活动缺少必要字段")
+	}
+	campaign.UpdatedAt = time.Now()
+	data, err := json.Marshal(campaign)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("benefit_campaigns")).Put([]byte(campaign.ID), data) })
+}
+
+func (s *Store) GetBenefitCampaign(id string) (model.BenefitCampaign, error) {
+	var result model.BenefitCampaign
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("benefit_campaigns")).Get([]byte(id))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &result)
+	})
+	return result, err
+}
+
+func (s *Store) ListBenefitCampaigns() ([]model.BenefitCampaign, error) {
+	result := make([]model.BenefitCampaign, 0)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("benefit_campaigns")).ForEach(func(_, data []byte) error {
+			var item model.BenefitCampaign
+			if err := json.Unmarshal(data, &item); err != nil {
+				return err
+			}
+			if item.Status == "pending" || item.Status == "active" {
+				result = append(result, item)
+			}
+			return nil
+		})
+	})
+	return result, err
+}
+
+func (s *Store) PutBenefitBan(ban model.BenefitBan) error {
+	if ban.Key == "" {
+		ban.Key = ban.CampaignID + "|" + strconv.Itoa(ban.UserID)
+	}
+	ban.UpdatedAt = time.Now()
+	data, err := json.Marshal(ban)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("benefit_bans")).Put([]byte(ban.Key), data) })
+}
+
+func (s *Store) GetBenefitBan(campaignID string, userID int) (model.BenefitBan, error) {
+	var result model.BenefitBan
+	key := campaignID + "|" + strconv.Itoa(userID)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("benefit_bans")).Get([]byte(key))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &result)
+	})
+	return result, err
+}
+
+func (s *Store) ListBenefitBans() ([]model.BenefitBan, error) {
+	result := make([]model.BenefitBan, 0)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("benefit_bans")).ForEach(func(_, data []byte) error {
+			var item model.BenefitBan
+			if err := json.Unmarshal(data, &item); err != nil {
+				return err
+			}
+			if item.Status == "disabled" || item.Status == "disable_failed" || item.Status == "enable_failed" {
+				result = append(result, item)
+			}
+			return nil
+		})
 	})
 	return result, err
 }

@@ -57,6 +57,10 @@ type Config struct {
 	NotifyEnabled              bool
 	AdminReportExportEnabled   bool
 	AdminUserManagementEnabled bool
+	BenefitEnabled             bool
+	BenefitMaxCount            int
+	BenefitMaxBanDays          int
+	BenefitCheckInterval       time.Duration
 }
 
 func Load() (Config, error) {
@@ -148,6 +152,13 @@ func Load() (Config, error) {
 	c.NotifyEnabled = parseBool("NOTIFY_ENABLED", true)
 	c.AdminReportExportEnabled = parseBool("ADMIN_REPORT_EXPORT_ENABLED", true)
 	c.AdminUserManagementEnabled = parseBool("ADMIN_USER_MANAGEMENT_ENABLED", true)
+	c.BenefitEnabled = parseBool("BENEFIT_ENABLED", true)
+	c.BenefitMaxCount = parseInt("BENEFIT_MAX_COUNT", 100, 1)
+	if c.BenefitMaxCount > 100 {
+		errs = append(errs, errors.New("BENEFIT_MAX_COUNT 不能超过 New API 单次上限 100"))
+	}
+	c.BenefitMaxBanDays = parseInt("BENEFIT_MAX_BAN_DAYS", 365, 1)
+	c.BenefitCheckInterval = parseDuration("BENEFIT_CHECK_INTERVAL", time.Minute)
 	c.CheckinCodeTTL = parseDuration("CHECKIN_CODE_TTL", 24*time.Hour)
 	c.BindCodeTTL = parseDuration("BIND_CODE_TTL", 10*time.Minute)
 	c.BindEmailWindow = parseDuration("BIND_EMAIL_WINDOW", time.Hour)

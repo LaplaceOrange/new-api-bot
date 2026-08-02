@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,7 @@ type fakeNewAPI struct {
 	managedAction string
 	reset2FA      int
 	resetPasskey  int
+	redemptions   []newapi.Redemption
 }
 
 func (f *fakeNewAPI) GetStatus(context.Context, bool) (newapi.Status, error) {
@@ -125,6 +127,41 @@ func (f *fakeNewAPI) ManageUserStatus(_ context.Context, userID int, action stri
 	f.lastQuotaUser = userID
 	f.managedAction = action
 	return nil
+}
+func (f *fakeNewAPI) CreateRedemptions(_ context.Context, name string, count int, quota int64, expires time.Time) ([]string, error) {
+	keys := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		id := len(f.redemptions) + 1
+		key := fmt.Sprintf("BENEFIT-%03d", id)
+		keys = append(keys, key)
+		f.redemptions = append(f.redemptions, newapi.Redemption{ID: id, Name: name, Key: key, Quota: quota, ExpiredTime: expires.Unix()})
+	}
+	return keys, nil
+}
+func (f *fakeNewAPI) SearchRedemptions(_ context.Context, name string, _ int) ([]newapi.Redemption, error) {
+	result := make([]newapi.Redemption, 0)
+	for _, item := range f.redemptions {
+		if item.Name == name {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
+func (f *fakeNewAPI) ListLogsByType(_ context.Context, _ time.Time, _ time.Time, username string, logType, _, pageSize int) (newapi.LogPage, error) {
+	items := make([]newapi.LogRecord, 0, pageSize)
+	for _, record := range f.logs {
+		if logType != 0 && record.Type != logType {
+			continue
+		}
+		if username != "" && !strings.EqualFold(record.Username, username) {
+			continue
+		}
+		items = append(items, record)
+		if len(items) >= pageSize {
+			break
+		}
+	}
+	return newapi.LogPage{Items: items, Total: len(items)}, nil
 }
 func (f *fakeNewAPI) ResetUser2FA(_ context.Context, userID int) error {
 	f.reset2FA = userID
@@ -219,6 +256,10 @@ func testService(t *testing.T) (*Service, *store.Store, *fakeNewAPI, *fakeQQ, *f
 		NotifyEnabled:              true,
 		AdminReportExportEnabled:   true,
 		AdminUserManagementEnabled: true,
+		BenefitEnabled:             true,
+		BenefitMaxCount:            100,
+		BenefitMaxBanDays:          365,
+		BenefitCheckInterval:       time.Minute,
 	}
 	api := &fakeNewAPI{
 		user:          newapi.User{ID: 42, Username: "alice", Email: "alice@example.com", Status: 1},
@@ -326,6 +367,43 @@ func TestAdminDisableRequiresConfirmation(t *testing.T) {
 	service.process(context.Background(), event)
 	if api.managedAction != "disable" || api.lastQuotaUser != 42 {
 		t.Fatalf("action not executed: %s %d", api.managedAction, api.lastQuotaUser)
+	}
+}
+
+func TestBenefitCreatesCodesAndEnforcesSingleClaim(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	event := groupEvent("g1", "u-admin", "/benefit 1 3 24 7")
+	event.Message.Author.UserOpenID = "admin"
+	service.process(context.Background(), event)
+	reply := lastReply(t, qqAPI)
+	if !strings.Contains(reply, "<@everyone>") || !strings.Contains(reply, "每个 $1，共 3 个") || !strings.Contains(reply, "每个用户限领一个") {
+		t.Fatalf("unexpected benefit reply: %q", reply)
+	}
+	campaign, err := storage.GetBenefitCampaign(benefitCampaignID(event.Message.ID))
+	if err != nil || len(campaign.RedemptionIDs) != 3 {
+		t.Fatalf("campaign not stored: %#v err=%v", campaign, err)
+	}
+	api.logs = []newapi.LogRecord{{ID: 1, UserID: 9, Type: 1, Content: fmt.Sprintf("通过兑换码充值，兑换码ID %d", campaign.RedemptionIDs[0])}, {ID: 2, UserID: 9, Type: 1, Content: fmt.Sprintf("通过兑换码充值，兑换码ID %d", campaign.RedemptionIDs[1])}}
+	if err := service.detectBenefitViolations(context.Background(), campaign); err != nil {
+		t.Fatal(err)
+	}
+	if api.managedAction != "disable" || api.lastQuotaUser != 9 {
+		t.Fatalf("violator not disabled: %s %d", api.managedAction, api.lastQuotaUser)
+	}
+	ban, err := storage.GetBenefitBan(campaign.ID, 9)
+	if err != nil || ban.Status != "disabled" {
+		t.Fatalf("ban not stored: %#v err=%v", ban, err)
+	}
+	ban.EnableAt = time.Now().Add(-time.Minute)
+	if err := storage.PutBenefitBan(ban); err != nil {
+		t.Fatal(err)
+	}
+	service.processBenefitBans(context.Background())
+	if api.managedAction != "enable" {
+		t.Fatalf("user not re-enabled: %s", api.managedAction)
 	}
 }
 
