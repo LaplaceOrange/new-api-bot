@@ -118,6 +118,13 @@ type BenefitBan struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+type CommandRule struct {
+	Keyword   string    `json:"keyword"`
+	Enabled   bool      `json:"enabled"`
+	Actor     string    `json:"actor"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type QQIdentity struct {
 	UnionOpenID  string
 	UserOpenID   string

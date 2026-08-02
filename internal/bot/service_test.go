@@ -298,6 +298,90 @@ func lastReply(t *testing.T, api *fakeQQ) string {
 	return api.messages[len(api.messages)-1]
 }
 
+func replyCount(api *fakeQQ) int {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	return len(api.messages)
+}
+
+func TestCommandRuleListsAreAvailableWithoutBinding(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+
+	service.process(context.Background(), c2cEvent("ordinary", "/disable list"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "当前没有明确设置为禁用") {
+		t.Fatalf("unexpected disabled list reply: %q", reply)
+	}
+	service.process(context.Background(), c2cEvent("ordinary", "/enable list"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "当前没有明确设置为启用") {
+		t.Fatalf("unexpected enabled list reply: %q", reply)
+	}
+}
+
+func TestOnlyAdminCanManageCommandRules(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+
+	service.process(context.Background(), c2cEvent("ordinary", `/disable "usage"`))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "没有管理命令启用状态的权限") {
+		t.Fatalf("unexpected permission reply: %q", reply)
+	}
+	if _, err := storage.GetCommandRule("usage"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("non-admin unexpectedly saved a command rule: %v", err)
+	}
+}
+
+func TestAdminCanDisableAndEnableCommandKeyword(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+
+	service.process(context.Background(), c2cEvent("admin", `/disable "bind view"`))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已禁用") || !strings.Contains(reply, "bind view") {
+		t.Fatalf("unexpected disable reply: %q", reply)
+	}
+	rule, err := storage.GetCommandRule("bind view")
+	if err != nil || rule.Enabled {
+		t.Fatalf("disabled rule not stored: %#v err=%v", rule, err)
+	}
+
+	before := replyCount(qqAPI)
+	service.process(context.Background(), c2cEvent("ordinary", "/bind   view 123"))
+	if got := replyCount(qqAPI); got != before {
+		t.Fatalf("disabled command replied: before=%d after=%d", before, got)
+	}
+
+	service.process(context.Background(), c2cEvent("ordinary", "/disable list"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "bind view") {
+		t.Fatalf("disabled list omitted rule: %q", reply)
+	}
+
+	service.process(context.Background(), c2cEvent("admin", `/enable "bind view"`))
+	rule, err = storage.GetCommandRule("bind view")
+	if err != nil || !rule.Enabled {
+		t.Fatalf("enabled rule not stored: %#v err=%v", rule, err)
+	}
+	before = replyCount(qqAPI)
+	service.process(context.Background(), c2cEvent("ordinary", "/bind view 123"))
+	if got := replyCount(qqAPI); got != before+1 {
+		t.Fatalf("re-enabled command did not reply: before=%d after=%d", before, got)
+	}
+	service.process(context.Background(), c2cEvent("ordinary", "/enable list"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "bind view") {
+		t.Fatalf("enabled list omitted rule: %q", reply)
+	}
+}
+
+func TestDisabledKeywordIsRemovedFromHelp(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+
+	service.process(context.Background(), c2cEvent("admin", `/disable "usage"`))
+	service.process(context.Background(), c2cEvent("ordinary", "/help"))
+	reply := lastReply(t, qqAPI)
+	if strings.Contains(reply, "/usage") {
+		t.Fatalf("help still contains disabled usage commands: %q", reply)
+	}
+	if !strings.Contains(reply, "/bind") {
+		t.Fatalf("help unexpectedly removed unrelated commands: %q", reply)
+	}
+}
+
 func TestNonCommandMessageIsIgnored(t *testing.T) {
 	service, _, _, qqAPI, _ := testService(t)
 	service.process(context.Background(), groupEvent("g1", "u1", "你好"))
