@@ -43,6 +43,7 @@ var buckets = [][]byte{
 	[]byte("sent_bot_messages"),
 	[]byte("benefit_campaigns"),
 	[]byte("benefit_bans"),
+	[]byte("command_rules"),
 }
 
 type Store struct {
@@ -840,6 +841,50 @@ func (s *Store) ListBenefitBans() ([]model.BenefitBan, error) {
 			return nil
 		})
 	})
+	return result, err
+}
+
+func (s *Store) PutCommandRule(rule model.CommandRule) error {
+	keyword := strings.TrimSpace(rule.Keyword)
+	if keyword == "" {
+		return errors.New("命令关键词不能为空")
+	}
+	rule.Keyword = keyword
+	rule.UpdatedAt = time.Now()
+	data, err := json.Marshal(rule)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("command_rules")).Put([]byte(keyword), data)
+	})
+}
+
+func (s *Store) GetCommandRule(keyword string) (model.CommandRule, error) {
+	var result model.CommandRule
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("command_rules")).Get([]byte(keyword))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &result)
+	})
+	return result, err
+}
+
+func (s *Store) ListCommandRules() ([]model.CommandRule, error) {
+	result := make([]model.CommandRule, 0)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("command_rules")).ForEach(func(_, data []byte) error {
+			var rule model.CommandRule
+			if err := json.Unmarshal(data, &rule); err != nil {
+				return err
+			}
+			result = append(result, rule)
+			return nil
+		})
+	})
+	sort.Slice(result, func(i, j int) bool { return result[i].Keyword < result[j].Keyword })
 	return result, err
 }
 

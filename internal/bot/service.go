@@ -165,6 +165,16 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	command := strings.ToLower(fields[0])
 	s.logger.Info("开始处理 QQ 命令", "event", event.EventType, "command", command)
 	identity := identityFromEvent(event)
+	if command == "/enable" || command == "/disable" {
+		if err := s.handleCommandRule(ctx, event, identity, command, content); err != nil {
+			s.logger.Error("处理命令关键词状态失败", "command", command, "error", err)
+		}
+		return
+	}
+	if keyword, blocked := s.matchDisabledCommand(content); blocked {
+		s.logger.Info("命令命中禁用关键词，静默忽略", "command", command, "keyword", keyword)
+		return
+	}
 	canonical, resolveErr := s.store.ResolveCanonical(identity)
 	if event.EventType == "C2C_MESSAGE_CREATE" && identity.UserOpenID != "" && canonical != "" {
 		_ = s.store.PutContact(canonical, identity.UserOpenID)
@@ -176,7 +186,7 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		if len(fields) != 1 {
 			err = s.reply(ctx, event, "格式错误。正确用法：/help")
 		} else {
-			err = s.reply(ctx, event, helpText(s.cfg))
+			err = s.reply(ctx, event, s.filteredHelpText())
 		}
 	case "/whoami":
 		if len(fields) != 1 {
@@ -1185,6 +1195,7 @@ func helpText(cfg config.Config) string {
 		"/models [用户ID或@用户] - 查看用户分组可用模型",
 		"/plan view - 查看自己的全部订阅",
 		"/whoami - 查看当前 OpenID",
+		"/enable list、/disable list - 查看命令关键词状态；管理员可启用或禁用关键词",
 		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）",
 		"管理员：/plan add、/plan sub、/plan view <用户ID或@群成员>",
 		"管理员：/admin bindings、/admin unbind <用户ID或@群成员>",
