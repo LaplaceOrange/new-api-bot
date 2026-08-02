@@ -24,7 +24,7 @@ type usageTotal struct {
 	Count    int64
 }
 
-func (s *Service) handleUsage(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
+func (s *Service) handleUsage(ctx context.Context, event qq.MessageEvent, canonical string, _ model.QQIdentity, fields []string) error {
 	if len(fields) > 3 {
 		return s.reply(ctx, event, usageHelp())
 	}
@@ -37,17 +37,14 @@ func (s *Service) handleUsage(ctx context.Context, event qq.MessageEvent, canoni
 		return s.reply(ctx, event, err.Error()+"\n"+usageHelp())
 	}
 	if len(fields) == 3 && strings.EqualFold(fields[2], "all") {
-		return s.replyAllUsage(ctx, event, start, end, label)
+		return s.replyAllUsageSummary(ctx, event, start, end, label)
 	}
 	if len(fields) == 3 {
-		if !s.isAdmin(identity) {
-			return s.reply(ctx, event, "你没有查看其他用户用量的权限；可以使用 /usage <时间长度> 或 /usage <时间长度> all。")
+		rankCount, parseErr := parseUsageRank(fields[2])
+		if parseErr != nil {
+			return s.reply(ctx, event, parseErr.Error()+"\n"+usageHelp())
 		}
-		userID, targetDescription, resolveErr := s.resolveUserTarget(event, fields[2])
-		if resolveErr != nil {
-			return s.reply(ctx, event, resolveErr.Error())
-		}
-		return s.replyUserUsage(ctx, event, userID, targetDescription, start, end, label)
+		return s.replyUsageRanking(ctx, event, start, end, label, rankCount)
 	}
 	binding, err := s.store.GetBinding(canonical)
 	if err != nil {
@@ -94,7 +91,37 @@ func (s *Service) replyUserUsage(ctx context.Context, event qq.MessageEvent, use
 	return s.reply(ctx, event, strings.Join(lines, "\n"))
 }
 
-func (s *Service) replyAllUsage(ctx context.Context, event qq.MessageEvent, start, end time.Time, label string) error {
+func (s *Service) replyAllUsageSummary(ctx context.Context, event qq.MessageEvent, start, end time.Time, label string) error {
+	rows, err := s.newAPI.ListUsageByUser(ctx, start, end)
+	if err != nil {
+		return s.reply(ctx, event, publicError(err))
+	}
+	status, err := s.newAPI.GetStatus(ctx, false)
+	if err != nil {
+		return s.reply(ctx, event, publicError(err))
+	}
+	var total usageTotal
+	activeUsernames := make(map[string]struct{})
+	for _, row := range rows {
+		total.Count += row.Count
+		total.Tokens += row.TokenUsed
+		total.Quota += row.Quota
+		if row.Count > 0 || row.TokenUsed > 0 || row.Quota > 0 {
+			activeUsernames[strings.ToLower(strings.TrimSpace(row.Username))] = struct{}{}
+		}
+	}
+	lines := []string{
+		fmt.Sprintf("全站用量汇总（%s）", label),
+		"时间范围：" + formatInsightRange(start, end, s.cfg.CheckinTimezone),
+		"请求次数：" + strconv.FormatInt(total.Count, 10),
+		"Token 用量：" + strconv.FormatInt(total.Tokens, 10),
+		"消耗额度：" + newapi.QuotaToDisplay(total.Quota, status.QuotaPerUnit),
+		"活跃用户：" + strconv.Itoa(len(activeUsernames)),
+	}
+	return s.reply(ctx, event, strings.Join(lines, "\n"))
+}
+
+func (s *Service) replyUsageRanking(ctx context.Context, event qq.MessageEvent, start, end time.Time, label string, rankCount int) error {
 	users, err := s.newAPI.ListUsers(ctx)
 	if err != nil {
 		return s.reply(ctx, event, publicError(err))
@@ -108,11 +135,23 @@ func (s *Service) replyAllUsage(ctx context.Context, event qq.MessageEvent, star
 		return s.reply(ctx, event, publicError(err))
 	}
 	totals := mergeUsersAndUsage(users, rows)
+	active := totals[:0]
+	for _, item := range totals {
+		if item.Count > 0 || item.Tokens > 0 || item.Quota > 0 {
+			active = append(active, item)
+		}
+	}
+	if len(active) == 0 {
+		return s.reply(ctx, event, fmt.Sprintf("用量排行榜（%s）：该时间段内没有使用记录。", label))
+	}
+	if rankCount > len(active) {
+		rankCount = len(active)
+	}
 	lines := []string{
-		fmt.Sprintf("全部用户用量（%s，共 %d 位用户）", label, len(totals)),
+		fmt.Sprintf("用量排行榜（%s，前 %d 名，按消耗额度排序）", label, rankCount),
 		"时间范围：" + formatInsightRange(start, end, s.cfg.CheckinTimezone),
 	}
-	for index, item := range totals {
+	for index, item := range active[:rankCount] {
 		lines = append(lines, fmt.Sprintf("%d. ID %d｜%s｜%d 次｜%d Token｜额度 %s", index+1, item.UserID, nonEmpty(item.Username, "未知用户"), item.Count, item.Tokens, newapi.QuotaToDisplay(item.Quota, status.QuotaPerUnit)))
 	}
 	return s.replyChunked(ctx, event, strings.Join(lines, "\n"), 1700)
@@ -516,6 +555,19 @@ func aggregateModels(records []newapi.UsageRecord) []usageTotal {
 	return result
 }
 
+func parseUsageRank(value string) (int, error) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.TrimPrefix(normalized, "top")
+	if strings.HasPrefix(normalized, "前") && strings.HasSuffix(normalized, "名") {
+		normalized = strings.TrimSuffix(strings.TrimPrefix(normalized, "前"), "名")
+	}
+	count, err := strconv.Atoi(normalized)
+	if err != nil || count < 1 || count > 100 {
+		return 0, errors.New("排行榜名次必须是 1 到 100 的整数，例如 /usage 7d 10")
+	}
+	return count, nil
+}
+
 func formatInsightRange(start, end time.Time, location *time.Location) string {
 	return start.In(location).Format("2006-01-02 15:04") + " ～ " + end.In(location).Format("2006-01-02 15:04 MST")
 }
@@ -528,7 +580,7 @@ func formatLogTime(timestamp int64, location *time.Location) string {
 }
 
 func usageHelp() string {
-	return "用法：/usage [时间长度]、/usage <时间长度> all；管理员还可使用 /usage <时间长度> <用户ID或@用户>。时间示例：24h、7d、4w、today、month。"
+	return "用法：/usage [时间长度] 查看自己；/usage <时间长度> all 查看全站汇总；/usage <时间长度> <前N名> 查看排行榜，例如 /usage 7d 10。时间示例：24h、7d、4w、today、month。"
 }
 
 func logsHelp() string {

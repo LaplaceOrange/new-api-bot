@@ -442,7 +442,7 @@ func TestPlanViewOtherRequiresAdmin(t *testing.T) {
 	}
 }
 
-func TestUsageSelfAndAllUsers(t *testing.T) {
+func TestUsageSelfSummaryAndRanking(t *testing.T) {
 	service, storage, api, qqAPI, _ := testService(t)
 	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
@@ -466,8 +466,13 @@ func TestUsageSelfAndAllUsers(t *testing.T) {
 	}
 
 	service.process(context.Background(), groupEvent("g1", "u1", "/usage 7d all"))
-	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "全部用户用量") || !strings.Contains(reply, "ID 42｜alice") || !strings.Contains(reply, "ID 43｜bob") {
-		t.Fatalf("unexpected all usage reply: %q", reply)
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "全站用量汇总") || !strings.Contains(reply, "请求次数：5") || !strings.Contains(reply, "Token 用量：2000") || !strings.Contains(reply, "消耗额度：1.5") || strings.Contains(reply, "ID 42") {
+		t.Fatalf("unexpected all usage summary reply: %q", reply)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "u1", "/usage 7d 2"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "用量排行榜") || !strings.Contains(reply, "ID 42｜alice") || !strings.Contains(reply, "ID 43｜bob") {
+		t.Fatalf("unexpected usage ranking reply: %q", reply)
 	}
 }
 
@@ -535,6 +540,15 @@ func TestParseInsightRange(t *testing.T) {
 	}
 	if _, _, _, err := parseInsightRange("32d", now, time.UTC); err == nil {
 		t.Fatal("expected range limit error")
+	}
+	for _, value := range []string{"10", "top10", "前10名"} {
+		count, err := parseUsageRank(value)
+		if err != nil || count != 10 {
+			t.Fatalf("rank %q count=%d err=%v", value, count, err)
+		}
+	}
+	if _, err := parseUsageRank("101"); err == nil {
+		t.Fatal("expected rank limit error")
 	}
 }
 
