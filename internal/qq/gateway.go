@@ -47,6 +47,7 @@ type MessageEvent struct {
 	EventType string
 	Sequence  int64
 	Message   Message
+	Member    GroupMemberEvent
 }
 
 type Message struct {
@@ -56,6 +57,22 @@ type Message struct {
 	Author      MessageAuthor   `json:"author"`
 	Mentions    []MessageAuthor `json:"mentions"`
 	Scene       MessageScene    `json:"message_scene"`
+	Elements    []MsgElement    `json:"msg_elements"`
+}
+
+type MsgElement struct {
+	MsgIdx      string        `json:"msg_idx"`
+	MessageType int           `json:"message_type"`
+	Content     string        `json:"content"`
+	Author      MessageAuthor `json:"author"`
+	Elements    []MsgElement  `json:"msg_elements"`
+}
+
+type GroupMemberEvent struct {
+	Timestamp    int64  `json:"timestamp"`
+	GroupOpenID  string `json:"group_openid"`
+	MemberOpenID string `json:"member_openid"`
+	UserOpenID   string `json:"user_openid"`
 }
 
 type MessageAuthor struct {
@@ -239,6 +256,15 @@ func (g *Gateway) connect(ctx context.Context, handler func(context.Context, Mes
 				continue
 			}
 			if payload.T == "RESUMED" {
+				continue
+			}
+			if payload.T == "GROUP_MEMBER_ADD" || payload.T == "GROUP_MEMBER_REMOVE" {
+				var member GroupMemberEvent
+				if err := json.Unmarshal(payload.D, &member); err != nil {
+					g.logger.Warn("解析群成员事件失败", "event", payload.T, "error", err)
+					continue
+				}
+				handler(ctx, MessageEvent{EventType: payload.T, Sequence: sequence.Load(), Member: member})
 				continue
 			}
 			// QQ 当前生产环境的群消息事件名为 GROUP_MESSAGE_CREATE；

@@ -229,6 +229,30 @@ func (c *Client) SubtractQuota(ctx context.Context, userID int, rawQuota int64) 
 	return c.adjustQuota(ctx, userID, rawQuota, "subtract")
 }
 
+func (c *Client) ManageUserStatus(ctx context.Context, userID int, action string) error {
+	if userID <= 0 || (action != "enable" && action != "disable") {
+		return errors.New("用户状态操作参数无效")
+	}
+	_, err := c.do(ctx, http.MethodPost, "/api/user/manage", map[string]any{"id": userID, "action": action}, true)
+	return err
+}
+
+func (c *Client) ResetUser2FA(ctx context.Context, userID int) error {
+	if userID <= 0 {
+		return errors.New("New API 用户 ID 必须是正整数")
+	}
+	_, err := c.do(ctx, http.MethodDelete, "/api/user/"+strconv.Itoa(userID)+"/2fa", nil, true)
+	return err
+}
+
+func (c *Client) ResetUserPasskey(ctx context.Context, userID int) error {
+	if userID <= 0 {
+		return errors.New("New API 用户 ID 必须是正整数")
+	}
+	_, err := c.do(ctx, http.MethodDelete, "/api/user/"+strconv.Itoa(userID)+"/reset_passkey", nil, true)
+	return err
+}
+
 func (c *Client) adjustQuota(ctx context.Context, userID int, rawQuota int64, mode string) error {
 	body := map[string]any{
 		"id":     userID,

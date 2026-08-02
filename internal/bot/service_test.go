@@ -39,6 +39,9 @@ type fakeNewAPI struct {
 	usageByModel  []newapi.UsageRecord
 	logs          []newapi.LogRecord
 	models        []string
+	managedAction string
+	reset2FA      int
+	resetPasskey  int
 }
 
 func (f *fakeNewAPI) GetStatus(context.Context, bool) (newapi.Status, error) {
@@ -114,6 +117,22 @@ func (f *fakeNewAPI) ListLogs(_ context.Context, _ time.Time, _ time.Time, usern
 }
 func (f *fakeNewAPI) ListEnabledModels(context.Context) ([]string, error) {
 	return append([]string(nil), f.models...), nil
+}
+func (f *fakeNewAPI) ListUserModels(context.Context, string) ([]string, error) {
+	return append([]string(nil), f.models...), nil
+}
+func (f *fakeNewAPI) ManageUserStatus(_ context.Context, userID int, action string) error {
+	f.lastQuotaUser = userID
+	f.managedAction = action
+	return nil
+}
+func (f *fakeNewAPI) ResetUser2FA(_ context.Context, userID int) error {
+	f.reset2FA = userID
+	return nil
+}
+func (f *fakeNewAPI) ResetUserPasskey(_ context.Context, userID int) error {
+	f.resetPasskey = userID
+	return nil
 }
 func (f *fakeNewAPI) ListUserSubscriptions(_ context.Context, userID int) ([]newapi.UserSubscriptionRecord, error) {
 	records := f.subscriptions[userID]
@@ -257,6 +276,43 @@ func TestBindMissingArgumentShowsExactUsage(t *testing.T) {
 	service.process(context.Background(), groupEvent("g1", "u1", "/bind"))
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "/bind <邮箱或New API用户ID>") {
 		t.Fatalf("unexpected reply: %q", reply)
+	}
+}
+
+func TestWelcomeAndMemberAdd(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	event := groupEvent("g1", "u-admin", "/welcome set 欢迎使用机器人")
+	event.Message.Author.UserOpenID = "admin"
+	service.process(context.Background(), event)
+	service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_MEMBER_ADD", Member: qq.GroupMemberEvent{GroupOpenID: "g1", MemberOpenID: "new-user", Timestamp: time.Now().Unix()}})
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "欢迎使用机器人") || !strings.Contains(reply, "<@new-user>") {
+		t.Fatalf("unexpected welcome reply: %q", reply)
+	}
+}
+
+func TestAdminDisableRequiresConfirmation(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	event := groupEvent("g1", "u-admin", "/admin user disable 42")
+	event.Message.Author.UserOpenID = "admin"
+	service.process(context.Background(), event)
+	reply := lastReply(t, qqAPI)
+	marker := "/confirm "
+	index := strings.Index(reply, marker)
+	if index < 0 {
+		t.Fatalf("missing confirmation: %q", reply)
+	}
+	code := strings.Fields(reply[index+len(marker):])[0]
+	event.Message.Content = "/confirm " + strings.TrimSuffix(code, "。")
+	event.Message.ID = "m-confirm"
+	service.process(context.Background(), event)
+	if api.managedAction != "disable" || api.lastQuotaUser != 42 {
+		t.Fatalf("action not executed: %s %d", api.managedAction, api.lastQuotaUser)
 	}
 }
 
