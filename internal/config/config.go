@@ -49,6 +49,7 @@ type Config struct {
 	GatewayWorkers      int
 	MessageDedupTTL     time.Duration
 	ReadinessFreshness  time.Duration
+	NotifyCheckInterval time.Duration
 }
 
 func Load() (Config, error) {
@@ -140,6 +141,7 @@ func Load() (Config, error) {
 	c.LinkCodeTTL = parseDuration("LINK_CODE_TTL", 10*time.Minute)
 	c.NewAPITimeout = parseDuration("NEWAPI_TIMEOUT", 10*time.Second)
 	c.QQAPITimeout = parseDuration("QQ_API_TIMEOUT", 10*time.Second)
+	c.NotifyCheckInterval = parseDuration("NOTIFY_CHECK_INTERVAL", 10*time.Minute)
 
 	switch c.SMTPTLSMode {
 	case "starttls", "tls", "none":

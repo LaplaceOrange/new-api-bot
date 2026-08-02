@@ -49,6 +49,18 @@ type AuditRecord struct {
 	Metadata    map[string]any `json:"metadata,omitempty"`
 }
 
+type QuotaNotification struct {
+	CanonicalID  string    `json:"canonical_id"`
+	NewAPIID     int       `json:"newapi_id"`
+	GroupOpenID  string    `json:"group_openid"`
+	MemberOpenID string    `json:"member_openid"`
+	Threshold    string    `json:"threshold"`
+	Enabled      bool      `json:"enabled"`
+	Alerted      bool      `json:"alerted"`
+	LastAlertAt  time.Time `json:"last_alert_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 type QQIdentity struct {
 	UnionOpenID  string
 	UserOpenID   string

@@ -26,9 +26,14 @@ import (
 type NewAPI interface {
 	GetStatus(context.Context, bool) (newapi.Status, error)
 	GetUser(context.Context, int) (newapi.User, error)
+	ListUsers(context.Context) ([]newapi.User, error)
 	FindUserByEmail(context.Context, string) (newapi.User, error)
 	AddQuota(context.Context, int, int64) error
 	SubtractQuota(context.Context, int, int64) error
+	ListUsageByUser(context.Context, time.Time, time.Time) ([]newapi.UsageRecord, error)
+	ListUsageByModel(context.Context, time.Time, time.Time, string) ([]newapi.UsageRecord, error)
+	ListLogs(context.Context, time.Time, time.Time, string, int, int) (newapi.LogPage, error)
+	ListEnabledModels(context.Context) ([]string, error)
 	ListUserSubscriptions(context.Context, int) ([]newapi.UserSubscriptionRecord, error)
 	CreateUserSubscription(context.Context, int, int) error
 	InvalidateUserSubscription(context.Context, int) error
@@ -40,25 +45,26 @@ type QQAPI interface {
 }
 
 type Service struct {
-	cfg      config.Config
-	store    *store.Store
-	secure   *secure.Box
-	newAPI   NewAPI
-	qq       QQAPI
-	mailer   mailer.Sender
-	logger   *slog.Logger
-	queue    chan qq.MessageEvent
-	workers  sync.WaitGroup
-	checkins sync.Map
-	credits  sync.Map
-	plans    sync.Map
-	stopOnce sync.Once
+	cfg        config.Config
+	store      *store.Store
+	secure     *secure.Box
+	newAPI     NewAPI
+	qq         QQAPI
+	mailer     mailer.Sender
+	logger     *slog.Logger
+	queue      chan qq.MessageEvent
+	workers    sync.WaitGroup
+	checkins   sync.Map
+	credits    sync.Map
+	plans      sync.Map
+	notifyStop chan struct{}
+	stopOnce   sync.Once
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
 	return &Service{
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
-		queue: make(chan qq.MessageEvent, cfg.GatewayQueueSize),
+		queue: make(chan qq.MessageEvent, cfg.GatewayQueueSize), notifyStop: make(chan struct{}),
 	}
 }
 
@@ -80,10 +86,18 @@ func (s *Service) Start(ctx context.Context) {
 			}
 		}(i)
 	}
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		s.runQuotaNotifier(ctx)
+	}()
 }
 
 func (s *Service) Stop() {
-	s.stopOnce.Do(func() { close(s.queue) })
+	s.stopOnce.Do(func() {
+		close(s.queue)
+		close(s.notifyStop)
+	})
 	s.workers.Wait()
 }
 
@@ -172,6 +186,14 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 			err = s.handleCredit(ctx, event, canonical, identity, fields)
 		case "/plan":
 			err = s.handlePlan(ctx, event, canonical, identity, fields)
+		case "/usage":
+			err = s.handleUsage(ctx, event, canonical, identity, fields)
+		case "/logs":
+			err = s.handleLogs(ctx, event, canonical, identity, fields)
+		case "/models":
+			err = s.handleModels(ctx, event, canonical, fields)
+		case "/notify":
+			err = s.handleNotify(ctx, event, canonical, fields)
 		case "/unbind":
 			err = s.handleUnbind(ctx, event, canonical, fields)
 		case "/admin":
@@ -338,6 +360,7 @@ func (s *Service) handleUnbind(ctx context.Context, event qq.MessageEvent, canon
 	if err != nil {
 		return s.reply(ctx, event, "解除绑定失败，请稍后重试。")
 	}
+	_ = s.store.DeleteQuotaNotification(canonical)
 	_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "binding.self_delete", Target: strconv.Itoa(removed.NewAPIID), Success: true})
 	return s.reply(ctx, event, fmt.Sprintf("已解除当前 QQ 身份与 New API 用户 %d 的绑定。", removed.NewAPIID))
 }
@@ -836,7 +859,7 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 		return s.reply(ctx, event, "你没有执行管理员指令的权限。")
 	}
 	if len(fields) < 2 {
-		return s.reply(ctx, event, "用法：/admin bindings [页码] 或 /admin unbind <用户ID或@用户>")
+		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户> 或 /admin report [时间长度]")
 	}
 	switch strings.ToLower(fields[1]) {
 	case "bindings":
@@ -875,10 +898,13 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 		if err != nil {
 			return s.reply(ctx, event, "未找到该用户的绑定记录。")
 		}
+		_ = s.store.DeleteQuotaNotification(removed.CanonicalID)
 		_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "binding.delete", Target: strconv.Itoa(id), Success: true, Metadata: map[string]any{"old_identity": removed.CanonicalID}})
 		return s.reply(ctx, event, fmt.Sprintf("已解除%s绑定的 New API 用户 %d 的 QQ 绑定。", targetDescription, id))
+	case "report":
+		return s.handleAdminReport(ctx, event, fields)
 	default:
-		return s.reply(ctx, event, "用法：/admin bindings [页码] 或 /admin unbind <用户ID或@用户>")
+		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户> 或 /admin report [时间长度]")
 	}
 }
 
@@ -1090,10 +1116,16 @@ func helpText() string {
 		"/checkin - 签到并直接增加绑定账户额度",
 		"/checkin status - 查看签到状态",
 		"/me - 查看账户与额度",
+		"/usage [时间长度] - 查看自己的用量，例如 /usage 7d",
+		"/usage <时间长度> all - 查看全部用户的用量（所有已绑定用户可用）",
+		"/logs [数量] - 查看自己的最近调用记录",
+		"/models - 查看站点当前已启用模型",
+		"/notify quota <额度>|off - 设置或关闭群内低额度提醒",
 		"/plan view - 查看自己的全部订阅",
 		"/whoami - 查看当前 OpenID",
 		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）",
 		"管理员：/plan add、/plan sub、/plan view <用户ID或@群成员>",
 		"管理员：/admin bindings、/admin unbind <用户ID或@群成员>",
+		"管理员：/admin report [时间长度] - 查看全站用量摘要",
 	}, "\n")
 }

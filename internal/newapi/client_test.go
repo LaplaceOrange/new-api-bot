@@ -111,3 +111,59 @@ func TestSubscriptionAdminEndpoints(t *testing.T) {
 		t.Fatal("invalidate endpoint was not called")
 	}
 }
+
+func TestInsightsEndpointsAndUserFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/user/2":
+			_, _ = w.Write([]byte(`{"success":false,"message":"No permission to access users of same or higher level","data":null}`))
+		case "/api/user/":
+			_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"items":[{"id":2,"username":"admin","group":"default","quota":123}],"total":1}}`))
+		case "/api/data/users":
+			if r.URL.Query().Get("start_timestamp") == "" || r.URL.Query().Get("end_timestamp") == "" {
+				t.Error("missing usage timestamps")
+			}
+			_, _ = w.Write([]byte(`{"success":true,"message":"","data":[{"username":"admin","created_at":1700000000,"token_used":12,"count":2,"quota":500000}]}`))
+		case "/api/data":
+			if r.URL.Query().Get("username") != "admin" {
+				t.Errorf("username=%q", r.URL.Query().Get("username"))
+			}
+			_, _ = w.Write([]byte(`{"success":true,"message":"","data":[{"username":"admin","model_name":"gpt-test","count":2,"quota":500000}]}`))
+		case "/api/log/":
+			if r.URL.Query().Get("type") != "2" || r.URL.Query().Get("username") != "admin" {
+				t.Errorf("unexpected log query: %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"items":[{"id":1,"user_id":2,"username":"admin","model_name":"gpt-test","prompt_tokens":10,"completion_tokens":5}],"total":1}}`))
+		case "/api/channel/models_enabled":
+			_, _ = w.Write([]byte(`{"success":true,"message":"","data":["gpt-test","gpt-test","claude-test"]}`))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := New(server.URL, "test-token", 1, 3*time.Second)
+	user, err := client.GetUser(context.Background(), 2)
+	if err != nil || user.Username != "admin" || user.Group != "default" {
+		t.Fatalf("fallback user=%#v err=%v", user, err)
+	}
+	start := time.Unix(1700000000, 0)
+	end := start.Add(time.Hour)
+	usage, err := client.ListUsageByUser(context.Background(), start, end)
+	if err != nil || len(usage) != 1 || usage[0].TokenUsed != 12 {
+		t.Fatalf("usage=%#v err=%v", usage, err)
+	}
+	modelsUsage, err := client.ListUsageByModel(context.Background(), start, end, "admin")
+	if err != nil || len(modelsUsage) != 1 || modelsUsage[0].ModelName != "gpt-test" {
+		t.Fatalf("model usage=%#v err=%v", modelsUsage, err)
+	}
+	logs, err := client.ListLogs(context.Background(), start, end, "admin", 1, 10)
+	if err != nil || len(logs.Items) != 1 || logs.Items[0].CompletionTokens != 5 {
+		t.Fatalf("logs=%#v err=%v", logs, err)
+	}
+	models, err := client.ListEnabledModels(context.Background())
+	if err != nil || len(models) != 2 || models[0] != "claude-test" {
+		t.Fatalf("models=%#v err=%v", models, err)
+	}
+}
