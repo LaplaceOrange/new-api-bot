@@ -28,21 +28,46 @@ func TestPublicErrorMapsExistingAdministratorPermissionFailure(t *testing.T) {
 
 type fakeNewAPI struct {
 	user          newapi.User
+	users         []newapi.User
 	quotaAdds     int
 	quotaSubs     int
 	lastQuotaUser int
 	lastQuota     int64
 	subscriptions map[int][]newapi.UserSubscriptionRecord
 	nextSubID     int
+	usageByUser   []newapi.UsageRecord
+	usageByModel  []newapi.UsageRecord
+	logs          []newapi.LogRecord
+	models        []string
 }
 
 func (f *fakeNewAPI) GetStatus(context.Context, bool) (newapi.Status, error) {
 	return newapi.Status{SystemName: "Test API", QuotaPerUnit: 500000}, nil
 }
 func (f *fakeNewAPI) GetUser(_ context.Context, id int) (newapi.User, error) {
+	if f.user.ID == id {
+		return f.user, nil
+	}
+	for _, user := range f.users {
+		if user.ID == id {
+			return user, nil
+		}
+	}
 	u := f.user
 	u.ID = id
 	return u, nil
+}
+func (f *fakeNewAPI) ListUsers(context.Context) ([]newapi.User, error) {
+	if len(f.users) > 0 {
+		users := append([]newapi.User(nil), f.users...)
+		for index := range users {
+			if users[index].ID == f.user.ID {
+				users[index] = f.user
+			}
+		}
+		return users, nil
+	}
+	return []newapi.User{f.user}, nil
 }
 func (f *fakeNewAPI) FindUserByEmail(context.Context, string) (newapi.User, error) {
 	return f.user, nil
@@ -58,6 +83,37 @@ func (f *fakeNewAPI) SubtractQuota(_ context.Context, userID int, quota int64) e
 	f.lastQuotaUser = userID
 	f.lastQuota = quota
 	return nil
+}
+func (f *fakeNewAPI) ListUsageByUser(context.Context, time.Time, time.Time) ([]newapi.UsageRecord, error) {
+	return append([]newapi.UsageRecord(nil), f.usageByUser...), nil
+}
+func (f *fakeNewAPI) ListUsageByModel(_ context.Context, _ time.Time, _ time.Time, username string) ([]newapi.UsageRecord, error) {
+	if username == "" {
+		return append([]newapi.UsageRecord(nil), f.usageByModel...), nil
+	}
+	result := make([]newapi.UsageRecord, 0)
+	for _, record := range f.usageByModel {
+		if strings.EqualFold(record.Username, username) {
+			result = append(result, record)
+		}
+	}
+	return result, nil
+}
+func (f *fakeNewAPI) ListLogs(_ context.Context, _ time.Time, _ time.Time, username string, _, pageSize int) (newapi.LogPage, error) {
+	items := make([]newapi.LogRecord, 0, pageSize)
+	for _, record := range f.logs {
+		if username != "" && !strings.EqualFold(record.Username, username) {
+			continue
+		}
+		items = append(items, record)
+		if len(items) >= pageSize {
+			break
+		}
+	}
+	return newapi.LogPage{Items: items, Total: len(items)}, nil
+}
+func (f *fakeNewAPI) ListEnabledModels(context.Context) ([]string, error) {
+	return append([]string(nil), f.models...), nil
 }
 func (f *fakeNewAPI) ListUserSubscriptions(_ context.Context, userID int) ([]newapi.UserSubscriptionRecord, error) {
 	records := f.subscriptions[userID]
@@ -138,9 +194,12 @@ func testService(t *testing.T) (*Service, *store.Store, *fakeNewAPI, *fakeQQ, *f
 		GatewayQueueSize:    64,
 		GatewayWorkers:      2,
 		MessageDedupTTL:     time.Hour,
+		NewAPITimeout:       3 * time.Second,
+		NotifyCheckInterval: time.Hour,
 	}
 	api := &fakeNewAPI{
 		user:          newapi.User{ID: 42, Username: "alice", Email: "alice@example.com", Status: 1},
+		users:         []newapi.User{{ID: 42, Username: "alice", Email: "alice@example.com", Status: 1}},
 		subscriptions: make(map[int][]newapi.UserSubscriptionRecord),
 	}
 	qqAPI := &fakeQQ{}
@@ -380,6 +439,102 @@ func TestPlanViewOtherRequiresAdmin(t *testing.T) {
 	service.process(context.Background(), groupEvent("g1", "u1", "/plan view 42"))
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "没有查看其他用户订阅的权限") {
 		t.Fatalf("unexpected permission reply: %q", reply)
+	}
+}
+
+func TestUsageSelfAndAllUsers(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	api.user = newapi.User{ID: 42, Username: "alice", Quota: 2500000, Status: 1}
+	api.users = []newapi.User{
+		api.user,
+		{ID: 43, Username: "bob", Quota: 1000000, Status: 1},
+	}
+	api.usageByUser = []newapi.UsageRecord{
+		{Username: "alice", Count: 3, TokenUsed: 1200, Quota: 500000},
+		{Username: "bob", Count: 2, TokenUsed: 800, Quota: 250000},
+	}
+	api.usageByModel = []newapi.UsageRecord{
+		{Username: "alice", ModelName: "gpt-test", Count: 3, TokenUsed: 1200, Quota: 500000},
+	}
+
+	service.process(context.Background(), groupEvent("g1", "u1", "/usage 7d"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "请求次数：3") || !strings.Contains(reply, "消耗额度：1") || !strings.Contains(reply, "gpt-test") {
+		t.Fatalf("unexpected self usage reply: %q", reply)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "u1", "/usage 7d all"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "全部用户用量") || !strings.Contains(reply, "ID 42｜alice") || !strings.Contains(reply, "ID 43｜bob") {
+		t.Fatalf("unexpected all usage reply: %q", reply)
+	}
+}
+
+func TestLogsModelsAndAdminReport(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	api.user = newapi.User{ID: 42, Username: "alice", Quota: 2000000, Group: "default", Status: 1}
+	api.users = []newapi.User{api.user}
+	api.logs = []newapi.LogRecord{{UserID: 42, Username: "alice", CreatedAt: time.Now().Unix(), ModelName: "gpt-test", PromptTokens: 10, CompletionTokens: 5, Quota: 500000, UseTime: 2}}
+	api.models = []string{"gpt-test", "claude-test"}
+	api.usageByUser = []newapi.UsageRecord{{Username: "alice", Count: 1, TokenUsed: 15, Quota: 500000}}
+	api.usageByModel = []newapi.UsageRecord{{Username: "alice", ModelName: "gpt-test", Count: 1, TokenUsed: 15, Quota: 500000}}
+
+	service.process(context.Background(), groupEvent("g1", "admin", "/logs 5"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "gpt-test") || !strings.Contains(reply, "输入 10 / 输出 5") {
+		t.Fatalf("unexpected logs reply: %q", reply)
+	}
+	service.process(context.Background(), groupEvent("g1", "admin", "/models"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "claude-test") || !strings.Contains(reply, "用户分组：default") {
+		t.Fatalf("unexpected models reply: %q", reply)
+	}
+	service.process(context.Background(), groupEvent("g1", "admin", "/admin report 7d"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "全站用量报告") || !strings.Contains(reply, "热门模型") {
+		t.Fatalf("unexpected report reply: %q", reply)
+	}
+}
+
+func TestQuotaNotificationSendsOnceAndRearms(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	api.user = newapi.User{ID: 42, Username: "alice", DisplayName: "Alice", Quota: 250000, Status: 1}
+	api.users = []newapi.User{api.user}
+	preference := model.QuotaNotification{CanonicalID: "member:g1:u1", NewAPIID: 42, GroupOpenID: "g1", Threshold: "1", Enabled: true}
+	if err := storage.PutQuotaNotification(preference); err != nil {
+		t.Fatal(err)
+	}
+	service.checkQuotaNotifications()
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "额度提醒") || !strings.Contains(reply, "Alice") {
+		t.Fatalf("unexpected notify reply: %q", reply)
+	}
+	saved, err := storage.GetQuotaNotification("member:g1:u1")
+	if err != nil || !saved.Alerted {
+		t.Fatalf("notification not marked alerted: %#v err=%v", saved, err)
+	}
+	messageCount := len(qqAPI.messages)
+	service.checkQuotaNotifications()
+	if len(qqAPI.messages) != messageCount {
+		t.Fatal("duplicate quota notification was sent")
+	}
+	api.user.Quota = 1000000
+	service.checkQuotaNotifications()
+	saved, _ = storage.GetQuotaNotification("member:g1:u1")
+	if saved.Alerted {
+		t.Fatal("quota notification was not rearmed after balance recovery")
+	}
+}
+
+func TestParseInsightRange(t *testing.T) {
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	start, end, _, err := parseInsightRange("7d", now, time.UTC)
+	if err != nil || !end.Equal(now) || end.Sub(start) != 7*24*time.Hour {
+		t.Fatalf("7d range start=%v end=%v err=%v", start, end, err)
+	}
+	if _, _, _, err := parseInsightRange("32d", now, time.UTC); err == nil {
+		t.Fatal("expected range limit error")
 	}
 }
 

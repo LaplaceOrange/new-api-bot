@@ -1,6 +1,6 @@
 # QQ × New API 机器人后端
 
-一个面向 [QQ 机器人 API v2](https://bot.q.qq.com/wiki/develop/api-v2/) 与 [New API 管理接口](https://docs.newapi.ai/zh/docs/api) 的低内存 Go 后端。机器人在群聊中完成邮箱验证码绑定、直接加额度签到、额度管理和管理员审计。
+一个面向 [QQ 机器人 API v2](https://bot.q.qq.com/wiki/develop/api-v2/) 与 [New API 管理接口](https://docs.newapi.ai/zh/docs/api) 的低内存 Go 后端。机器人在群聊中完成邮箱验证码绑定、直接加额度签到、用量查询、额度提醒、订阅管理和管理员审计。
 
 ## 推荐 AI 中转站
 
@@ -14,6 +14,8 @@
 - SMTP 邮箱验证码，每个 QQ 身份和目标账户每小时默认最多发送两封。
 - 按自然日、自然周或自然月直接给已绑定 New API 用户增加签到额度。
 - 管理员增加/扣除额度、管理用户订阅、查看绑定和解除绑定。
+- 查询个人、指定用户或全站用户用量，查看调用记录和站点已启用模型。
+- 在指定群内发送低额度提醒；管理员可查看全站用户与模型用量报表。
 - bbolt 单文件持久化、AES-256-GCM 敏感数据加密、JSON 结构化日志。
 - `/healthz` 和 `/readyz` 健康检查。
 
@@ -28,6 +30,15 @@
 | `/checkin` | 群聊 | 签到并直接增加绑定账户额度 |
 | `/checkin status` | 群聊 | 查看当前周期签到状态 |
 | `/me` | 群聊 | 查看绑定账户及额度 |
+| `/usage [时间长度]` | 已绑定用户 | 查看自己的请求数、Token、消耗额度及常用模型，默认最近 24 小时 |
+| `/usage <时间长度> all` | 已绑定用户 | 查看该时间段内所有 New API 用户的使用情况，所有已绑定用户可用 |
+| `/usage <时间长度> <用户ID或@用户>` | 管理员 | 查看指定用户的使用情况 |
+| `/logs [数量]` | 已绑定用户 | 查看自己的最近调用记录，默认 10 条、最多 20 条 |
+| `/logs <用户ID或@用户> [数量]` | 管理员 | 查看指定用户的最近调用记录 |
+| `/models` | 已绑定用户 | 查看站点当前已启用模型及自己的用户分组 |
+| `/notify quota <额度>` | 已绑定用户 | 在当前群设置低额度提醒 |
+| `/notify quota off` | 已绑定用户 | 关闭自己的低额度提醒 |
+| `/notify status` | 已绑定用户 | 查看自己的额度提醒状态 |
 | `/whoami` | 任意 | 查看可写入管理员名单的 OpenID |
 | `/help` | 任意 | 查看指令说明 |
 | `/credit add <用户ID或@用户> <额度>` | 管理员 | 增加用户额度 |
@@ -39,10 +50,13 @@
 | `/plan sub <订阅编号> <用户ID或@用户>` | 管理员 | 验证订阅归属后立即取消订阅 |
 | `/admin bindings [页码]` | 管理员 | 分页查看绑定 |
 | `/admin unbind <用户ID或@用户>` | 管理员 | 解除绑定 |
+| `/admin report [时间长度]` | 管理员 | 查看全站用户及模型用量摘要，默认最近 24 小时 |
 
 除 `/help`、`/whoami` 和 `/bind` 外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
 
 所有以“用户ID”为目标的管理指令均可在群聊中使用 `@群成员` 代替数字 New API 用户 ID；机器人会读取该群成员已经建立的绑定。`/bind <邮箱或用户ID>` 是例外，只接受邮箱或数字 New API 用户 ID，不能使用 `@群成员`。
+
+用量时间长度支持 `30m`、`24h`、`7d`、`4w`、`today`、`week` 和 `month` 等格式，最长查询 31 天。例如 `/usage 7d all` 会按额度消耗从高到低列出最近 7 天的全部用户。由于该指令会展示全站用户名和用量数据，所有已绑定用户均可直接执行。
 
 ## 准备 QQ 机器人
 
@@ -71,8 +85,13 @@ QQ_ADMIN_OPENIDS=union:ABCDEF,user:123456,member:GROUP_OPENID:MEMBER_OPENID
 
 - `GET /api/status`
 - `GET /api/user/{id}`
+- `GET /api/user/`
 - `GET /api/user/search`
 - `POST /api/user/manage`
+- `GET /api/data/users`
+- `GET /api/data`
+- `GET /api/log/`
+- `GET /api/channel/models_enabled`
 - `GET /api/subscription/admin/users/{id}/subscriptions`
 - `POST /api/subscription/admin/users/{id}/subscriptions`
 - `POST /api/subscription/admin/user_subscriptions/{id}/invalidate`
@@ -133,6 +152,14 @@ $bytes = New-Object byte[] 32
 - 显示额度 `1` 对应原始 quota `500000`。
 - 显示额度 `0.01` 对应原始 quota `5000`。
 - 如果换算结果不是整数 quota，指令会被拒绝。
+
+### 额度提醒
+
+- 用户在希望接收提醒的群内执行 `/notify quota <额度>`，阈值使用站点显示额度。
+- 后台默认每 10 分钟检查一次，可通过 `NOTIFY_CHECK_INTERVAL` 调整。
+- 余额首次低于或等于阈值时，机器人会在设置提醒的群内发送一次通知。
+- 提醒后不会重复刷屏；账户充值并重新高于阈值后会自动恢复监控，下次再次低于阈值时重新提醒。
+- `/notify quota off` 会删除提醒配置；用户解绑时也会自动删除对应提醒。
 
 ## Docker Compose 部署
 

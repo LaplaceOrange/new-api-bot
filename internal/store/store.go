@@ -37,6 +37,7 @@ var buckets = [][]byte{
 	[]byte("message_dedup"),
 	[]byte("gateway"),
 	[]byte("audit"),
+	[]byte("quota_notifications"),
 }
 
 type Store struct {
@@ -604,6 +605,55 @@ func (s *Store) AddAudit(record model.AuditRecord) error {
 		binary.BigEndian.PutUint64(key[:], seq)
 		return bucket.Put(key[:], data)
 	})
+}
+
+func (s *Store) PutQuotaNotification(preference model.QuotaNotification) error {
+	if strings.TrimSpace(preference.CanonicalID) == "" || preference.NewAPIID <= 0 || strings.TrimSpace(preference.GroupOpenID) == "" {
+		return errors.New("额度提醒配置缺少必要字段")
+	}
+	preference.UpdatedAt = time.Now()
+	data, err := json.Marshal(preference)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("quota_notifications")).Put([]byte(preference.CanonicalID), data)
+	})
+}
+
+func (s *Store) GetQuotaNotification(canonical string) (model.QuotaNotification, error) {
+	var preference model.QuotaNotification
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("quota_notifications")).Get([]byte(canonical))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &preference)
+	})
+	return preference, err
+}
+
+func (s *Store) DeleteQuotaNotification(canonical string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("quota_notifications")).Delete([]byte(canonical))
+	})
+}
+
+func (s *Store) ListQuotaNotifications() ([]model.QuotaNotification, error) {
+	preferences := make([]model.QuotaNotification, 0)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("quota_notifications")).ForEach(func(_, value []byte) error {
+			var preference model.QuotaNotification
+			if err := json.Unmarshal(value, &preference); err != nil {
+				return err
+			}
+			if preference.Enabled {
+				preferences = append(preferences, preference)
+			}
+			return nil
+		})
+	})
+	return preferences, err
 }
 
 func MaskEmail(email string) string {

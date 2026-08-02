@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const maxResponseBody = 1 << 20
+const maxResponseBody = 8 << 20
 
 var ErrRedemptionNotFound = errors.New("未找到对应的兑换码记录")
 
@@ -52,14 +52,16 @@ type Status struct {
 }
 
 type User struct {
-	ID          int    `json:"id"`
-	Username    string `json:"username"`
-	DisplayName string `json:"display_name"`
-	Email       string `json:"email"`
-	Quota       int64  `json:"quota"`
-	UsedQuota   int64  `json:"used_quota"`
-	Status      int    `json:"status"`
-	Role        int    `json:"role"`
+	ID           int    `json:"id"`
+	Username     string `json:"username"`
+	DisplayName  string `json:"display_name"`
+	Email        string `json:"email"`
+	Group        string `json:"group"`
+	Quota        int64  `json:"quota"`
+	UsedQuota    int64  `json:"used_quota"`
+	RequestCount int64  `json:"request_count"`
+	Status       int    `json:"status"`
+	Role         int    `json:"role"`
 }
 
 type Redemption struct {
@@ -158,6 +160,15 @@ func (c *Client) GetStatus(ctx context.Context, force bool) (Status, error) {
 func (c *Client) GetUser(ctx context.Context, id int) (User, error) {
 	env, err := c.do(ctx, http.MethodGet, "/api/user/"+strconv.Itoa(id), nil, true)
 	if err != nil {
+		users, listErr := c.ListUsers(ctx)
+		if listErr != nil {
+			return User{}, err
+		}
+		for _, user := range users {
+			if user.ID == id {
+				return user, nil
+			}
+		}
 		return User{}, err
 	}
 	var user User
@@ -364,6 +375,15 @@ func (c *Client) do(ctx context.Context, method, path string, body any, auth boo
 func decodeRaw(data json.RawMessage, target any) error {
 	if len(data) == 0 || string(data) == "null" {
 		return errors.New("响应 data 为空")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	return decoder.Decode(target)
+}
+
+func decodeRawAllowEmptyArray(data json.RawMessage, target any) error {
+	if len(data) == 0 || string(data) == "null" {
+		data = []byte("[]")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
