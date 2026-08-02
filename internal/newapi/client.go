@@ -65,12 +65,15 @@ type User struct {
 }
 
 type Redemption struct {
-	ID          int    `json:"id"`
-	Key         string `json:"key"`
-	Name        string `json:"name"`
-	Status      int    `json:"status"`
-	Quota       int64  `json:"quota"`
-	ExpiredTime int64  `json:"expired_time"`
+	ID           int    `json:"id"`
+	Key          string `json:"key"`
+	Name         string `json:"name"`
+	Status       int    `json:"status"`
+	Quota        int64  `json:"quota"`
+	ExpiredTime  int64  `json:"expired_time"`
+	CreatedTime  int64  `json:"created_time"`
+	RedeemedTime int64  `json:"redeemed_time"`
+	UsedUserID   int    `json:"used_user_id"`
 }
 
 type UserSubscription struct {
@@ -302,24 +305,70 @@ func (c *Client) InvalidateUserSubscription(ctx context.Context, subscriptionID 
 }
 
 func (c *Client) CreateRedemption(ctx context.Context, name string, rawQuota int64, expiresAt time.Time) (string, error) {
+	keys, err := c.CreateRedemptions(ctx, name, 1, rawQuota, expiresAt)
+	if err != nil {
+		return "", err
+	}
+	if len(keys) != 1 {
+		return "", errors.New("New API 未返回新建兑换码")
+	}
+	return keys[0], nil
+}
+
+func (c *Client) CreateRedemptions(ctx context.Context, name string, count int, rawQuota int64, expiresAt time.Time) ([]string, error) {
+	if count < 1 || count > 100 {
+		return nil, errors.New("兑换码数量必须是 1 到 100")
+	}
 	body := map[string]any{
 		"name":         name,
-		"count":        1,
+		"count":        count,
 		"quota":        rawQuota,
 		"expired_time": expiresAt.Unix(),
 	}
 	env, err := c.do(ctx, http.MethodPost, "/api/redemption/", body, true)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	var keys []string
 	if err := decodeRaw(env.Data, &keys); err != nil {
-		return "", fmt.Errorf("解析兑换码创建结果失败: %w", err)
+		return nil, fmt.Errorf("解析兑换码创建结果失败: %w", err)
 	}
-	if len(keys) != 1 || strings.TrimSpace(keys[0]) == "" {
-		return "", errors.New("New API 未返回新建兑换码")
+	if len(keys) != count {
+		return nil, fmt.Errorf("New API 返回兑换码数量不符：期望 %d，实际 %d", count, len(keys))
 	}
-	return keys[0], nil
+	for _, key := range keys {
+		if strings.TrimSpace(key) == "" {
+			return nil, errors.New("New API 返回了空兑换码")
+		}
+	}
+	return keys, nil
+}
+
+func (c *Client) SearchRedemptions(ctx context.Context, name string, pageSize int) ([]Redemption, error) {
+	if pageSize < 1 {
+		pageSize = 100
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	path := "/api/redemption/search?keyword=" + url.QueryEscape(name) + "&p=1&page_size=" + strconv.Itoa(pageSize)
+	env, err := c.do(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var page struct {
+		Items []Redemption `json:"items"`
+	}
+	if err := decodeRaw(env.Data, &page); err != nil {
+		return nil, fmt.Errorf("解析兑换码搜索结果失败: %w", err)
+	}
+	result := make([]Redemption, 0, len(page.Items))
+	for _, item := range page.Items {
+		if item.Name == name {
+			result = append(result, item)
+		}
+	}
+	return result, nil
 }
 
 func (c *Client) FindRedemptionByName(ctx context.Context, name string) (Redemption, error) {

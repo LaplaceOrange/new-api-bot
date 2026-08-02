@@ -37,6 +37,10 @@ type NewAPI interface {
 	ListUserSubscriptions(context.Context, int) ([]newapi.UserSubscriptionRecord, error)
 	CreateUserSubscription(context.Context, int, int) error
 	InvalidateUserSubscription(context.Context, int) error
+	CreateRedemptions(context.Context, string, int, int64, time.Time) ([]string, error)
+	SearchRedemptions(context.Context, string, int) ([]newapi.Redemption, error)
+	ListLogsByType(context.Context, time.Time, time.Time, string, int, int, int) (newapi.LogPage, error)
+	ManageUserStatus(context.Context, int, string) error
 }
 
 type QQAPI interface {
@@ -62,6 +66,7 @@ type Service struct {
 	gatewayConnected func() bool
 	notifyMu         sync.Mutex
 	groupLastNotify  map[string]time.Time
+	benefitMu        sync.Mutex
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
@@ -98,6 +103,11 @@ func (s *Service) Start(ctx context.Context) {
 			s.runQuotaNotifier(ctx)
 		}()
 	}
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		s.runBenefitWorker(ctx)
+	}()
 }
 
 func (s *Service) Stop() {
@@ -200,6 +210,8 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 			err = s.handleCredit(ctx, event, canonical, identity, fields)
 		case "/plan":
 			err = s.handlePlan(ctx, event, canonical, identity, fields)
+		case "/benefit":
+			err = s.handleBenefit(ctx, event, canonical, identity, fields)
 		case "/usage":
 			err = s.handleUsage(ctx, event, canonical, identity, fields)
 		case "/logs":
@@ -1191,6 +1203,9 @@ func helpText(cfg config.Config) string {
 	}
 	if cfg.AdminUserManagementEnabled {
 		lines = append(lines, "管理员：/admin user status|enable|disable|reset2fa|resetpasskey <用户>")
+	}
+	if cfg.BenefitEnabled {
+		lines = append(lines, "管理员：/benefit <面额> <数量> <有效期(h)> <封禁时间(day)> - 发放限领福利")
 	}
 	return strings.Join(lines, "\n")
 }

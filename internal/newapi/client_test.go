@@ -112,6 +112,40 @@ func TestSubscriptionAdminEndpoints(t *testing.T) {
 	}
 }
 
+func TestBulkRedemptionEndpoints(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/redemption/":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["count"] != float64(3) || body["name"] != "bf-test" {
+				t.Fatalf("unexpected body: %#v", body)
+			}
+			_, _ = w.Write([]byte(`{"success":true,"message":"","data":["code-a","code-b","code-c"]}`))
+		case "/api/redemption/search":
+			if r.URL.Query().Get("keyword") != "bf-test" {
+				t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"items":[{"id":1,"name":"bf-test","key":"code-a"},{"id":2,"name":"bf-test","key":"code-b"},{"id":3,"name":"other","key":"ignore"}]}}`))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := New(server.URL, "token", 1, 3*time.Second)
+	keys, err := client.CreateRedemptions(context.Background(), "bf-test", 3, 500000, time.Now().Add(time.Hour))
+	if err != nil || len(keys) != 3 {
+		t.Fatalf("keys=%v err=%v", keys, err)
+	}
+	items, err := client.SearchRedemptions(context.Background(), "bf-test", 100)
+	if err != nil || len(items) != 2 || items[1].ID != 2 {
+		t.Fatalf("items=%#v err=%v", items, err)
+	}
+}
+
 func TestInsightsEndpointsAndUserFallback(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
