@@ -15,44 +15,48 @@ import (
 )
 
 type Config struct {
-	QQAppID             string
-	QQAppSecret         string
-	NewAPIBaseURL       string
-	NewAPIAdminToken    string
-	NewAPIAdminUserID   int
-	QQAdminOpenIDs      map[string]struct{}
-	BotDataKey          []byte
-	SMTPHost            string
-	SMTPPort            int
-	SMTPUsername        string
-	SMTPPassword        string
-	SMTPFrom            string
-	SMTPTLSMode         string
-	CheckinEnabled      bool
-	CheckinCredit       string
-	CheckinPeriod       string
-	CheckinTimezone     *time.Location
-	CheckinTimezoneName string
-	CheckinCodeTTL      time.Duration
-	BindCodeTTL         time.Duration
-	BindCodeMaxAttempts int
-	BindEmailLimit      int
-	BindEmailWindow     time.Duration
-	LinkCodeTTL         time.Duration
-	CreditMaxPerCommand string
-	DataPath            string
-	ListenAddr          string
-	LogLevel            slog.Level
-	NewAPITimeout       time.Duration
-	QQAPITimeout        time.Duration
-	GatewayQueueSize    int
-	GatewayWorkers      int
-	MessageDedupTTL     time.Duration
-	ReadinessFreshness  time.Duration
-	NotifyCheckInterval time.Duration
-	NotifyDailyTime     string
-	NotifyGroupCooldown time.Duration
-	WelcomeDefault      string
+	QQAppID                    string
+	QQAppSecret                string
+	NewAPIBaseURL              string
+	NewAPIAdminToken           string
+	NewAPIAdminUserID          int
+	QQAdminOpenIDs             map[string]struct{}
+	BotDataKey                 []byte
+	SMTPHost                   string
+	SMTPPort                   int
+	SMTPUsername               string
+	SMTPPassword               string
+	SMTPFrom                   string
+	SMTPTLSMode                string
+	CheckinEnabled             bool
+	CheckinCredit              string
+	CheckinPeriod              string
+	CheckinTimezone            *time.Location
+	CheckinTimezoneName        string
+	CheckinCodeTTL             time.Duration
+	BindCodeTTL                time.Duration
+	BindCodeMaxAttempts        int
+	BindEmailLimit             int
+	BindEmailWindow            time.Duration
+	LinkCodeTTL                time.Duration
+	CreditMaxPerCommand        string
+	DataPath                   string
+	ListenAddr                 string
+	LogLevel                   slog.Level
+	NewAPITimeout              time.Duration
+	QQAPITimeout               time.Duration
+	GatewayQueueSize           int
+	GatewayWorkers             int
+	MessageDedupTTL            time.Duration
+	ReadinessFreshness         time.Duration
+	NotifyCheckInterval        time.Duration
+	NotifyDailyTime            string
+	NotifyGroupCooldown        time.Duration
+	WelcomeDefault             string
+	UsageChartEnabled          bool
+	NotifyEnabled              bool
+	AdminReportExportEnabled   bool
+	AdminUserManagementEnabled bool
 }
 
 func Load() (Config, error) {
@@ -140,6 +144,10 @@ func Load() (Config, error) {
 	c.BindCodeMaxAttempts = parseInt("BIND_CODE_MAX_ATTEMPTS", 5, 1)
 	c.BindEmailLimit = parseInt("BIND_EMAIL_LIMIT", 2, 1)
 	c.CheckinEnabled = parseBool("CHECKIN_ENABLED", true)
+	c.UsageChartEnabled = parseBool("USAGE_CHART_ENABLED", true)
+	c.NotifyEnabled = parseBool("NOTIFY_ENABLED", true)
+	c.AdminReportExportEnabled = parseBool("ADMIN_REPORT_EXPORT_ENABLED", true)
+	c.AdminUserManagementEnabled = parseBool("ADMIN_USER_MANAGEMENT_ENABLED", true)
 	c.CheckinCodeTTL = parseDuration("CHECKIN_CODE_TTL", 24*time.Hour)
 	c.BindCodeTTL = parseDuration("BIND_CODE_TTL", 10*time.Minute)
 	c.BindEmailWindow = parseDuration("BIND_EMAIL_WINDOW", time.Hour)

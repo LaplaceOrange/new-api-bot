@@ -91,11 +91,13 @@ func (s *Service) Start(ctx context.Context) {
 			}
 		}(i)
 	}
-	s.workers.Add(1)
-	go func() {
-		defer s.workers.Done()
-		s.runQuotaNotifier(ctx)
-	}()
+	if s.cfg.NotifyEnabled {
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			s.runQuotaNotifier(ctx)
+		}()
+	}
 }
 
 func (s *Service) Stop() {
@@ -164,7 +166,7 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		if len(fields) != 1 {
 			err = s.reply(ctx, event, "格式错误。正确用法：/help")
 		} else {
-			err = s.reply(ctx, event, helpText())
+			err = s.reply(ctx, event, helpText(s.cfg))
 		}
 	case "/whoami":
 		if len(fields) != 1 {
@@ -205,7 +207,11 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		case "/models":
 			err = s.handleModels(ctx, event, canonical, identity, fields)
 		case "/notify":
-			err = s.handleNotify(ctx, event, canonical, fields)
+			if !s.cfg.NotifyEnabled {
+				err = s.reply(ctx, event, "额度提醒功能当前已关闭。")
+			} else {
+				err = s.handleNotify(ctx, event, canonical, fields)
+			}
 		case "/welcome":
 			err = s.handleWelcome(ctx, event, identity, fields, content)
 		case "/bot":
@@ -213,7 +219,11 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		case "/recall":
 			err = s.handleRecall(ctx, event, identity, fields)
 		case "/confirm":
-			err = s.handleConfirm(ctx, event, canonical, identity, fields)
+			if !s.cfg.AdminUserManagementEnabled {
+				err = s.reply(ctx, event, "New API 用户状态管理功能当前已关闭。")
+			} else {
+				err = s.handleConfirm(ctx, event, canonical, identity, fields)
+			}
 		case "/unbind":
 			err = s.handleUnbind(ctx, event, canonical, fields)
 		case "/admin":
@@ -923,10 +933,16 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 		return s.reply(ctx, event, fmt.Sprintf("已解除%s绑定的 New API 用户 %d 的 QQ 绑定。", targetDescription, id))
 	case "report":
 		if len(fields) >= 3 && strings.EqualFold(fields[2], "export") {
+			if !s.cfg.AdminReportExportEnabled {
+				return s.reply(ctx, event, "CSV 管理报表导出功能当前已关闭。")
+			}
 			return s.handleAdminReportExport(ctx, event, fields)
 		}
 		return s.handleAdminReport(ctx, event, fields)
 	case "user":
+		if !s.cfg.AdminUserManagementEnabled {
+			return s.reply(ctx, event, "New API 用户状态管理功能当前已关闭。")
+		}
 		return s.handleAdminUser(ctx, event, canonical, identity, fields)
 	default:
 		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户> 或 /admin report [时间长度]")
@@ -1140,8 +1156,8 @@ func userStatusText(status int) string {
 	}
 }
 
-func helpText() string {
-	return strings.Join([]string{
+func helpText(cfg config.Config) string {
+	lines := []string{
 		"可用指令：",
 		"/bind <邮箱或用户ID> - 在当前群发送绑定验证码",
 		"/bind vertify <验证码> - 在当前群完成绑定",
@@ -1155,8 +1171,6 @@ func helpText() string {
 		"/usage <时间长度> <前N名> - 查看用量排行榜，例如 /usage 7d 10",
 		"/logs [数量] - 查看自己的最近调用记录",
 		"/models [用户ID或@用户] - 查看用户分组可用模型",
-		"/notify quota <额度>|off、/notify daily on|off、/notify status",
-		"/usage chart <时间长度> - 生成个人用量图表",
 		"/plan view - 查看自己的全部订阅",
 		"/whoami - 查看当前 OpenID",
 		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）",
@@ -1164,8 +1178,19 @@ func helpText() string {
 		"管理员：/admin bindings、/admin unbind <用户ID或@群成员>",
 		"管理员：/admin report [时间长度] - 查看全站用量摘要",
 		"管理员：/welcome on|off|set <欢迎语>、/recall",
-		"管理员：/admin user status|enable|disable|reset2fa|resetpasskey <用户>",
-		"管理员：/admin report export [时间长度] - 导出 CSV",
 		"/bot status - 查看机器人与群聊状态",
-	}, "\n")
+	}
+	if cfg.UsageChartEnabled {
+		lines = append(lines, "/usage chart <时间长度> - 生成个人用量图表")
+	}
+	if cfg.NotifyEnabled {
+		lines = append(lines, "/notify quota <额度>|off、/notify daily on|off、/notify status")
+	}
+	if cfg.AdminReportExportEnabled {
+		lines = append(lines, "管理员：/admin report export [时间长度] - 导出 CSV")
+	}
+	if cfg.AdminUserManagementEnabled {
+		lines = append(lines, "管理员：/admin user status|enable|disable|reset2fa|resetpasskey <用户>")
+	}
+	return strings.Join(lines, "\n")
 }

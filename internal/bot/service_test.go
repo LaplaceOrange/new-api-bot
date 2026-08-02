@@ -198,23 +198,27 @@ func testService(t *testing.T) (*Service, *store.Store, *fakeNewAPI, *fakeQQ, *f
 		t.Fatal(err)
 	}
 	cfg := config.Config{
-		QQAdminOpenIDs:      map[string]struct{}{"user:admin": {}},
-		CheckinEnabled:      true,
-		CheckinCredit:       "1",
-		CheckinPeriod:       "daily",
-		CheckinTimezone:     time.UTC,
-		CheckinCodeTTL:      24 * time.Hour,
-		BindCodeTTL:         10 * time.Minute,
-		BindCodeMaxAttempts: 5,
-		BindEmailLimit:      2,
-		BindEmailWindow:     time.Hour,
-		LinkCodeTTL:         10 * time.Minute,
-		CreditMaxPerCommand: "1000",
-		GatewayQueueSize:    64,
-		GatewayWorkers:      2,
-		MessageDedupTTL:     time.Hour,
-		NewAPITimeout:       3 * time.Second,
-		NotifyCheckInterval: time.Hour,
+		QQAdminOpenIDs:             map[string]struct{}{"user:admin": {}},
+		CheckinEnabled:             true,
+		CheckinCredit:              "1",
+		CheckinPeriod:              "daily",
+		CheckinTimezone:            time.UTC,
+		CheckinCodeTTL:             24 * time.Hour,
+		BindCodeTTL:                10 * time.Minute,
+		BindCodeMaxAttempts:        5,
+		BindEmailLimit:             2,
+		BindEmailWindow:            time.Hour,
+		LinkCodeTTL:                10 * time.Minute,
+		CreditMaxPerCommand:        "1000",
+		GatewayQueueSize:           64,
+		GatewayWorkers:             2,
+		MessageDedupTTL:            time.Hour,
+		NewAPITimeout:              3 * time.Second,
+		NotifyCheckInterval:        time.Hour,
+		UsageChartEnabled:          true,
+		NotifyEnabled:              true,
+		AdminReportExportEnabled:   true,
+		AdminUserManagementEnabled: true,
 	}
 	api := &fakeNewAPI{
 		user:          newapi.User{ID: 42, Username: "alice", Email: "alice@example.com", Status: 1},
@@ -260,6 +264,15 @@ func TestNonCommandMessageIsIgnored(t *testing.T) {
 	defer qqAPI.mu.Unlock()
 	if len(qqAPI.messages) != 0 {
 		t.Fatalf("non-command message unexpectedly received %d replies", len(qqAPI.messages))
+	}
+}
+
+func TestHelpOmitsDisabledFeatures(t *testing.T) {
+	text := helpText(config.Config{})
+	for _, command := range []string{"/usage chart", "/notify", "/admin report export", "/admin user"} {
+		if strings.Contains(text, command) {
+			t.Fatalf("disabled command %q appeared in help: %q", command, text)
+		}
 	}
 }
 
