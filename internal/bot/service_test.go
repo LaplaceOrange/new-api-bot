@@ -379,7 +379,7 @@ func TestBenefitCreatesCodesAndEnforcesSingleClaim(t *testing.T) {
 	event.Message.Author.UserOpenID = "admin"
 	service.process(context.Background(), event)
 	reply := lastReply(t, qqAPI)
-	if !strings.Contains(reply, "<@everyone>") || !strings.Contains(reply, "每个 $1，共 3 个") || !strings.Contains(reply, "每个用户限领一个") {
+	if !strings.Contains(reply, "@everyone") || strings.Contains(reply, "<@everyone>") || !strings.Contains(reply, "每个 $1，共 3 个") || !strings.Contains(reply, "每个用户限领一个") {
 		t.Fatalf("unexpected benefit reply: %q", reply)
 	}
 	campaign, err := storage.GetBenefitCampaign(benefitCampaignID(event.Message.ID))
