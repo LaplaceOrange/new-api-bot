@@ -45,28 +45,33 @@ type QQAPI interface {
 }
 
 type Service struct {
-	cfg        config.Config
-	store      *store.Store
-	secure     *secure.Box
-	newAPI     NewAPI
-	qq         QQAPI
-	mailer     mailer.Sender
-	logger     *slog.Logger
-	queue      chan qq.MessageEvent
-	workers    sync.WaitGroup
-	checkins   sync.Map
-	credits    sync.Map
-	plans      sync.Map
-	notifyStop chan struct{}
-	stopOnce   sync.Once
+	cfg              config.Config
+	store            *store.Store
+	secure           *secure.Box
+	newAPI           NewAPI
+	qq               QQAPI
+	mailer           mailer.Sender
+	logger           *slog.Logger
+	queue            chan qq.MessageEvent
+	workers          sync.WaitGroup
+	checkins         sync.Map
+	credits          sync.Map
+	plans            sync.Map
+	notifyStop       chan struct{}
+	stopOnce         sync.Once
+	gatewayConnected func() bool
+	notifyMu         sync.Mutex
+	groupLastNotify  map[string]time.Time
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
 	return &Service{
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
-		queue: make(chan qq.MessageEvent, cfg.GatewayQueueSize), notifyStop: make(chan struct{}),
+		queue: make(chan qq.MessageEvent, cfg.GatewayQueueSize), notifyStop: make(chan struct{}), groupLastNotify: make(map[string]time.Time),
 	}
 }
+
+func (s *Service) SetGatewayConnectedFunc(fn func() bool) { s.gatewayConnected = fn }
 
 func (s *Service) Start(ctx context.Context) {
 	for i := 0; i < s.cfg.GatewayWorkers; i++ {
@@ -104,6 +109,9 @@ func (s *Service) Stop() {
 func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) {
 	msgIndex := sceneValue(event.Message.Scene.Ext, "msg_idx")
 	dedupKey := event.EventType + "|" + event.Message.ID + "|" + msgIndex
+	if event.Member.GroupOpenID != "" {
+		dedupKey = fmt.Sprintf("%s|%s|%s|%d", event.EventType, event.Member.GroupOpenID, event.Member.MemberOpenID, event.Member.Timestamp)
+	}
 	duplicate, err := s.store.CheckAndMarkMessage(dedupKey, time.Now(), s.cfg.MessageDedupTTL)
 	if err != nil {
 		s.logger.Error("消息去重存储失败", "error", err)
@@ -125,6 +133,10 @@ func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) {
 func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	ctx, cancel := context.WithTimeout(parent, 25*time.Second)
 	defer cancel()
+	if event.EventType == "GROUP_MEMBER_ADD" {
+		s.handleMemberAdd(ctx, event)
+		return
+	}
 	content := strings.TrimSpace(event.Message.Content)
 	if content == "" || !strings.HasPrefix(content, "/") {
 		s.logger.Info("忽略非指令 QQ 消息",
@@ -191,9 +203,17 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		case "/logs":
 			err = s.handleLogs(ctx, event, canonical, identity, fields)
 		case "/models":
-			err = s.handleModels(ctx, event, canonical, fields)
+			err = s.handleModels(ctx, event, canonical, identity, fields)
 		case "/notify":
 			err = s.handleNotify(ctx, event, canonical, fields)
+		case "/welcome":
+			err = s.handleWelcome(ctx, event, identity, fields, content)
+		case "/bot":
+			err = s.handleBotStatus(ctx, event, fields)
+		case "/recall":
+			err = s.handleRecall(ctx, event, identity, fields)
+		case "/confirm":
+			err = s.handleConfirm(ctx, event, canonical, identity, fields)
 		case "/unbind":
 			err = s.handleUnbind(ctx, event, canonical, fields)
 		case "/admin":
@@ -902,7 +922,12 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 		_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "binding.delete", Target: strconv.Itoa(id), Success: true, Metadata: map[string]any{"old_identity": removed.CanonicalID}})
 		return s.reply(ctx, event, fmt.Sprintf("已解除%s绑定的 New API 用户 %d 的 QQ 绑定。", targetDescription, id))
 	case "report":
+		if len(fields) >= 3 && strings.EqualFold(fields[2], "export") {
+			return s.handleAdminReportExport(ctx, event, fields)
+		}
 		return s.handleAdminReport(ctx, event, fields)
+	case "user":
+		return s.handleAdminUser(ctx, event, canonical, identity, fields)
 	default:
 		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户> 或 /admin report [时间长度]")
 	}
@@ -924,6 +949,15 @@ func (s *Service) reply(ctx context.Context, event qq.MessageEvent, content stri
 			openID = event.Message.Author.ID
 		}
 		return s.qq.ReplyC2C(ctx, openID, event.Message.ID, content)
+	}
+	if sender, ok := s.qq.(interface {
+		SendGroupText(context.Context, string, string, string) (qq.SentMessage, error)
+	}); ok {
+		sent, err := sender.SendGroupText(ctx, event.Message.GroupOpenID, event.Message.ID, content)
+		if err == nil && sent.ID != "" {
+			_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: event.Message.GroupOpenID, MessageID: sent.ID, MessageIdx: sceneValue(sent.MessageScene.Ext, "msg_idx"), SentAt: time.Now()})
+		}
+		return err
 	}
 	return s.qq.ReplyGroup(ctx, event.Message.GroupOpenID, event.Message.ID, content)
 }
@@ -1120,13 +1154,18 @@ func helpText() string {
 		"/usage <时间长度> all - 查看全站请求、Token 与额度汇总",
 		"/usage <时间长度> <前N名> - 查看用量排行榜，例如 /usage 7d 10",
 		"/logs [数量] - 查看自己的最近调用记录",
-		"/models - 查看站点当前已启用模型",
-		"/notify quota <额度>|off - 设置或关闭群内低额度提醒",
+		"/models [用户ID或@用户] - 查看用户分组可用模型",
+		"/notify quota <额度>|off、/notify daily on|off、/notify status",
+		"/usage chart <时间长度> - 生成个人用量图表",
 		"/plan view - 查看自己的全部订阅",
 		"/whoami - 查看当前 OpenID",
 		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）",
 		"管理员：/plan add、/plan sub、/plan view <用户ID或@群成员>",
 		"管理员：/admin bindings、/admin unbind <用户ID或@群成员>",
 		"管理员：/admin report [时间长度] - 查看全站用量摘要",
+		"管理员：/welcome on|off|set <欢迎语>、/recall",
+		"管理员：/admin user status|enable|disable|reset2fa|resetpasskey <用户>",
+		"管理员：/admin report export [时间长度] - 导出 CSV",
+		"/bot status - 查看机器人与群聊状态",
 	}, "\n")
 }

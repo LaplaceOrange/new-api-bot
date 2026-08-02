@@ -38,6 +38,9 @@ var buckets = [][]byte{
 	[]byte("gateway"),
 	[]byte("audit"),
 	[]byte("quota_notifications"),
+	[]byte("group_welcome"),
+	[]byte("pending_admin_actions"),
+	[]byte("sent_bot_messages"),
 }
 
 type Store struct {
@@ -647,13 +650,112 @@ func (s *Store) ListQuotaNotifications() ([]model.QuotaNotification, error) {
 			if err := json.Unmarshal(value, &preference); err != nil {
 				return err
 			}
-			if preference.Enabled {
+			if preference.Enabled || preference.DailyEnabled {
 				preferences = append(preferences, preference)
 			}
 			return nil
 		})
 	})
 	return preferences, err
+}
+
+func (s *Store) PutGroupWelcome(setting model.GroupWelcome) error {
+	if strings.TrimSpace(setting.GroupOpenID) == "" {
+		return errors.New("群 OpenID 不能为空")
+	}
+	setting.UpdatedAt = time.Now()
+	data, err := json.Marshal(setting)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("group_welcome")).Put([]byte(setting.GroupOpenID), data)
+	})
+}
+
+func (s *Store) GetGroupWelcome(group string) (model.GroupWelcome, error) {
+	var result model.GroupWelcome
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("group_welcome")).Get([]byte(group))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &result)
+	})
+	return result, err
+}
+
+func (s *Store) PutPendingAdminAction(action model.PendingAdminAction) error {
+	data, err := json.Marshal(action)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("pending_admin_actions")).Put([]byte(action.Code), data)
+	})
+}
+
+func (s *Store) TakePendingAdminAction(code, actor string, now time.Time) (model.PendingAdminAction, error) {
+	var result model.PendingAdminAction
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("pending_admin_actions"))
+		data := b.Get([]byte(code))
+		if data == nil {
+			return ErrNotFound
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			return err
+		}
+		if result.Actor != actor || now.After(result.ExpiresAt) {
+			_ = b.Delete([]byte(code))
+			return ErrNotFound
+		}
+		return b.Delete([]byte(code))
+	})
+	return result, err
+}
+
+func (s *Store) PutSentBotMessage(message model.SentBotMessage) error {
+	data, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("sent_bot_messages"))
+		if message.MessageID != "" {
+			if err := b.Put([]byte("id|"+message.GroupOpenID+"|"+message.MessageID), data); err != nil {
+				return err
+			}
+		}
+		if message.MessageIdx != "" {
+			if err := b.Put([]byte("idx|"+message.GroupOpenID+"|"+message.MessageIdx), data); err != nil {
+				return err
+			}
+		}
+		return b.Put([]byte("last|"+message.GroupOpenID), data)
+	})
+}
+
+func (s *Store) GetSentBotMessage(group, reference string) (model.SentBotMessage, error) {
+	var result model.SentBotMessage
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("sent_bot_messages"))
+		var data []byte
+		if reference != "" {
+			data = b.Get([]byte("id|" + group + "|" + reference))
+			if data == nil {
+				data = b.Get([]byte("idx|" + group + "|" + reference))
+			}
+		}
+		if data == nil {
+			data = b.Get([]byte("last|" + group))
+		}
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &result)
+	})
+	return result, err
 }
 
 func MaskEmail(email string) string {

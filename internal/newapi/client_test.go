@@ -131,7 +131,7 @@ func TestInsightsEndpointsAndUserFallback(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"success":true,"message":"","data":[{"username":"admin","model_name":"gpt-test","count":2,"quota":500000}]}`))
 		case "/api/log/":
-			if r.URL.Query().Get("type") != "2" || r.URL.Query().Get("username") != "admin" {
+			if r.URL.Query().Get("type") != "0" || r.URL.Query().Get("username") != "admin" {
 				t.Errorf("unexpected log query: %s", r.URL.RawQuery)
 			}
 			_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"items":[{"id":1,"user_id":2,"username":"admin","model_name":"gpt-test","prompt_tokens":10,"completion_tokens":5}],"total":1}}`))

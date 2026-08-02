@@ -37,11 +37,32 @@ type LogRecord struct {
 	UseTime          int64  `json:"use_time"`
 	IsStream         bool   `json:"is_stream"`
 	Group            string `json:"group"`
+	Content          string `json:"content"`
 }
 
 type LogPage struct {
 	Items []LogRecord `json:"items"`
 	Total int         `json:"total"`
+}
+
+func (c *Client) CountLogOutcomes(ctx context.Context, start, end time.Time, username string) (success, failed int64, err error) {
+	for page := 1; page <= maxUserPages; page++ {
+		result, listErr := c.ListLogs(ctx, start, end, username, page, 100)
+		if listErr != nil {
+			return 0, 0, listErr
+		}
+		for _, item := range result.Items {
+			if item.Type == 5 {
+				failed++
+			} else if item.Type == 2 {
+				success++
+			}
+		}
+		if len(result.Items) < 100 || int(success+failed) >= result.Total {
+			return success, failed, nil
+		}
+	}
+	return success, failed, errors.New("日志数量超过最大分页限制")
 }
 
 func (c *Client) ListUsers(ctx context.Context) ([]User, error) {
@@ -110,7 +131,8 @@ func (c *Client) ListLogs(ctx context.Context, start, end time.Time, username st
 		pageSize = 100
 	}
 	query := url.Values{}
-	query.Set("type", "2")
+	// type=0 表示全部日志，调用成功(type=2)和失败(type=5)均返回。
+	query.Set("type", "0")
 	query.Set("start_timestamp", strconv.FormatInt(start.Unix(), 10))
 	query.Set("end_timestamp", strconv.FormatInt(end.Unix(), 10))
 	query.Set("username", strings.TrimSpace(username))
@@ -127,6 +149,36 @@ func (c *Client) ListLogs(ctx context.Context, start, end time.Time, username st
 	if result.Items == nil {
 		result.Items = []LogRecord{}
 	}
+	return result, nil
+}
+
+func (c *Client) ListUserModels(ctx context.Context, group string) ([]string, error) {
+	path := "/api/user/models"
+	if strings.TrimSpace(group) != "" {
+		path += "?group=" + url.QueryEscape(strings.TrimSpace(group))
+	}
+	env, err := c.do(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var models []string
+	if err := decodeRawAllowEmptyArray(env.Data, &models); err != nil {
+		return nil, fmt.Errorf("解析用户可用模型失败: %w", err)
+	}
+	unique := make(map[string]struct{}, len(models))
+	result := make([]string, 0, len(models))
+	for _, name := range models {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := unique[name]; ok {
+			continue
+		}
+		unique[name] = struct{}{}
+		result = append(result, name)
+	}
+	sort.Strings(result)
 	return result, nil
 }
 

@@ -59,6 +59,7 @@ func main() {
 	smtpSender := mailer.NewSMTP(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPFrom, cfg.SMTPTLSMode, cfg.NewAPITimeout)
 	gateway := qq.NewGateway(qqClient, storage, logger)
 	service := bot.New(cfg, storage, box, newAPIClient, qqClient, smtpSender, logger)
+	service.SetGatewayConnectedFunc(gateway.Connected)
 
 	preflightCtx, preflightCancel := context.WithTimeout(context.Background(), cfg.NewAPITimeout)
 	if status, err := newAPIClient.GetStatus(preflightCtx, true); err != nil {

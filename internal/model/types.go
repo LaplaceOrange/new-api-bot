@@ -59,6 +59,31 @@ type QuotaNotification struct {
 	Alerted      bool      `json:"alerted"`
 	LastAlertAt  time.Time `json:"last_alert_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+	DailyEnabled bool      `json:"daily_enabled"`
+	LastDailyKey string    `json:"last_daily_key"`
+}
+
+type GroupWelcome struct {
+	GroupOpenID string    `json:"group_openid"`
+	Enabled     bool      `json:"enabled"`
+	Message     string    `json:"message"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type PendingAdminAction struct {
+	Code        string    `json:"code"`
+	Actor       string    `json:"actor"`
+	Action      string    `json:"action"`
+	TargetID    int       `json:"target_id"`
+	TargetLabel string    `json:"target_label"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+type SentBotMessage struct {
+	GroupOpenID string    `json:"group_openid"`
+	MessageID   string    `json:"message_id"`
+	MessageIdx  string    `json:"message_idx"`
+	SentAt      time.Time `json:"sent_at"`
 }
 
 type QQIdentity struct {

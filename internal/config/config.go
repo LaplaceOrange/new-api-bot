@@ -50,6 +50,9 @@ type Config struct {
 	MessageDedupTTL     time.Duration
 	ReadinessFreshness  time.Duration
 	NotifyCheckInterval time.Duration
+	NotifyDailyTime     string
+	NotifyGroupCooldown time.Duration
+	WelcomeDefault      string
 }
 
 func Load() (Config, error) {
@@ -76,6 +79,8 @@ func Load() (Config, error) {
 		GatewayWorkers:      2,
 		MessageDedupTTL:     24 * time.Hour,
 		ReadinessFreshness:  5 * time.Minute,
+		NotifyDailyTime:     envString("NOTIFY_DAILY_TIME", "09:00"),
+		WelcomeDefault:      envString("WELCOME_DEFAULT_MESSAGE", "欢迎加入！如需使用机器人，请发送：/bind <邮箱或New API用户ID>"),
 	}
 
 	var errs []error
@@ -142,6 +147,10 @@ func Load() (Config, error) {
 	c.NewAPITimeout = parseDuration("NEWAPI_TIMEOUT", 10*time.Second)
 	c.QQAPITimeout = parseDuration("QQ_API_TIMEOUT", 10*time.Second)
 	c.NotifyCheckInterval = parseDuration("NOTIFY_CHECK_INTERVAL", 10*time.Minute)
+	c.NotifyGroupCooldown = parseDuration("NOTIFY_GROUP_COOLDOWN", time.Minute)
+	if _, err := time.Parse("15:04", c.NotifyDailyTime); err != nil {
+		errs = append(errs, errors.New("NOTIFY_DAILY_TIME 必须是 HH:MM 格式，例如 09:00"))
+	}
 
 	switch c.SMTPTLSMode {
 	case "starttls", "tls", "none":

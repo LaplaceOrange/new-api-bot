@@ -24,16 +24,34 @@ type usageTotal struct {
 	Count    int64
 }
 
-func (s *Service) handleUsage(ctx context.Context, event qq.MessageEvent, canonical string, _ model.QQIdentity, fields []string) error {
+func (s *Service) handleUsage(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
 	if len(fields) > 3 {
 		return s.reply(ctx, event, usageHelp())
 	}
-	durationArg := "24h"
+	if len(fields) >= 2 && strings.EqualFold(fields[1], "chart") {
+		duration := "7d"
+		if len(fields) == 3 {
+			duration = fields[2]
+		}
+		return s.handleUsageChart(ctx, event, canonical, duration)
+	}
+	durationArg := "today"
 	if len(fields) >= 2 {
 		durationArg = fields[1]
 	}
 	start, end, label, err := parseInsightRange(durationArg, time.Now(), s.cfg.CheckinTimezone)
 	if err != nil {
+		if len(fields) == 3 && s.isAdmin(identity) {
+			userID, description, targetErr := s.resolveUserTarget(event, fields[1])
+			if targetErr != nil {
+				return s.reply(ctx, event, targetErr.Error())
+			}
+			start, end, label, err = parseInsightRange(fields[2], time.Now(), s.cfg.CheckinTimezone)
+			if err != nil {
+				return s.reply(ctx, event, err.Error()+"\n"+usageHelp())
+			}
+			return s.replyUserUsage(ctx, event, userID, description, start, end, label)
+		}
 		return s.reply(ctx, event, err.Error()+"\n"+usageHelp())
 	}
 	if len(fields) == 3 && strings.EqualFold(fields[2], "all") {
@@ -64,6 +82,12 @@ func (s *Service) replyUserUsage(ctx context.Context, event qq.MessageEvent, use
 	}
 	total := usageForUsername(rows, user.Username)
 	models, modelErr := s.newAPI.ListUsageByModel(ctx, start, end, user.Username)
+	var succeeded, failed int64
+	if counter, ok := s.newAPI.(interface {
+		CountLogOutcomes(context.Context, time.Time, time.Time, string) (int64, int64, error)
+	}); ok {
+		succeeded, failed, _ = counter.CountLogOutcomes(ctx, start, end, user.Username)
+	}
 	status, statusErr := s.newAPI.GetStatus(ctx, false)
 	if statusErr != nil {
 		return s.reply(ctx, event, publicError(statusErr))
@@ -72,6 +96,7 @@ func (s *Service) replyUserUsage(ctx context.Context, event qq.MessageEvent, use
 		fmt.Sprintf("%s用量（%s，New API 用户 %d）", targetDescription, label, userID),
 		"时间范围：" + formatInsightRange(start, end, s.cfg.CheckinTimezone),
 		"请求次数：" + strconv.FormatInt(total.Count, 10),
+		fmt.Sprintf("成功 / 失败：%d / %d", succeeded, failed),
 		"Token 用量：" + strconv.FormatInt(total.Tokens, 10),
 		"消耗额度：" + newapi.QuotaToDisplay(total.Quota, status.QuotaPerUnit),
 		"当前余额：" + newapi.QuotaToDisplay(user.Quota, status.QuotaPerUnit),
@@ -213,24 +238,61 @@ func (s *Service) handleLogs(ctx context.Context, event qq.MessageEvent, canonic
 	lines := []string{fmt.Sprintf("%s（New API 用户 %d）最近 %d 条调用记录：", targetDescription, userID, len(page.Items))}
 	for index, item := range page.Items {
 		lines = append(lines, fmt.Sprintf("\n%d. %s｜%s", index+1, formatLogTime(item.CreatedAt, s.cfg.CheckinTimezone), nonEmpty(item.ModelName, "未知模型")))
-		lines = append(lines, fmt.Sprintf("Token：%d（输入 %d / 输出 %d）｜额度：%s｜耗时：%ds", item.PromptTokens+item.CompletionTokens, item.PromptTokens, item.CompletionTokens, newapi.QuotaToDisplay(item.Quota, status.QuotaPerUnit), item.UseTime))
+		callStatus := "成功"
+		if item.Type == 5 {
+			callStatus = "失败"
+		}
+		lines = append(lines, fmt.Sprintf("状态：%s｜Token：%d（输入 %d / 输出 %d）｜额度：%s｜耗时：%ds", callStatus, item.PromptTokens+item.CompletionTokens, item.PromptTokens, item.CompletionTokens, newapi.QuotaToDisplay(item.Quota, status.QuotaPerUnit), item.UseTime))
+		if item.Type == 5 && strings.TrimSpace(item.Content) != "" {
+			lines = append(lines, "错误："+nonEmpty(item.Content, "调用失败"))
+		}
 	}
 	return s.replyChunked(ctx, event, strings.Join(lines, "\n"), 1700)
 }
 
-func (s *Service) handleModels(ctx context.Context, event qq.MessageEvent, canonical string, fields []string) error {
-	if len(fields) != 1 {
-		return s.reply(ctx, event, "格式错误。正确用法：/models")
-	}
-	models, err := s.newAPI.ListEnabledModels(ctx)
-	if err != nil {
-		return s.reply(ctx, event, publicError(err))
+func (s *Service) handleModels(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
+	if len(fields) > 2 {
+		return s.reply(ctx, event, "格式错误。正确用法：/models [用户ID或@用户]")
 	}
 	binding, _ := s.store.GetBinding(canonical)
-	user, userErr := s.newAPI.GetUser(ctx, binding.NewAPIID)
+	userID := binding.NewAPIID
+	if len(fields) == 2 {
+		if !s.isAdmin(identity) {
+			return s.reply(ctx, event, "你没有查看其他用户模型的权限。")
+		}
+		var err error
+		userID, _, err = s.resolveUserTarget(event, fields[1])
+		if err != nil {
+			return s.reply(ctx, event, err.Error())
+		}
+	}
+	user, userErr := s.newAPI.GetUser(ctx, userID)
+	if userErr != nil {
+		return s.reply(ctx, event, publicError(userErr))
+	}
+	models := []string{}
+	exact := false
+	if provider, ok := s.newAPI.(interface {
+		ListUserModels(context.Context, string) ([]string, error)
+	}); ok {
+		if result, err := provider.ListUserModels(ctx, user.Group); err == nil {
+			models = result
+			exact = true
+		}
+	}
+	if !exact {
+		var err error
+		models, err = s.newAPI.ListEnabledModels(ctx)
+		if err != nil {
+			return s.reply(ctx, event, publicError(err))
+		}
+	}
 	header := fmt.Sprintf("站点当前已启用模型，共 %d 个", len(models))
-	if userErr == nil && strings.TrimSpace(user.Group) != "" {
+	if strings.TrimSpace(user.Group) != "" {
 		header += "；你的用户分组：" + user.Group
+	}
+	if !exact {
+		header += "（站点级回退结果）"
 	}
 	if len(models) == 0 {
 		return s.reply(ctx, event, header+"。")
@@ -246,19 +308,65 @@ func (s *Service) handleNotify(ctx context.Context, event qq.MessageEvent, canon
 	if len(fields) == 2 && strings.EqualFold(fields[1], "status") {
 		preference, err := s.store.GetQuotaNotification(canonical)
 		if err != nil {
-			return s.reply(ctx, event, "当前未启用额度提醒。用法：/notify quota <额度>")
+			return s.reply(ctx, event, "当前未启用提醒。用法：/notify quota <额度> 或 /notify daily on")
 		}
 		status := "等待额度低于阈值"
 		if preference.Alerted {
 			status = "本轮低额度提醒已发送，充值超过阈值后会自动重新启用"
 		}
-		return s.reply(ctx, event, fmt.Sprintf("额度提醒：已启用\n阈值：%s\nNew API 用户：%d\n状态：%s", preference.Threshold, preference.NewAPIID, status))
+		quotaState := "关闭"
+		if preference.Enabled {
+			quotaState = "开启，阈值 " + preference.Threshold + "，" + status
+		}
+		dailyState := "关闭"
+		if preference.DailyEnabled {
+			dailyState = "开启，每日 " + s.cfg.NotifyDailyTime
+		}
+		return s.reply(ctx, event, fmt.Sprintf("New API 用户：%d\n额度提醒：%s\n每日摘要：%s", preference.NewAPIID, quotaState, dailyState))
+	}
+	if len(fields) == 3 && strings.EqualFold(fields[1], "daily") {
+		if event.Message.GroupOpenID == "" {
+			return s.reply(ctx, event, "每日摘要只能在目标群内设置。")
+		}
+		binding, err := s.store.GetBinding(canonical)
+		if err != nil {
+			return s.reply(ctx, event, "未找到当前用户的绑定信息。")
+		}
+		preference, _ := s.store.GetQuotaNotification(canonical)
+		preference.CanonicalID = canonical
+		preference.NewAPIID = binding.NewAPIID
+		preference.GroupOpenID = event.Message.GroupOpenID
+		preference.MemberOpenID = event.Message.Author.MemberOpenID
+		switch strings.ToLower(fields[2]) {
+		case "on":
+			preference.DailyEnabled = true
+		case "off":
+			preference.DailyEnabled = false
+		default:
+			return s.reply(ctx, event, "格式错误。正确用法：/notify daily on 或 /notify daily off")
+		}
+		if !preference.Enabled && !preference.DailyEnabled {
+			_ = s.store.DeleteQuotaNotification(canonical)
+		} else if err := s.store.PutQuotaNotification(preference); err != nil {
+			return s.reply(ctx, event, "保存每日摘要设置失败。")
+		}
+		if preference.DailyEnabled {
+			return s.reply(ctx, event, "每日用量摘要已开启，将在每天 "+s.cfg.NotifyDailyTime+"（"+s.cfg.CheckinTimezoneName+"）发送到当前群。")
+		}
+		return s.reply(ctx, event, "每日用量摘要已关闭。")
 	}
 	if len(fields) != 3 || !strings.EqualFold(fields[1], "quota") {
 		return s.reply(ctx, event, "用法：/notify quota <额度>、/notify quota off 或 /notify status")
 	}
 	if strings.EqualFold(fields[2], "off") {
-		_ = s.store.DeleteQuotaNotification(canonical)
+		preference, err := s.store.GetQuotaNotification(canonical)
+		if err == nil && preference.DailyEnabled {
+			preference.Enabled = false
+			preference.Alerted = false
+			_ = s.store.PutQuotaNotification(preference)
+		} else {
+			_ = s.store.DeleteQuotaNotification(canonical)
+		}
 		return s.reply(ctx, event, "额度提醒已关闭。")
 	}
 	if event.Message.GroupOpenID == "" {
@@ -280,11 +388,14 @@ func (s *Service) handleNotify(ctx context.Context, event qq.MessageEvent, canon
 	if err != nil {
 		return s.reply(ctx, event, publicError(err))
 	}
-	preference := model.QuotaNotification{
-		CanonicalID: canonical, NewAPIID: binding.NewAPIID,
-		GroupOpenID: event.Message.GroupOpenID, MemberOpenID: event.Message.Author.MemberOpenID,
-		Threshold: fields[2], Enabled: true, Alerted: user.Quota <= rawThreshold,
-	}
+	preference, _ := s.store.GetQuotaNotification(canonical)
+	preference.CanonicalID = canonical
+	preference.NewAPIID = binding.NewAPIID
+	preference.GroupOpenID = event.Message.GroupOpenID
+	preference.MemberOpenID = event.Message.Author.MemberOpenID
+	preference.Threshold = fields[2]
+	preference.Enabled = true
+	preference.Alerted = user.Quota <= rawThreshold
 	if err := s.store.PutQuotaNotification(preference); err != nil {
 		return s.reply(ctx, event, "保存额度提醒设置失败。")
 	}
@@ -338,35 +449,85 @@ func (s *Service) checkQuotaNotifications() {
 	for _, user := range users {
 		byID[user.ID] = user
 	}
+	groupMessages := make(map[string][]string)
+	groupAllowed := make(map[string]bool)
+	updates := make(map[string]model.QuotaNotification)
+	updateGroups := make(map[string]string)
+	now := time.Now()
+	dailyAt, _ := time.ParseInLocation("15:04", s.cfg.NotifyDailyTime, s.cfg.CheckinTimezone)
+	local := now.In(s.cfg.CheckinTimezone)
+	dailyDue := local.Hour() == dailyAt.Hour() && local.Minute() >= dailyAt.Minute()
+	dailyKey := local.Format("2006-01-02")
 	for _, preference := range preferences {
 		user, exists := byID[preference.NewAPIID]
 		if !exists {
 			continue
 		}
-		threshold, thresholdErr := newapi.DisplayToQuota(preference.Threshold, status.QuotaPerUnit)
-		if thresholdErr != nil {
-			continue
-		}
-		if user.Quota > threshold {
-			if preference.Alerted {
-				preference.Alerted = false
-				preference.LastAlertAt = time.Time{}
-				_ = s.store.PutQuotaNotification(preference)
+		if preference.Enabled {
+			threshold, thresholdErr := newapi.DisplayToQuota(preference.Threshold, status.QuotaPerUnit)
+			if thresholdErr == nil && user.Quota > threshold {
+				if preference.Alerted {
+					preference.Alerted = false
+					preference.LastAlertAt = time.Time{}
+					updates[preference.CanonicalID] = preference
+				}
+			} else if thresholdErr == nil && !preference.Alerted {
+				if notificationGroupAllowed(s, preference.GroupOpenID, groupAllowed) {
+					groupMessages[preference.GroupOpenID] = append(groupMessages[preference.GroupOpenID], fmt.Sprintf("⚠️ 额度提醒 %s New API 用户 %d（%s）当前余额 %s，阈值 %s。", mentionMember(preference.MemberOpenID), user.ID, nonEmpty(user.DisplayName, user.Username), newapi.QuotaToDisplay(user.Quota, status.QuotaPerUnit), preference.Threshold))
+					preference.Alerted = true
+					preference.LastAlertAt = now
+					updates[preference.CanonicalID] = preference
+					updateGroups[preference.CanonicalID] = preference.GroupOpenID
+				}
 			}
-			continue
 		}
-		if preference.Alerted {
-			continue
+		if preference.DailyEnabled && dailyDue && preference.LastDailyKey != dailyKey {
+			start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, s.cfg.CheckinTimezone)
+			rows, usageErr := s.newAPI.ListUsageByUser(ctx, start, now)
+			if usageErr == nil && notificationGroupAllowed(s, preference.GroupOpenID, groupAllowed) {
+				total := usageForUsername(rows, user.Username)
+				groupMessages[preference.GroupOpenID] = append(groupMessages[preference.GroupOpenID], fmt.Sprintf("📊 %s 今日用量：%d 次请求，%d Token，消耗额度 %s，余额 %s。", mentionMember(preference.MemberOpenID), total.Count, total.Tokens, newapi.QuotaToDisplay(total.Quota, status.QuotaPerUnit), newapi.QuotaToDisplay(user.Quota, status.QuotaPerUnit)))
+				preference.LastDailyKey = dailyKey
+				updates[preference.CanonicalID] = preference
+				updateGroups[preference.CanonicalID] = preference.GroupOpenID
+			}
 		}
-		message := fmt.Sprintf("⚠️ 额度提醒\nNew API 用户 %d（%s）当前余额 %s，已低于或等于设置阈值 %s。", user.ID, nonEmpty(user.DisplayName, user.Username), newapi.QuotaToDisplay(user.Quota, status.QuotaPerUnit), preference.Threshold)
-		if err := s.qq.ReplyGroup(ctx, preference.GroupOpenID, "", message); err != nil {
-			s.logger.Warn("发送群内额度提醒失败", "newapi_user_id", user.ID, "error", err)
-			continue
-		}
-		preference.Alerted = true
-		preference.LastAlertAt = time.Now()
-		_ = s.store.PutQuotaNotification(preference)
 	}
+	sentGroups := make(map[string]bool)
+	for group, lines := range groupMessages {
+		if err := s.qq.ReplyGroup(ctx, group, "", strings.Join(lines, "\n")); err != nil {
+			s.logger.Warn("发送群内合并通知失败", "error", err)
+			continue
+		}
+		s.notifyMu.Lock()
+		s.groupLastNotify[group] = time.Now()
+		s.notifyMu.Unlock()
+		sentGroups[group] = true
+	}
+	for canonical, preference := range updates {
+		group := updateGroups[canonical]
+		if group == "" || sentGroups[group] {
+			_ = s.store.PutQuotaNotification(preference)
+		}
+	}
+}
+
+func mentionMember(openID string) string {
+	if strings.TrimSpace(openID) == "" {
+		return ""
+	}
+	return "<@" + openID + ">"
+}
+
+func notificationGroupAllowed(s *Service, group string, cache map[string]bool) bool {
+	if allowed, ok := cache[group]; ok {
+		return allowed
+	}
+	s.notifyMu.Lock()
+	allowed := time.Since(s.groupLastNotify[group]) >= s.cfg.NotifyGroupCooldown
+	s.notifyMu.Unlock()
+	cache[group] = allowed
+	return allowed
 }
 
 func (s *Service) handleAdminReport(ctx context.Context, event qq.MessageEvent, fields []string) error {
@@ -580,7 +741,7 @@ func formatLogTime(timestamp int64, location *time.Location) string {
 }
 
 func usageHelp() string {
-	return "用法：/usage [时间长度] 查看自己；/usage <时间长度> all 查看全站汇总；/usage <时间长度> <前N名> 查看排行榜，例如 /usage 7d 10。时间示例：24h、7d、4w、today、month。"
+	return "用法：/usage [today|7d|month] 查看自己；管理员可用 /usage <用户ID或@用户> 7d；/usage <时间长度> all 查看全站汇总；/usage <时间长度> <前N名> 查看排行榜；/usage chart 7d 生成图表。"
 }
 
 func logsHelp() string {

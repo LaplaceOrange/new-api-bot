@@ -30,15 +30,19 @@
 | `/checkin` | 群聊 | 签到并直接增加绑定账户额度 |
 | `/checkin status` | 群聊 | 查看当前周期签到状态 |
 | `/me` | 群聊 | 查看绑定账户及额度 |
-| `/usage [时间长度]` | 已绑定用户 | 查看自己的请求数、Token、消耗额度及常用模型，默认最近 24 小时 |
+| `/usage [today\|7d\|month]` | 已绑定用户 | 查看自己的请求数、成功/失败数、Token、消耗额度、余额及常用模型，默认今天 |
+| `/usage <用户ID或@用户> <时间长度>` | 管理员 | 查看指定用户用量 |
 | `/usage <时间长度> all` | 已绑定用户 | 查看该时间段全站总请求次数、总 Token、总消耗额度和活跃用户数 |
 | `/usage <时间长度> <前N名>` | 已绑定用户 | 查看按消耗额度排序的前 N 名用户，例如 `/usage 7d 10` |
+| `/usage chart <时间长度>` | 已绑定用户 | 生成每日额度折线及模型用量占比 PNG 图表 |
 | `/logs [数量]` | 已绑定用户 | 查看自己的最近调用记录，默认 10 条、最多 20 条 |
 | `/logs <用户ID或@用户> [数量]` | 管理员 | 查看指定用户的最近调用记录 |
-| `/models` | 已绑定用户 | 查看站点当前已启用模型及自己的用户分组 |
+| `/models [用户ID或@用户]` | 用户/管理员 | 查看用户分组可用模型；目标用户查询仅管理员可用 |
 | `/notify quota <额度>` | 已绑定用户 | 在当前群设置低额度提醒 |
 | `/notify quota off` | 已绑定用户 | 关闭自己的低额度提醒 |
+| `/notify daily on\|off` | 已绑定用户 | 开启或关闭每日用量摘要 |
 | `/notify status` | 已绑定用户 | 查看自己的额度提醒状态 |
+| `/bot status` | 已绑定用户 | 诊断 Gateway、QQ Token、New API 及当前群状态 |
 | `/whoami` | 任意 | 查看可写入管理员名单的 OpenID |
 | `/help` | 任意 | 查看指令说明 |
 | `/credit add <用户ID或@用户> <额度>` | 管理员 | 增加用户额度 |
@@ -51,6 +55,16 @@
 | `/admin bindings [页码]` | 管理员 | 分页查看绑定 |
 | `/admin unbind <用户ID或@用户>` | 管理员 | 解除绑定 |
 | `/admin report [时间长度]` | 管理员 | 查看全站用户及模型用量摘要，默认最近 24 小时 |
+| `/admin report export [时间长度]` | 管理员 | 生成并发送 UTF-8 CSV 全站报表 |
+| `/welcome on\|off` | 管理员 | 开启或关闭当前群的新成员欢迎 |
+| `/welcome set <欢迎语>` | 管理员 | 设置当前群欢迎语并自动开启 |
+| `/recall [消息ID]` | 管理员 | 回复机器人两分钟内的消息进行撤回；消息 ID 可作回退 |
+| `/admin user status <用户ID或@用户>` | 管理员 | 查看用户状态、角色和分组 |
+| `/admin user enable <用户ID或@用户>` | 管理员 | 启用用户 |
+| `/admin user disable <用户ID或@用户>` | 管理员 | 生成一次性确认码，确认后禁用用户 |
+| `/admin user reset2fa <用户ID或@用户>` | 管理员 | 二次确认后重置用户 2FA |
+| `/admin user resetpasskey <用户ID或@用户>` | 管理员 | 二次确认后重置用户 Passkey |
+| `/confirm <一次性操作码>` | 管理员 | 确认五分钟内的敏感管理操作 |
 
 除 `/help`、`/whoami` 和 `/bind` 外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
 
@@ -61,7 +75,7 @@
 ## 准备 QQ 机器人
 
 1. 在 QQ 开放平台创建机器人，记录 AppID 和 AppSecret/ClientSecret。
-2. 开通群聊消息能力，并允许 `GROUP_MESSAGE_CREATE`（兼容旧名 `GROUP_AT_MESSAGE_CREATE`）对应事件。
+2. 开通群聊消息能力，并允许 `GROUP_MESSAGE_CREATE`（兼容旧名 `GROUP_AT_MESSAGE_CREATE`）及 `GROUP_MEMBER_ADD` 对应事件。
 3. 群聊中需要 @ 机器人后发送指令；官方事件会自动移除消息开头的机器人 @ 前缀。
 4. QQ API v2 不提供数字 QQ 号。启动机器人后执行 `/whoami`，将输出的 OpenID 写入 `QQ_ADMIN_OPENIDS`。
 
@@ -92,6 +106,10 @@ QQ_ADMIN_OPENIDS=union:ABCDEF,user:123456,member:GROUP_OPENID:MEMBER_OPENID
 - `GET /api/data`
 - `GET /api/log/`
 - `GET /api/channel/models_enabled`
+- `GET /api/user/models?group={group}`
+- `POST /api/user/manage`（enable、disable、额度调整）
+- `DELETE /api/user/{id}/2fa`
+- `DELETE /api/user/{id}/reset_passkey`
 - `GET /api/subscription/admin/users/{id}/subscriptions`
 - `POST /api/subscription/admin/users/{id}/subscriptions`
 - `POST /api/subscription/admin/user_subscriptions/{id}/invalidate`
@@ -160,6 +178,15 @@ $bytes = New-Object byte[] 32
 - 余额首次低于或等于阈值时，机器人会在设置提醒的群内发送一次通知。
 - 提醒后不会重复刷屏；账户充值并重新高于阈值后会自动恢复监控，下次再次低于阈值时重新提醒。
 - `/notify quota off` 会删除提醒配置；用户解绑时也会自动删除对应提醒。
+- `/notify daily on` 会在 `NOTIFY_DAILY_TIME` 发送当天请求、Token、额度和余额摘要；同群消息会合并，并受 `NOTIFY_GROUP_COOLDOWN` 控制。
+
+### 群欢迎、状态和报表
+
+- `/welcome on` 订阅群成员加入事件后的自动欢迎；`/welcome set` 可为每个群保存独立欢迎语。
+- `/bot status` 会优先查询 QQ 的群内机器人状态和群基础信息。相关接口未获得开放权限时，仍会返回 Gateway、Access Token 和 New API 连通状态。
+- `/usage chart 7d` 将 PNG 上传到当前群；`/admin report export 7d` 将 CSV 文件上传到当前群。需要 QQ 机器人具备群文件/富媒体接口权限。
+- `/recall` 仅撤回机器人自己发送且不超过两分钟的消息。
+- 禁用用户、重置 2FA 和重置 Passkey 使用 `/confirm <code>` 文本确认，并写入本地审计记录。
 
 ## Docker Compose 部署
 
