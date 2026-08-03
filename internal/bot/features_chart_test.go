@@ -69,6 +69,20 @@ func TestUsageChartSupportsSpecificUserAndGroupAll(t *testing.T) {
 		{UserID: 43, Username: "bob", ModelName: "claude-test", CreatedAt: now.Unix(), Quota: 1000000},
 		{UserID: 44, Username: "outside", ModelName: "other", CreatedAt: now.Unix(), Quota: 9000000},
 	}
+	groupRecords, err := service.listGroupUsageChartRecords(context.Background(), []model.Binding{
+		{CanonicalID: "member:g1:admin", NewAPIID: 42},
+		{CanonicalID: "member:g1:member", NewAPIID: 43},
+	}, now.Add(-7*24*time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var groupQuota int64
+	for _, record := range groupRecords {
+		groupQuota += record.Quota
+	}
+	if len(groupRecords) != 2 || groupQuota != 1500000 {
+		t.Fatalf("unexpected group chart records: %#v", groupRecords)
+	}
 	event := groupEvent("g1", "admin", "/usage chart 7d all")
 	identity := model.QQIdentity{MemberOpenID: "admin", GroupOpenID: "g1"}
 	if err := service.handleUsageChart(context.Background(), event, "member:g1:admin", identity, "7d", "all"); err != nil {

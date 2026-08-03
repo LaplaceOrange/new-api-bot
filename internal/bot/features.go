@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsykk/new-api-bot/internal/model"
@@ -282,20 +283,12 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 		if len(bindings) == 0 {
 			return s.reply(ctx, event, "当前群内尚无已绑定并被机器人识别的成员，无法生成汇总图表。")
 		}
-		memberIDs := make(map[int]struct{}, len(bindings))
-		for _, binding := range bindings {
-			memberIDs[binding.NewAPIID] = struct{}{}
-		}
-		allRecords, queryErr := s.newAPI.ListUsageByModel(ctx, start, end, "")
+		var queryErr error
+		records, queryErr = s.listGroupUsageChartRecords(ctx, bindings, start, end)
 		if queryErr != nil {
 			return s.reply(ctx, event, publicError(queryErr))
 		}
-		for _, record := range allRecords {
-			if _, exists := memberIDs[record.UserID]; exists {
-				records = append(records, record)
-			}
-		}
-		targetText = fmt.Sprintf("本群已绑定成员（%d 人）", len(memberIDs))
+		targetText = fmt.Sprintf("本群已绑定成员（%d 人）", len(bindings))
 	} else {
 		userID := 0
 		if target == "" {
@@ -345,6 +338,60 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 		_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: event.Message.GroupOpenID, MessageID: sent.ID, SentAt: time.Now()})
 	}
 	return s.qq.ReplyGroup(ctx, event.Message.GroupOpenID, "", fmt.Sprintf("%s 的%s用量图表已生成（折线：每日额度；色块：模型占比）。", targetText, label))
+}
+
+// listGroupUsageChartRecords queries each bound account explicitly. The New API
+// global /api/data response is aggregated by model on some deployments and may
+// omit user_id, so filtering that response by user ID produces an all-zero chart.
+func (s *Service) listGroupUsageChartRecords(ctx context.Context, bindings []model.Binding, start, end time.Time) ([]newapi.UsageRecord, error) {
+	if len(bindings) == 0 {
+		return []newapi.UsageRecord{}, nil
+	}
+	type result struct {
+		records []newapi.UsageRecord
+		err     error
+	}
+	workers := min(4, len(bindings))
+	jobs := make(chan model.Binding)
+	results := make(chan result, len(bindings))
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for binding := range jobs {
+				user, err := s.newAPI.GetUser(ctx, binding.NewAPIID)
+				if err == nil {
+					if strings.TrimSpace(user.Username) == "" {
+						err = fmt.Errorf("New API 用户 %d 缺少用户名", binding.NewAPIID)
+					} else {
+						var records []newapi.UsageRecord
+						records, err = s.newAPI.ListUsageByModel(ctx, start, end, user.Username)
+						results <- result{records: records, err: err}
+						continue
+					}
+				}
+				results <- result{err: err}
+			}
+		}()
+	}
+	go func() {
+		for _, binding := range bindings {
+			jobs <- binding
+		}
+		close(jobs)
+		wait.Wait()
+		close(results)
+	}()
+
+	all := make([]newapi.UsageRecord, 0)
+	for result := range results {
+		if result.err != nil {
+			return nil, result.err
+		}
+		all = append(all, result.records...)
+	}
+	return all, nil
 }
 
 func (s *Service) handleAdminReportExport(ctx context.Context, event qq.MessageEvent, fields []string) error {
