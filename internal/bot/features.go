@@ -264,25 +264,65 @@ func (s *Service) auditUserAction(actor, action string, target int, err error) {
 	_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: actor, Action: "user." + action, Target: strconv.Itoa(target), Success: err == nil, Description: errorText(err)})
 }
 
-func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, canonical, duration string) error {
+func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, duration, target string) error {
 	if event.Message.GroupOpenID == "" {
 		return s.reply(ctx, event, "用量图表目前仅支持群聊发送。")
-	}
-	binding, err := s.store.GetBinding(canonical)
-	if err != nil {
-		return s.reply(ctx, event, "未找到当前用户的绑定信息。")
 	}
 	start, end, label, err := parseInsightRange(duration, time.Now(), s.cfg.CheckinTimezone)
 	if err != nil {
 		return s.reply(ctx, event, err.Error())
 	}
-	user, err := s.newAPI.GetUser(ctx, binding.NewAPIID)
-	if err != nil {
-		return s.reply(ctx, event, publicError(err))
-	}
-	records, err := s.newAPI.ListUsageByModel(ctx, start, end, user.Username)
-	if err != nil {
-		return s.reply(ctx, event, publicError(err))
+	var records []newapi.UsageRecord
+	targetText := "当前用户"
+	if strings.EqualFold(target, "all") {
+		bindings, groupErr := s.store.ListGroupBindings(event.Message.GroupOpenID)
+		if groupErr != nil {
+			return s.reply(ctx, event, "读取本群绑定成员失败，请稍后重试。")
+		}
+		if len(bindings) == 0 {
+			return s.reply(ctx, event, "当前群内尚无已绑定并被机器人识别的成员，无法生成汇总图表。")
+		}
+		memberIDs := make(map[int]struct{}, len(bindings))
+		for _, binding := range bindings {
+			memberIDs[binding.NewAPIID] = struct{}{}
+		}
+		allRecords, queryErr := s.newAPI.ListUsageByModel(ctx, start, end, "")
+		if queryErr != nil {
+			return s.reply(ctx, event, publicError(queryErr))
+		}
+		for _, record := range allRecords {
+			if _, exists := memberIDs[record.UserID]; exists {
+				records = append(records, record)
+			}
+		}
+		targetText = fmt.Sprintf("本群已绑定成员（%d 人）", len(memberIDs))
+	} else {
+		userID := 0
+		if target == "" {
+			binding, bindingErr := s.store.GetBinding(canonical)
+			if bindingErr != nil {
+				return s.reply(ctx, event, "未找到当前用户的绑定信息。")
+			}
+			userID = binding.NewAPIID
+		} else {
+			if !s.isAdmin(identity) {
+				return s.reply(ctx, event, "你没有查看其他用户用量图表的权限。")
+			}
+			var resolveErr error
+			userID, targetText, resolveErr = s.resolveUserTarget(event, target)
+			if resolveErr != nil {
+				return s.reply(ctx, event, resolveErr.Error())
+			}
+		}
+		user, userErr := s.newAPI.GetUser(ctx, userID)
+		if userErr != nil {
+			return s.reply(ctx, event, publicError(userErr))
+		}
+		records, err = s.newAPI.ListUsageByModel(ctx, start, end, user.Username)
+		if err != nil {
+			return s.reply(ctx, event, publicError(err))
+		}
+		targetText = fmt.Sprintf("%s（New API 用户 %d）", targetText, user.ID)
 	}
 	status, err := s.newAPI.GetStatus(ctx, false)
 	if err != nil {
@@ -304,7 +344,7 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 	if sent.ID != "" {
 		_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: event.Message.GroupOpenID, MessageID: sent.ID, SentAt: time.Now()})
 	}
-	return s.qq.ReplyGroup(ctx, event.Message.GroupOpenID, "", fmt.Sprintf("New API 用户 %d 的%s用量图表已生成（折线：每日额度；色块：模型占比）。", user.ID, label))
+	return s.qq.ReplyGroup(ctx, event.Message.GroupOpenID, "", fmt.Sprintf("%s 的%s用量图表已生成（折线：每日额度；色块：模型占比）。", targetText, label))
 }
 
 func (s *Service) handleAdminReportExport(ctx context.Context, event qq.MessageEvent, fields []string) error {

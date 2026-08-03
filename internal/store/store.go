@@ -299,6 +299,61 @@ func (s *Store) ListBindings(page, pageSize int) ([]model.Binding, int, error) {
 	return all[start:end], total, nil
 }
 
+// ListGroupBindings returns the uniquely bound accounts that have been seen in
+// a specific group. QQ does not expose a general member-list API to this bot,
+// so only members whose group identity was observed by the Gateway are included.
+func (s *Store) ListGroupBindings(groupOpenID string) ([]model.Binding, error) {
+	groupOpenID = strings.TrimSpace(groupOpenID)
+	if groupOpenID == "" {
+		return nil, errors.New("group openid is required")
+	}
+	prefix := "member:" + groupOpenID + ":"
+	result := make([]model.Binding, 0)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		bindings := tx.Bucket([]byte("bindings"))
+		aliases := tx.Bucket([]byte("aliases"))
+		canonicalIDs := make(map[string]struct{})
+		if err := aliases.ForEach(func(key, value []byte) error {
+			if strings.HasPrefix(string(key), prefix) && len(value) > 0 {
+				canonicalIDs[string(value)] = struct{}{}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if err := bindings.ForEach(func(key, _ []byte) error {
+			if strings.HasPrefix(string(key), prefix) {
+				canonicalIDs[string(key)] = struct{}{}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for canonicalID := range canonicalIDs {
+			value := bindings.Get([]byte(canonicalID))
+			if value == nil {
+				continue
+			}
+			var binding model.Binding
+			if err := json.Unmarshal(value, &binding); err != nil {
+				return err
+			}
+			result = append(result, binding)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].NewAPIID != result[j].NewAPIID {
+			return result[i].NewAPIID < result[j].NewAPIID
+		}
+		return result[i].CanonicalID < result[j].CanonicalID
+	})
+	return result, nil
+}
+
 func (s *Store) PutPendingBind(pending model.PendingBind) error {
 	data, err := json.Marshal(pending)
 	if err != nil {

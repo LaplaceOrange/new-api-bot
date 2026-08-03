@@ -1213,7 +1213,7 @@ func helpText(cfg config.Config) string {
 		"/bot status - 查看机器人与群聊状态",
 	}
 	if cfg.UsageChartEnabled {
-		lines = append(lines, "/usage chart <时间长度> - 生成个人用量图表")
+		lines = append(lines, "/usage chart <时间长度> [@用户|用户ID|all] - 生成用量图表；指定用户仅管理员可用，all 汇总本群已绑定成员")
 	}
 	if cfg.NotifyEnabled {
 		lines = append(lines, "/notify quota <额度>|off、/notify daily on|off、/notify status")

@@ -51,6 +51,30 @@ func TestResolveCanonicalKeepsLinkMapping(t *testing.T) {
 	}
 }
 
+func TestListGroupBindingsUsesObservedGroupAliases(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now()
+	for _, binding := range []model.Binding{
+		{CanonicalID: "member:g1:direct", NewAPIID: 1, CreatedAt: now},
+		{CanonicalID: "user:linked", NewAPIID: 2, CreatedAt: now},
+		{CanonicalID: "member:g2:other", NewAPIID: 3, CreatedAt: now},
+	} {
+		if err := s.CreateBinding(binding); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.PutAlias("member:g1:linked", "user:linked"); err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := s.ListGroupBindings("g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 2 || bindings[0].NewAPIID != 1 || bindings[1].NewAPIID != 2 {
+		t.Fatalf("unexpected group bindings: %#v", bindings)
+	}
+}
+
 func TestEmailRateLimit(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)

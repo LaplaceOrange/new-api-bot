@@ -34,7 +34,9 @@
 | `/usage <用户ID或@用户> <时间长度>` | 管理员 | 查看指定用户用量 |
 | `/usage <时间长度> all` | 已绑定用户 | 查看该时间段全站总请求次数、总 Token、总消耗额度和活跃用户数 |
 | `/usage <时间长度> <前N名>` | 已绑定用户 | 查看按消耗额度排序的前 N 名用户，例如 `/usage 7d 10` |
-| `/usage chart <时间长度>` | 已绑定用户 | 生成每日额度折线及模型用量占比 PNG 图表 |
+| `/usage chart <时间长度>` | 已绑定用户 | 生成自己的每日额度折线及模型用量占比 PNG 图表 |
+| `/usage chart <时间长度> <@群成员或用户ID>` | 管理员 | 生成指定已绑定群成员或 New API 用户的用量图表 |
+| `/usage chart <时间长度> all` | 已绑定用户 | 汇总当前群内已被机器人识别且已绑定成员的用量图表 |
 | `/logs [数量]` | 已绑定用户 | 查看自己的最近调用记录，默认 10 条、最多 20 条 |
 | `/logs <用户ID或@用户> [数量]` | 管理员 | 查看指定用户的最近调用记录 |
 | `/models [用户ID或@用户]` | 用户/管理员 | 查看用户分组可用模型；目标用户查询仅管理员可用 |
@@ -192,7 +194,7 @@ $bytes = New-Object byte[] 32
 
 - `/welcome on` 会在 QQ `GROUP_MEMBER_ADD` 事件到达时发送主动群消息，并使用 QQ 当前的 `<qqbot-at-user id="..." />` 文本协议实际 @ 新成员；`/welcome set` 可为每个群保存独立欢迎语。机器人日志会记录群成员事件、欢迎设置状态和发送失败原因，便于排查 QQ 平台未投递事件或主动消息配额问题。
 - `/bot status` 会优先查询 QQ 的群内机器人状态和群基础信息。相关接口未获得开放权限时，仍会返回 Gateway、Access Token 和 New API 连通状态。
-- `/usage chart 7d` 将 PNG 上传到当前群；`/admin report export 7d` 将 CSV 文件上传到当前群。需要 QQ 机器人具备群文件/富媒体接口权限。
+- `/usage chart 7d`、`/usage chart 7d @某成员` 和 `/usage chart 7d all` 将 PNG 上传到当前群；`all` 仅统计当前群内已被机器人识别且已绑定 New API 的成员。`/admin report export 7d` 将 CSV 文件上传到当前群。需要 QQ 机器人具备群文件/富媒体接口权限。
 - `/recall` 仅撤回机器人自己发送且不超过两分钟的消息。
 - 禁用用户、重置 2FA 和重置 Passkey 使用 `/confirm <code>` 文本确认，并写入本地审计记录。
 

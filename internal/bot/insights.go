@@ -25,18 +25,25 @@ type usageTotal struct {
 }
 
 func (s *Service) handleUsage(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
-	if len(fields) > 3 {
-		return s.reply(ctx, event, usageHelp())
-	}
 	if len(fields) >= 2 && strings.EqualFold(fields[1], "chart") {
+		if len(fields) > 4 {
+			return s.reply(ctx, event, usageHelp())
+		}
 		if !s.cfg.UsageChartEnabled {
 			return s.reply(ctx, event, "用量图表功能当前已关闭。")
 		}
 		duration := "7d"
-		if len(fields) == 3 {
+		if len(fields) >= 3 {
 			duration = fields[2]
 		}
-		return s.handleUsageChart(ctx, event, canonical, duration)
+		target := ""
+		if len(fields) == 4 {
+			target = fields[3]
+		}
+		return s.handleUsageChart(ctx, event, canonical, identity, duration, target)
+	}
+	if len(fields) > 3 {
+		return s.reply(ctx, event, usageHelp())
 	}
 	durationArg := "today"
 	if len(fields) >= 2 {
@@ -746,7 +753,7 @@ func formatLogTime(timestamp int64, location *time.Location) string {
 }
 
 func usageHelp() string {
-	return "用法：/usage [today|7d|month] 查看自己；管理员可用 /usage <用户ID或@用户> 7d；/usage <时间长度> all 查看全站汇总；/usage <时间长度> <前N名> 查看排行榜；/usage chart 7d 生成图表。"
+	return "用法：/usage [today|7d|month] 查看自己；管理员可用 /usage <用户ID或@用户> 7d；/usage <时间长度> all 查看全站汇总；/usage <时间长度> <前N名> 查看排行榜；/usage chart <时间长度> [@用户|用户ID|all] 生成图表。"
 }
 
 func logsHelp() string {
