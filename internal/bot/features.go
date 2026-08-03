@@ -284,7 +284,11 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 	if err != nil {
 		return s.reply(ctx, event, publicError(err))
 	}
-	data, err := renderUsageChart(records, start, end, s.cfg.CheckinTimezone)
+	status, err := s.newAPI.GetStatus(ctx, false)
+	if err != nil {
+		return s.reply(ctx, event, publicError(err))
+	}
+	data, err := renderUsageChart(records, start, end, s.cfg.CheckinTimezone, status.QuotaPerUnit)
 	if err != nil {
 		return s.reply(ctx, event, "生成用量图表失败。")
 	}
@@ -358,23 +362,33 @@ func (s *Service) handleAdminReportExport(ctx context.Context, event qq.MessageE
 	return s.qq.ReplyGroup(ctx, event.Message.GroupOpenID, "", "全站 "+label+" CSV 报表已发送。")
 }
 
-func renderUsageChart(records []newapi.UsageRecord, start, end time.Time, location *time.Location) ([]byte, error) {
-	img := image.NewRGBA(image.Rect(0, 0, 1000, 600))
-	draw.Draw(img, img.Bounds(), &image.Uniform{color.RGBA{248, 250, 252, 255}}, image.Point{}, draw.Src)
-	days := int(end.Sub(start)/(24*time.Hour)) + 1
+func renderUsageChart(records []newapi.UsageRecord, start, end time.Time, location *time.Location, quotaPerUnit int64) ([]byte, error) {
+	const (
+		canvasWidth  = 1280
+		canvasHeight = 820
+		plotLeft     = 150
+		plotRight    = 1210
+		plotTop      = 220
+		plotBottom   = 500
+	)
+	img := image.NewRGBA(image.Rect(0, 0, canvasWidth, canvasHeight))
+	background := color.RGBA{248, 250, 252, 255}
+	draw.Draw(img, img.Bounds(), &image.Uniform{background}, image.Point{}, draw.Src)
+
+	days := int(end.Sub(start).Hours()/24 + 0.999)
 	if days < 2 {
 		days = 2
 	}
-	if days > 32 {
-		days = 32
+	if days > 31 {
+		days = 31
 	}
 	daily := make([]int64, days)
 	modelQuota := map[string]int64{}
+	var totalQuota, totalRequests, totalTokens int64
 	for _, record := range records {
 		idx := days - 1
 		if record.CreatedAt > 0 {
-			d := time.Unix(record.CreatedAt, 0).In(location).Sub(start.In(location))
-			idx = int(d / (24 * time.Hour))
+			idx = int(time.Unix(record.CreatedAt, 0).In(location).Sub(start.In(location)).Hours() / 24)
 			if idx < 0 {
 				idx = 0
 			}
@@ -383,55 +397,168 @@ func renderUsageChart(records []newapi.UsageRecord, start, end time.Time, locati
 			}
 		}
 		daily[idx] += record.Quota
-		modelQuota[nonEmpty(record.ModelName, "unknown")] += record.Quota
+		modelQuota[nonEmpty(record.ModelName, "UNKNOWN")] += record.Quota
+		totalQuota += record.Quota
+		totalRequests += record.Count
+		totalTokens += record.TokenUsed
 	}
-	axis := color.RGBA{71, 85, 105, 255}
-	drawLine(img, 70, 40, 70, 350, axis)
-	drawLine(img, 70, 350, 950, 350, axis)
-	maxQ := int64(1)
-	for _, q := range daily {
-		if q > maxQ {
-			maxQ = q
+
+	ink := color.RGBA{30, 41, 59, 255}
+	muted := color.RGBA{100, 116, 139, 255}
+	grid := color.RGBA{203, 213, 225, 255}
+	blue := color.RGBA{37, 99, 235, 255}
+	drawTinyText(img, 54, 58, "USAGE REPORT", 3, ink)
+	rangeText := start.In(location).Format("2006-01-02 15:04") + " - " + end.In(location).Format("2006-01-02 15:04")
+	drawTinyText(img, 56, 86, rangeText, 1, muted)
+	drawTinyText(img, 56, 130, "TOTAL QUOTA: "+newapi.QuotaToDisplay(totalQuota, quotaPerUnit), 2, ink)
+	drawTinyText(img, 460, 130, "REQUESTS: "+compactChartNumber(totalRequests), 2, ink)
+	drawTinyText(img, 790, 130, "TOKENS: "+compactChartNumber(totalTokens), 2, ink)
+
+	fillRect(img, 48, 178, 1232, 540, color.RGBA{255, 255, 255, 255})
+	drawTinyText(img, plotLeft, 204, "DAILY QUOTA", 2, ink)
+	fillRect(img, plotLeft+180, 195, plotLeft+194, 209, blue)
+	drawTinyText(img, plotLeft+202, 204, "DAILY USAGE", 1, muted)
+
+	maxQuota := int64(1)
+	for _, quota := range daily {
+		if quota > maxQuota {
+			maxQuota = quota
 		}
 	}
-	prevX, prevY := 70, 350
-	for i, q := range daily {
-		x := 70 + i*880/(days-1)
-		y := 350 - int(q*280/maxQ)
-		drawLine(img, prevX, prevY, x, y, color.RGBA{37, 99, 235, 255})
-		fillRect(img, x-3, y-3, x+4, y+4, color.RGBA{29, 78, 216, 255})
-		prevX, prevY = x, y
+	maxQuota = niceChartMax(maxQuota)
+	for tick := 0; tick <= 4; tick++ {
+		y := plotBottom - tick*(plotBottom-plotTop)/4
+		drawLine(img, plotLeft, y, plotRight, y, grid)
+		label := newapi.QuotaToDisplay(maxQuota*int64(tick)/4, quotaPerUnit)
+		drawTinyTextRight(img, plotLeft-12, y+4, label, 1, muted)
 	}
+	drawLine(img, plotLeft, plotTop, plotLeft, plotBottom, color.RGBA{71, 85, 105, 255})
+	drawLine(img, plotLeft, plotBottom, plotRight, plotBottom, color.RGBA{71, 85, 105, 255})
+
+	labelStep := 1
+	if days > 10 {
+		labelStep = 2
+	}
+	if days > 20 {
+		labelStep = 4
+	}
+	previousX, previousY := 0, 0
+	for i, quota := range daily {
+		x := plotLeft + i*(plotRight-plotLeft)/(days-1)
+		y := plotBottom - int(quota*int64(plotBottom-plotTop)/maxQuota)
+		if i > 0 {
+			drawThickLine(img, previousX, previousY, x, y, blue, 2)
+		}
+		fillRect(img, x-4, y-4, x+5, y+5, color.RGBA{29, 78, 216, 255})
+		if i%labelStep == 0 || i == days-1 {
+			drawLine(img, x, plotBottom, x, plotBottom+6, muted)
+			labelDay := start.In(location).AddDate(0, 0, i).Format("01/02")
+			drawTinyTextCentered(img, x, plotBottom+24, labelDay, 1, muted)
+		}
+		previousX, previousY = x, y
+	}
+
+	drawTinyText(img, 56, 590, "MODEL SHARE", 2, ink)
 	type pair struct {
 		name  string
 		quota int64
 	}
 	pairs := make([]pair, 0, len(modelQuota))
-	var total int64
-	for name, q := range modelQuota {
-		pairs = append(pairs, pair{name, q})
-		total += q
+	for name, quota := range modelQuota {
+		pairs = append(pairs, pair{name: name, quota: quota})
 	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].quota > pairs[j].quota })
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].quota != pairs[j].quota {
+			return pairs[i].quota > pairs[j].quota
+		}
+		return pairs[i].name < pairs[j].name
+	})
 	colors := []color.RGBA{{16, 185, 129, 255}, {245, 158, 11, 255}, {139, 92, 246, 255}, {239, 68, 68, 255}, {6, 182, 212, 255}, {100, 116, 139, 255}}
-	x := 70
-	if total == 0 {
-		total = 1
-	}
-	for i, p := range pairs {
-		if i >= 6 {
-			break
+	barLeft, barRight := 56, 1224
+	fillRect(img, barLeft, 615, barRight, 655, color.RGBA{226, 232, 240, 255})
+	if totalQuota > 0 {
+		x := barLeft
+		for i, pair := range pairs {
+			if i == len(colors) {
+				break
+			}
+			width := int(pair.quota * int64(barRight-barLeft) / totalQuota)
+			if i == len(pairs)-1 || i == len(colors)-1 {
+				width = barRight - x
+			}
+			if width > 0 {
+				fillRect(img, x, 615, min(barRight, x+width), 655, colors[i])
+				x += width
+			}
 		}
-		width := int(p.quota * 880 / total)
-		if width < 2 {
-			width = 2
-		}
-		fillRect(img, x, 430, min(950, x+width), 540, colors[i%len(colors)])
-		x += width
 	}
+	if len(pairs) == 0 {
+		drawTinyText(img, 56, 700, "NO USAGE DATA IN THIS PERIOD", 2, muted)
+	} else {
+		for i, pair := range pairs {
+			if i >= len(colors) {
+				break
+			}
+			column, row := i%2, i/2
+			x := 56 + column*590
+			y := 700 + row*36
+			fillRect(img, x, y-12, x+16, y+4, colors[i])
+			percent := float64(pair.quota) * 100 / float64(totalQuota)
+			text := truncateChartLabel(pair.name, 38) + "  " + fmt.Sprintf("%.1f%%", percent)
+			drawTinyText(img, x+28, y, text, 1, ink)
+		}
+	}
+
 	var output bytes.Buffer
 	err := png.Encode(&output, img)
 	return output.Bytes(), err
+}
+
+func niceChartMax(value int64) int64 {
+	if value <= 1 {
+		return 1
+	}
+	step := int64(1)
+	for step*10 < value {
+		step *= 10
+	}
+	for _, multiplier := range []int64{1, 2, 5, 10} {
+		candidate := step * multiplier
+		if value <= candidate {
+			return candidate
+		}
+	}
+	return step * 10
+}
+
+func compactChartNumber(value int64) string {
+	negative := value < 0
+	if negative {
+		value = -value
+	}
+	prefix := ""
+	if negative {
+		prefix = "-"
+	}
+	switch {
+	case value >= 1_000_000_000:
+		return fmt.Sprintf("%s%.2fB", prefix, float64(value)/1_000_000_000)
+	case value >= 1_000_000:
+		return fmt.Sprintf("%s%.2fM", prefix, float64(value)/1_000_000)
+	case value >= 1_000:
+		return fmt.Sprintf("%s%.1fK", prefix, float64(value)/1_000)
+	default:
+		return prefix + strconv.FormatInt(value, 10)
+	}
+}
+
+func truncateChartLabel(value string, limit int) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:max(1, limit-3)]) + "..."
 }
 
 func drawLine(img *image.RGBA, x0, y0, x1, y1 int, c color.Color) {
@@ -462,6 +589,88 @@ func drawLine(img *image.RGBA, x0, y0, x1, y1 int, c color.Color) {
 		}
 	}
 }
+
+// tinyGlyphs keeps chart labels self-contained: the production image does not
+// rely on OS fonts, which are intentionally absent from the distroless image.
+var tinyGlyphs = map[rune][7]byte{
+	'A': {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}, 'B': {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},
+	'C': {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}, 'D': {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
+	'E': {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}, 'F': {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},
+	'G': {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}, 'H': {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+	'I': {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}, 'J': {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C},
+	'K': {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}, 'L': {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
+	'M': {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}, 'N': {0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11},
+	'O': {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, 'P': {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
+	'Q': {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}, 'R': {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},
+	'S': {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}, 'T': {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+	'U': {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, 'V': {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04},
+	'W': {0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11}, 'X': {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11},
+	'Y': {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}, 'Z': {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F},
+	'0': {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}, '1': {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
+	'2': {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}, '3': {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E},
+	'4': {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}, '5': {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E},
+	'6': {0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E}, '7': {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+	'8': {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}, '9': {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E},
+	'-': {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}, '.': {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C},
+	':': {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00}, '/': {0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10},
+	'|': {0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}, '%': {0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13},
+	'_': {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F}, '?': {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04},
+}
+
+func drawThickLine(img *image.RGBA, x0, y0, x1, y1 int, c color.Color, thickness int) {
+	radius := max(0, thickness-1)
+	for dx := -radius; dx <= radius; dx++ {
+		for dy := -radius; dy <= radius; dy++ {
+			if dx*dx+dy*dy <= radius*radius {
+				drawLine(img, x0+dx, y0+dy, x1+dx, y1+dy, c)
+			}
+		}
+	}
+}
+
+func drawTinyText(img *image.RGBA, x, y int, value string, scale int, c color.Color) {
+	if scale < 1 {
+		scale = 1
+	}
+	for _, char := range strings.ToUpper(value) {
+		if char == ' ' {
+			x += 4 * scale
+			continue
+		}
+		glyph, exists := tinyGlyphs[char]
+		if !exists {
+			glyph = tinyGlyphs['?']
+		}
+		for row, bits := range glyph {
+			for column := 0; column < 5; column++ {
+				if bits&(1<<uint(4-column)) != 0 {
+					fillRect(img, x+column*scale, y+row*scale, x+(column+1)*scale, y+(row+1)*scale, c)
+				}
+			}
+		}
+		x += 6 * scale
+	}
+}
+
+func tinyTextWidth(value string, scale int) int {
+	if scale < 1 {
+		scale = 1
+	}
+	width := 0
+	for range value {
+		width += 6 * scale
+	}
+	return width
+}
+
+func drawTinyTextRight(img *image.RGBA, x, y int, value string, scale int, c color.Color) {
+	drawTinyText(img, x-tinyTextWidth(value, scale), y, value, scale, c)
+}
+
+func drawTinyTextCentered(img *image.RGBA, x, y int, value string, scale int, c color.Color) {
+	drawTinyText(img, x-tinyTextWidth(value, scale)/2, y, value, scale, c)
+}
+
 func fillRect(img *image.RGBA, x0, y0, x1, y1 int, c color.Color) {
 	draw.Draw(img, image.Rect(x0, y0, x1, y1), &image.Uniform{c}, image.Point{}, draw.Src)
 }
