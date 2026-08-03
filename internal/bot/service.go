@@ -521,17 +521,21 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 	mutex.Lock()
 	defer mutex.Unlock()
 
+	credit, err := s.currentCheckinCredit()
+	if err != nil {
+		return s.reply(ctx, event, "读取签到额度配置失败，请联系管理员。")
+	}
 	status, err := s.newAPI.GetStatus(ctx, false)
 	if err != nil {
 		return s.reply(ctx, event, publicError(err))
 	}
-	rawQuota, err := newapi.DisplayToQuota(s.cfg.CheckinCredit, status.QuotaPerUnit)
+	rawQuota, err := newapi.DisplayToQuota(credit, status.QuotaPerUnit)
 	if err != nil {
 		return s.reply(ctx, event, "签到额度配置无效，请联系管理员："+err.Error())
 	}
 	record := model.CheckinRecord{
 		CanonicalID: canonical, NewAPIID: binding.NewAPIID, PeriodKey: period,
-		RawQuota: rawQuota, DisplayCredit: s.cfg.CheckinCredit, CreatedAt: time.Now(), Status: "pending",
+		RawQuota: rawQuota, DisplayCredit: credit, CreatedAt: time.Now(), Status: "pending",
 	}
 	record, created, err := s.store.ReserveCheckin(record)
 	if err != nil {
@@ -553,8 +557,8 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 		s.logger.Error("签到额度已发放但保存完成状态失败", "canonical", canonical, "newapi_user_id", binding.NewAPIID, "error", err)
 		return s.reply(ctx, event, "额度已经发放，但本地签到状态保存失败，请联系管理员核查，勿重复签到。")
 	}
-	_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: true, Metadata: map[string]any{"period": period, "quota": rawQuota, "display_credit": s.cfg.CheckinCredit}})
-	return s.reply(ctx, event, fmt.Sprintf("🎉 签到成功！额度 %s 已直接发放至绑定的 New API 用户 %d。", s.cfg.CheckinCredit, binding.NewAPIID))
+	_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: true, Metadata: map[string]any{"period": period, "quota": rawQuota, "display_credit": credit}})
+	return s.reply(ctx, event, fmt.Sprintf("🎉 签到成功！额度 %s 已直接发放至绑定的 New API 用户 %d。", credit, binding.NewAPIID))
 }
 
 func (s *Service) handleCheckinStatus(ctx context.Context, event qq.MessageEvent, canonical string) error {
@@ -913,7 +917,7 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 		return s.reply(ctx, event, "你没有执行管理员指令的权限。")
 	}
 	if len(fields) < 2 {
-		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户> 或 /admin report [时间长度]")
+		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户>、/admin report [时间长度] 或 /admin checkin [edit <发放额度>]")
 	}
 	switch strings.ToLower(fields[1]) {
 	case "bindings":
@@ -963,13 +967,15 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 			return s.handleAdminReportExport(ctx, event, fields)
 		}
 		return s.handleAdminReport(ctx, event, fields)
+	case "checkin":
+		return s.handleAdminCheckin(ctx, event, canonical, fields)
 	case "user":
 		if !s.cfg.AdminUserManagementEnabled {
 			return s.reply(ctx, event, "New API 用户状态管理功能当前已关闭。")
 		}
 		return s.handleAdminUser(ctx, event, canonical, identity, fields)
 	default:
-		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户> 或 /admin report [时间长度]")
+		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户>、/admin report [时间长度] 或 /admin checkin [edit <发放额度>]")
 	}
 }
 
@@ -1201,6 +1207,7 @@ func helpText(cfg config.Config) string {
 		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）",
 		"管理员：/plan add、/plan sub、/plan view <用户ID或@群成员>",
 		"管理员：/admin bindings、/admin unbind <用户ID或@群成员>",
+		"管理员：/admin checkin、/admin checkin edit <发放额度>",
 		"管理员：/admin report [时间长度] - 查看全站用量摘要",
 		"管理员：/welcome on|off|set <欢迎语>、/recall",
 		"/bot status - 查看机器人与群聊状态",
