@@ -264,6 +264,7 @@ func (g *Gateway) connect(ctx context.Context, handler func(context.Context, Mes
 					g.logger.Warn("解析群成员事件失败", "event", payload.T, "error", err)
 					continue
 				}
+				g.logger.Info("收到 QQ 群成员事件", "event", payload.T, "group_openid_present", member.GroupOpenID != "", "member_openid_present", member.MemberOpenID != "")
 				handler(ctx, MessageEvent{EventType: payload.T, Sequence: sequence.Load(), Member: member})
 				continue
 			}

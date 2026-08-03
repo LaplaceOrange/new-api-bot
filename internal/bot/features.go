@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -40,19 +41,32 @@ type userAdminAPI interface {
 
 func (s *Service) handleMemberAdd(ctx context.Context, event qq.MessageEvent) {
 	setting, err := s.store.GetGroupWelcome(event.Member.GroupOpenID)
-	if err != nil || !setting.Enabled {
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.logger.Info("收到群成员加入事件，但当前群未开启欢迎", "group_openid", event.Member.GroupOpenID)
+		} else {
+			s.logger.Error("读取群欢迎设置失败", "group_openid", event.Member.GroupOpenID, "error", err)
+		}
+		return
+	}
+	if !setting.Enabled {
+		s.logger.Info("收到群成员加入事件，但当前群欢迎已关闭", "group_openid", event.Member.GroupOpenID)
+		return
+	}
+	if strings.TrimSpace(event.Member.GroupOpenID) == "" || strings.TrimSpace(event.Member.MemberOpenID) == "" {
+		s.logger.Warn("群成员加入事件缺少群或成员 OpenID，无法发送带 @ 的欢迎消息", "group_openid_present", event.Member.GroupOpenID != "", "member_openid_present", event.Member.MemberOpenID != "")
 		return
 	}
 	message := strings.TrimSpace(setting.Message)
 	if message == "" {
 		message = s.cfg.WelcomeDefault
 	}
-	if event.Member.MemberOpenID != "" {
-		message = mentionMember(event.Member.MemberOpenID) + " " + message
-	}
+	message = mentionMember(event.Member.MemberOpenID) + " " + message
 	if err := s.qq.ReplyGroup(ctx, event.Member.GroupOpenID, "", message); err != nil {
-		s.logger.Warn("发送新成员欢迎消息失败", "error", err)
+		s.logger.Warn("发送新成员欢迎消息失败", "group_openid", event.Member.GroupOpenID, "member_openid", event.Member.MemberOpenID, "error", err)
+		return
 	}
+	s.logger.Info("已发送新成员欢迎消息", "group_openid", event.Member.GroupOpenID, "member_openid", event.Member.MemberOpenID)
 }
 
 func (s *Service) handleWelcome(ctx context.Context, event qq.MessageEvent, identity model.QQIdentity, fields []string, content string) error {
