@@ -226,28 +226,33 @@ func (c *Client) SendGroupFile(ctx context.Context, group, replyTo, fileName str
 	md5Ten := md5.Sum(data[:min(len(data), 10<<20)])
 	body := map[string]any{"file_type": fileType, "file_size": strconv.Itoa(len(data)), "file_name": fileName, "md5": fmt.Sprintf("%x", md5sum), "sha1": fmt.Sprintf("%x", sha1sum), "md5_10m": fmt.Sprintf("%x", md5Ten)}
 	var prep struct {
-		UploadID  string `json:"upload_id"`
-		BlockSize int    `json:"block_size"`
+		UploadID string `json:"upload_id"`
+		// QQ 文件上传接口在不同版本中会将 block_size 返回为 JSON 数字或字符串。
+		BlockSize flexInt `json:"block_size"`
 		Parts     []struct {
-			Index        int    `json:"index"`
-			PresignedURL string `json:"presigned_url"`
-			BlockSize    int    `json:"block_size"`
+			Index        int     `json:"index"`
+			PresignedURL string  `json:"presigned_url"`
+			BlockSize    flexInt `json:"block_size"`
 		} `json:"parts"`
 	}
 	if err := c.request(ctx, http.MethodPost, "/v2/groups/"+url.PathEscape(group)+"/upload_prepare", body, &prep); err != nil {
 		return SentMessage{}, err
 	}
+	blockSize := int(prep.BlockSize)
+	if blockSize <= 0 {
+		return SentMessage{}, errors.New("QQ 上传分片大小无效")
+	}
 	for _, part := range prep.Parts {
-		start := part.Index * prep.BlockSize
+		start := part.Index * blockSize
 		if start >= len(data) && part.Index > 0 {
-			start = (part.Index - 1) * prep.BlockSize
+			start = (part.Index - 1) * blockSize
 		}
 		if start < 0 || start >= len(data) {
 			return SentMessage{}, errors.New("QQ 上传分片索引无效")
 		}
-		size := part.BlockSize
+		size := int(part.BlockSize)
 		if size <= 0 {
-			size = prep.BlockSize
+			size = blockSize
 		}
 		end := min(start+size, len(data))
 		chunk := data[start:end]
