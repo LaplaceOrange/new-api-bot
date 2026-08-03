@@ -440,7 +440,7 @@ func TestWelcomeAndMemberAdd(t *testing.T) {
 	event.Message.Author.UserOpenID = "admin"
 	service.process(context.Background(), event)
 	service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_MEMBER_ADD", Member: qq.GroupMemberEvent{GroupOpenID: "g1", MemberOpenID: "new-user", Timestamp: time.Now().Unix()}})
-	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "欢迎使用机器人") || !strings.Contains(reply, "<@new-user>") {
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "欢迎使用机器人") || !strings.Contains(reply, `<qqbot-at-user id="new-user" />`) {
 		t.Fatalf("unexpected welcome reply: %q", reply)
 	}
 }

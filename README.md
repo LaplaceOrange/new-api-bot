@@ -59,7 +59,7 @@
 | `/admin unbind <用户ID或@用户>` | 管理员 | 解除绑定 |
 | `/admin report [时间长度]` | 管理员 | 查看全站用户及模型用量摘要，默认最近 24 小时 |
 | `/admin report export [时间长度]` | 管理员 | 生成并发送 UTF-8 CSV 全站报表 |
-| `/welcome on\|off` | 管理员 | 开启或关闭当前群的新成员欢迎 |
+| `/welcome on\|off` | 管理员 | 开启或关闭当前群的新成员欢迎；欢迎消息会实际 @ 新成员 |
 | `/welcome set <欢迎语>` | 管理员 | 设置当前群欢迎语并自动开启 |
 | `/recall [消息ID]` | 管理员 | 回复机器人两分钟内的消息进行撤回；消息 ID 可作回退 |
 | `/admin user status <用户ID或@用户>` | 管理员 | 查看用户状态、角色和分组 |
@@ -188,7 +188,7 @@ $bytes = New-Object byte[] 32
 
 ### 群欢迎、状态和报表
 
-- `/welcome on` 订阅群成员加入事件后的自动欢迎；`/welcome set` 可为每个群保存独立欢迎语。
+- `/welcome on` 会在 QQ `GROUP_MEMBER_ADD` 事件到达时发送主动群消息，并使用 QQ 当前的 `<qqbot-at-user id="..." />` 文本协议实际 @ 新成员；`/welcome set` 可为每个群保存独立欢迎语。机器人日志会记录群成员事件、欢迎设置状态和发送失败原因，便于排查 QQ 平台未投递事件或主动消息配额问题。
 - `/bot status` 会优先查询 QQ 的群内机器人状态和群基础信息。相关接口未获得开放权限时，仍会返回 Gateway、Access Token 和 New API 连通状态。
 - `/usage chart 7d` 将 PNG 上传到当前群；`/admin report export 7d` 将 CSV 文件上传到当前群。需要 QQ 机器人具备群文件/富媒体接口权限。
 - `/recall` 仅撤回机器人自己发送且不超过两分钟的消息。

@@ -516,10 +516,12 @@ func (s *Service) checkQuotaNotifications() {
 }
 
 func mentionMember(openID string) string {
-	if strings.TrimSpace(openID) == "" {
+	openID = strings.TrimSpace(openID)
+	if openID == "" {
 		return ""
 	}
-	return "<@" + openID + ">"
+	// QQ 当前文本交互协议使用 qqbot-at-user；旧的 <@userid> 协议已被官方标记为即将弃用。
+	return `<qqbot-at-user id="` + openID + `" />`
 }
 
 func notificationGroupAllowed(s *Service, group string, cache map[string]bool) bool {
