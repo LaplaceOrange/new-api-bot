@@ -813,6 +813,48 @@ func TestCheckinIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestAdminCheckinStatsAndImmediateCreditEdit(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	now := time.Now()
+	for _, binding := range []model.Binding{
+		{CanonicalID: "user:admin", NewAPIID: 42, Email: "admin@example.com", CreatedAt: now},
+		{CanonicalID: "user:checked-1", NewAPIID: 43, Email: "one@example.com", CreatedAt: now},
+		{CanonicalID: "user:checked-2", NewAPIID: 44, Email: "two@example.com", CreatedAt: now},
+		{CanonicalID: "user:later", NewAPIID: 45, Email: "later@example.com", CreatedAt: now},
+		{CanonicalID: "user:fresh", NewAPIID: 46, Email: "fresh@example.com", CreatedAt: now},
+	} {
+		if err := storage.CreateBinding(binding); err != nil {
+			t.Fatal(err)
+		}
+	}
+	period, _ := periodKey(now, service.cfg.CheckinPeriod, service.cfg.CheckinTimezone)
+	for _, record := range []model.CheckinRecord{
+		{CanonicalID: "user:checked-1", NewAPIID: 43, PeriodKey: period, DisplayCredit: "1", RawQuota: 500000, CreatedAt: now, Status: "completed"},
+		{CanonicalID: "user:checked-2", NewAPIID: 44, PeriodKey: period, DisplayCredit: "2", RawQuota: 1000000, CreatedAt: now, Status: "completed"},
+		{CanonicalID: "user:later", NewAPIID: 45, PeriodKey: period, DisplayCredit: "1", RawQuota: 500000, CreatedAt: now, Status: "pending"},
+	} {
+		if _, created, err := storage.ReserveCheckin(record); err != nil || !created {
+			t.Fatalf("reserve checkin created=%v err=%v", created, err)
+		}
+	}
+
+	service.process(context.Background(), c2cEvent("admin", "/admin checkin"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "签到人数：2") || !strings.Contains(reply, "已发放额度：3") || !strings.Contains(reply, "处理中签到：1") {
+		t.Fatalf("unexpected checkin stats: %q", reply)
+	}
+	service.process(context.Background(), c2cEvent("admin", "/admin checkin edit 2.5"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "更新为 2.5") || !strings.Contains(reply, "已立即生效") {
+		t.Fatalf("unexpected checkin edit reply: %q", reply)
+	}
+	if credit, err := storage.GetCheckinCreditOverride(); err != nil || credit != "2.5" {
+		t.Fatalf("checkin credit override=%q err=%v", credit, err)
+	}
+	service.process(context.Background(), c2cEvent("fresh", "/checkin"))
+	if api.lastQuota != 1250000 {
+		t.Fatalf("updated checkin quota=%d, want 1250000", api.lastQuota)
+	}
+}
+
 func TestPeriodKey(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	key, next := periodKey(now, "daily", time.UTC)

@@ -44,6 +44,7 @@ var buckets = [][]byte{
 	[]byte("benefit_campaigns"),
 	[]byte("benefit_bans"),
 	[]byte("command_rules"),
+	[]byte("runtime_settings"),
 }
 
 type Store struct {
@@ -535,6 +536,46 @@ func (s *Store) GetCheckin(canonical, period string) (model.CheckinRecord, error
 		return json.Unmarshal(value, &result)
 	})
 	return result, err
+}
+
+func (s *Store) ListCheckinsBetween(start, end time.Time) ([]model.CheckinRecord, error) {
+	result := make([]model.CheckinRecord, 0)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("checkins")).ForEach(func(_, value []byte) error {
+			var record model.CheckinRecord
+			if err := json.Unmarshal(value, &record); err != nil {
+				return err
+			}
+			if !record.CreatedAt.Before(start) && record.CreatedAt.Before(end) {
+				result = append(result, record)
+			}
+			return nil
+		})
+	})
+	return result, err
+}
+
+func (s *Store) GetCheckinCreditOverride() (string, error) {
+	var value string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("runtime_settings")).Get([]byte("checkin_credit"))
+		if data == nil {
+			return ErrNotFound
+		}
+		value = string(data)
+		return nil
+	})
+	return value, err
+}
+
+func (s *Store) PutCheckinCreditOverride(credit string) error {
+	credit = strings.TrimSpace(credit)
+	if credit == "" {
+		return errors.New("签到额度不能为空")
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("runtime_settings")).Put([]byte("checkin_credit"), []byte(credit))
+	})
 }
 
 func checkinKey(canonical, period string) []byte {
