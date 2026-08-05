@@ -24,7 +24,7 @@
 | 指令 | 场景 | 说明 |
 | --- | --- | --- |
 | `/bind <邮箱或用户ID>` | 群聊 | 向 New API 账户邮箱发送绑定验证码 |
-| `/bind vertify <6位验证码>` | 群聊 | 在当前群完成双向唯一绑定 |
+| `/bind verify <6位验证码>` | 群聊 | 在当前群完成双向唯一绑定 |
 | `/bind status` | 群聊 | 查看当前绑定的 New API 用户信息 |
 | `/unbind` | 群聊 | 解除当前 QQ 身份的 New API 绑定 |
 | `/checkin` | 群聊 | 签到并直接增加绑定账户额度 |
@@ -257,7 +257,7 @@ go build -trimpath -ldflags="-s -w" -o bin/new-api-bot.exe ./cmd/bot
 1. 用户在群内 @ 机器人并发送：`/bind user@example.com` 或 `/bind 123`。
 2. 机器人通过管理员接口确认用户存在、已启用且有邮箱。
 3. 机器人通过 SMTP 向账户邮箱发送六位验证码。
-4. 用户在同一群内 @ 机器人并发送：`/bind vertify 123456`。
+4. 用户在同一群内 @ 机器人并发送：`/bind verify 123456`。
 5. 验证通过后写入双向唯一绑定。
 
 验证码只以 HMAC 摘要保存。连续输错达到 `BIND_CODE_MAX_ATTEMPTS` 后，本次绑定请求立即失效。

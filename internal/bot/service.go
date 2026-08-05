@@ -285,9 +285,9 @@ func (s *Service) handleBind(ctx context.Context, event qq.MessageEvent, canonic
 	if len(fields) == 2 && strings.EqualFold(fields[1], "status") {
 		return s.handleBindStatus(ctx, event, canonical)
 	}
-	if len(fields) >= 2 && strings.EqualFold(fields[1], "vertify") {
+	if len(fields) >= 2 && strings.EqualFold(fields[1], "verify") {
 		if len(fields) != 3 || !isSixDigits(fields[2]) {
-			return s.reply(ctx, event, "格式错误。正确用法：/bind vertify <6位验证码>")
+			return s.reply(ctx, event, "格式错误。正确用法：/bind verify <6位验证码>")
 		}
 		pending, err := s.store.GetPendingBind(canonical)
 		if err != nil {
@@ -295,8 +295,11 @@ func (s *Service) handleBind(ctx context.Context, event qq.MessageEvent, canonic
 		}
 		return s.verifyBinding(ctx, event, pending, fields[2])
 	}
+	if len(fields) >= 2 && strings.EqualFold(fields[1], "vertify") {
+		return s.reply(ctx, event, "vertify 拼写错误，请使用：/bind verify <6位验证码>")
+	}
 	if len(fields) != 2 {
-		return s.reply(ctx, event, "格式错误。正确用法：/bind <邮箱或New API用户ID>；收到邮件后使用 /bind vertify <6位验证码>。")
+		return s.reply(ctx, event, "格式错误。正确用法：/bind <邮箱或New API用户ID>；收到邮件后使用 /bind verify <6位验证码>。")
 	}
 	argument := strings.TrimSpace(fields[1])
 	if strings.HasPrefix(argument, "@") || strings.HasPrefix(argument, "<@") {
@@ -372,7 +375,7 @@ func (s *Service) handleBind(ctx context.Context, event qq.MessageEvent, canonic
 	if err := s.store.RecordEmailSent(rateKeys, now, s.cfg.BindEmailWindow); err != nil {
 		s.logger.Warn("记录邮件限流状态失败", "error", err)
 	}
-	return s.reply(ctx, event, "验证码已发送至 "+store.MaskEmail(pending.Email)+"，请在有效期内直接在当前群发送 /bind vertify <6位验证码> 完成绑定。")
+	return s.reply(ctx, event, "验证码已发送至 "+store.MaskEmail(pending.Email)+"，请在有效期内直接在当前群发送 /bind verify <6位验证码> 完成绑定。")
 }
 
 func (s *Service) handleBindStatus(ctx context.Context, event qq.MessageEvent, canonical string) error {
@@ -1190,7 +1193,7 @@ func helpText(cfg config.Config) string {
 	lines := []string{
 		"可用指令：",
 		"/bind <邮箱或用户ID> - 在当前群发送绑定验证码",
-		"/bind vertify <验证码> - 在当前群完成绑定",
+		"/bind verify <验证码> - 在当前群完成绑定",
 		"/bind status - 查看当前绑定信息",
 		"/unbind - 解除当前 QQ 身份绑定",
 		"/checkin - 签到并直接增加绑定账户额度",

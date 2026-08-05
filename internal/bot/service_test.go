@@ -523,7 +523,7 @@ func TestBindFlow(t *testing.T) {
 	if mail.code == "" {
 		t.Fatal("verification email was not sent")
 	}
-	service.process(context.Background(), c2cEvent("u1", "/bind vertify "+mail.code))
+	service.process(context.Background(), c2cEvent("u1", "/bind verify "+mail.code))
 	binding, err := storage.GetBinding("user:u1")
 	if err != nil {
 		t.Fatal(err)
@@ -542,7 +542,7 @@ func TestGroupBindFlow(t *testing.T) {
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "当前群") {
 		t.Fatalf("unexpected reply: %q", reply)
 	}
-	service.process(context.Background(), groupEvent("g1", "u1", "/bind vertify "+mail.code))
+	service.process(context.Background(), groupEvent("g1", "u1", "/bind verify "+mail.code))
 	binding, err := storage.GetBinding("member:g1:u1")
 	if err != nil {
 		t.Fatal(err)
