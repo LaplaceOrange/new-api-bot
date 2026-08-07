@@ -65,9 +65,9 @@ func TestUsageChartSupportsSpecificUserAndGroupAll(t *testing.T) {
 	api.user = newapi.User{ID: 42, Username: "alice"}
 	api.users = []newapi.User{api.user, {ID: 43, Username: "bob"}, {ID: 44, Username: "outside"}}
 	api.usageByModel = []newapi.UsageRecord{
-		{UserID: 42, Username: "alice", ModelName: "gpt-test", CreatedAt: now.Unix(), Quota: 500000},
-		{UserID: 43, Username: "bob", ModelName: "claude-test", CreatedAt: now.Unix(), Quota: 1000000},
-		{UserID: 44, Username: "outside", ModelName: "other", CreatedAt: now.Unix(), Quota: 9000000},
+		{Username: "alice", ModelName: "gpt-test", CreatedAt: now.Unix(), Quota: 500000},
+		{Username: "bob", ModelName: "claude-test", CreatedAt: now.Unix(), Quota: 1000000},
+		{Username: "outside", ModelName: "other", CreatedAt: now.Unix(), Quota: 9000000},
 	}
 	groupRecords, err := service.listGroupUsageChartRecords(context.Background(), []model.Binding{
 		{CanonicalID: "member:g1:admin", NewAPIID: 42},
@@ -102,5 +102,17 @@ func TestUsageChartSupportsSpecificUserAndGroupAll(t *testing.T) {
 	}
 	if reply := lastReply(t, baseQQ); !bytes.Contains([]byte(reply), []byte("指定目标（New API 用户 43）")) {
 		t.Fatalf("unexpected target chart reply: %q", reply)
+	}
+}
+
+func TestUsageChartTimeoutExceedsCommandDeadline(t *testing.T) {
+	if got := usageChartTimeout(10*time.Second, 1); got != 45*time.Second {
+		t.Fatalf("single-user timeout=%v", got)
+	}
+	if got := usageChartTimeout(10*time.Second, 20); got <= 25*time.Second {
+		t.Fatalf("group timeout must exceed command deadline: %v", got)
+	}
+	if got := usageChartTimeout(10*time.Second, 1000); got != 2*time.Minute {
+		t.Fatalf("timeout cap=%v", got)
 	}
 }

@@ -275,6 +275,7 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 	}
 	var records []newapi.UsageRecord
 	targetText := "当前用户"
+	memberCount := 1
 	if strings.EqualFold(target, "all") {
 		bindings, groupErr := s.store.ListGroupBindings(event.Message.GroupOpenID)
 		if groupErr != nil {
@@ -283,13 +284,20 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 		if len(bindings) == 0 {
 			return s.reply(ctx, event, "当前群内尚无已绑定并被机器人识别的成员，无法生成汇总图表。")
 		}
+		memberCount = len(bindings)
+		queryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageChartTimeout(s.cfg.NewAPITimeout, memberCount))
+		defer cancel()
+		ctx = queryCtx
 		var queryErr error
 		records, queryErr = s.listGroupUsageChartRecords(ctx, bindings, start, end)
 		if queryErr != nil {
-			return s.reply(ctx, event, publicError(queryErr))
+			return s.replyUsageChartResult(ctx, event, "生成群成员用量图表失败："+publicError(queryErr))
 		}
 		targetText = fmt.Sprintf("本群已绑定成员（%d 人）", len(bindings))
 	} else {
+		queryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageChartTimeout(s.cfg.NewAPITimeout, memberCount))
+		defer cancel()
+		ctx = queryCtx
 		userID := 0
 		if target == "" {
 			binding, bindingErr := s.store.GetBinding(canonical)
@@ -319,7 +327,7 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 	}
 	status, err := s.newAPI.GetStatus(ctx, false)
 	if err != nil {
-		return s.reply(ctx, event, publicError(err))
+		return s.replyUsageChartResult(ctx, event, publicError(err))
 	}
 	data, err := renderUsageChart(records, start, end, s.cfg.CheckinTimezone, status.QuotaPerUnit)
 	if err != nil {
@@ -332,12 +340,41 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 	name := "usage-" + time.Now().Format("20060102-150405") + ".png"
 	sent, err := api.SendGroupFile(ctx, event.Message.GroupOpenID, event.Message.ID, name, 1, data)
 	if err != nil {
-		return s.reply(ctx, event, "发送用量图表失败："+publicQQError(err))
+		return s.replyUsageChartResult(ctx, event, "发送用量图表失败："+publicQQError(err))
 	}
 	if sent.ID != "" {
 		_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: event.Message.GroupOpenID, MessageID: sent.ID, SentAt: time.Now()})
 	}
 	return s.qq.ReplyGroup(ctx, event.Message.GroupOpenID, "", fmt.Sprintf("%s 的%s用量图表已生成（折线：每日额度；色块：模型占比）。", targetText, label))
+}
+
+func usageChartTimeout(requestTimeout time.Duration, members int) time.Duration {
+	if requestTimeout <= 0 {
+		requestTimeout = 10 * time.Second
+	}
+	if members < 1 {
+		members = 1
+	}
+	// 两次全局查询通常即可完成；兼容接口缺少用户名时，按四个 worker 分批回退查询。
+	batches := (members+3)/4 + 3
+	timeout := requestTimeout * time.Duration(batches)
+	if timeout < 45*time.Second {
+		timeout = 45 * time.Second
+	}
+	if timeout > 2*time.Minute {
+		timeout = 2 * time.Minute
+	}
+	return timeout
+}
+
+func (s *Service) replyUsageChartResult(ctx context.Context, event qq.MessageEvent, content string) error {
+	replyTimeout := s.cfg.QQAPITimeout
+	if replyTimeout <= 0 {
+		replyTimeout = 10 * time.Second
+	}
+	replyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replyTimeout)
+	defer cancel()
+	return s.reply(replyCtx, event, content)
 }
 
 // listGroupUsageChartRecords queries each bound account explicitly. The New API
@@ -347,37 +384,75 @@ func (s *Service) listGroupUsageChartRecords(ctx context.Context, bindings []mod
 	if len(bindings) == 0 {
 		return []newapi.UsageRecord{}, nil
 	}
+	users, err := s.newAPI.ListUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	usersByID := make(map[int]string, len(users))
+	for _, user := range users {
+		username := strings.TrimSpace(user.Username)
+		if user.ID > 0 && username != "" {
+			usersByID[user.ID] = username
+		}
+	}
+	usernames := make([]string, 0, len(bindings))
+	memberNames := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		username := usersByID[binding.NewAPIID]
+		if username == "" {
+			return nil, fmt.Errorf("New API 用户 %d 不存在或缺少用户名", binding.NewAPIID)
+		}
+		usernames = append(usernames, username)
+		memberNames[strings.ToLower(username)] = struct{}{}
+	}
+
+	// 优先使用一次全局查询，并按用户名过滤。部分 New API 版本不返回 user_id，
+	// 但仍会返回 username；这样可避免群成员数量增加时线性放大请求数。
+	globalRecords, globalErr := s.newAPI.ListUsageByModel(ctx, start, end, "")
+	if globalErr == nil {
+		if len(globalRecords) == 0 {
+			return []newapi.UsageRecord{}, nil
+		}
+		hasUsername := false
+		filtered := make([]newapi.UsageRecord, 0, len(globalRecords))
+		for _, record := range globalRecords {
+			username := strings.ToLower(strings.TrimSpace(record.Username))
+			if username == "" {
+				continue
+			}
+			hasUsername = true
+			if _, exists := memberNames[username]; exists {
+				filtered = append(filtered, record)
+			}
+		}
+		if hasUsername {
+			return filtered, nil
+		}
+	} else if ctx.Err() != nil {
+		return nil, globalErr
+	}
+
 	type result struct {
 		records []newapi.UsageRecord
 		err     error
 	}
-	workers := min(4, len(bindings))
-	jobs := make(chan model.Binding)
-	results := make(chan result, len(bindings))
+	workers := min(4, len(usernames))
+	jobs := make(chan string)
+	results := make(chan result, len(usernames))
 	var wait sync.WaitGroup
 	for range workers {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			for binding := range jobs {
-				user, err := s.newAPI.GetUser(ctx, binding.NewAPIID)
-				if err == nil {
-					if strings.TrimSpace(user.Username) == "" {
-						err = fmt.Errorf("New API 用户 %d 缺少用户名", binding.NewAPIID)
-					} else {
-						var records []newapi.UsageRecord
-						records, err = s.newAPI.ListUsageByModel(ctx, start, end, user.Username)
-						results <- result{records: records, err: err}
-						continue
-					}
-				}
-				results <- result{err: err}
+			for username := range jobs {
+				records, queryErr := s.newAPI.ListUsageByModel(ctx, start, end, username)
+				results <- result{records: records, err: queryErr}
 			}
 		}()
 	}
 	go func() {
-		for _, binding := range bindings {
-			jobs <- binding
+		for _, username := range usernames {
+			jobs <- username
 		}
 		close(jobs)
 		wait.Wait()
