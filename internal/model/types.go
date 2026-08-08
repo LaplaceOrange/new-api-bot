@@ -36,7 +36,9 @@ type CheckinRecord struct {
 	DisplayCredit  string    `json:"display_credit"`
 	ExpiresAt      time.Time `json:"expires_at"`
 	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 	Status         string    `json:"status"`
+	LastError      string    `json:"last_error,omitempty"`
 }
 
 type AuditRecord struct {

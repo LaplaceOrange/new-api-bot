@@ -143,7 +143,7 @@ func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) {
 }
 
 func (s *Service) process(parent context.Context, event qq.MessageEvent) {
-	ctx, cancel := context.WithTimeout(parent, 25*time.Second)
+	ctx, cancel := context.WithTimeout(parent, commandTimeout(s.cfg.NewAPITimeout, s.cfg.QQAPITimeout))
 	defer cancel()
 	if event.EventType == "GROUP_MEMBER_ADD" {
 		s.handleMemberAdd(ctx, event)
@@ -259,6 +259,24 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	if err != nil {
 		s.logger.Error("处理机器人命令失败", "command", command, "error", err)
 	}
+}
+
+// commandTimeout leaves room for one New API request, a QQ reply, and an
+// additional New API request for commands such as /checkin on a cold cache.
+func commandTimeout(newAPITimeout, qqAPITimeout time.Duration) time.Duration {
+	const minimum = 25 * time.Second
+	const replyReserve = 5 * time.Second
+	if newAPITimeout <= 0 {
+		newAPITimeout = 30 * time.Second
+	}
+	if qqAPITimeout <= 0 {
+		qqAPITimeout = 10 * time.Second
+	}
+	timeout := newAPITimeout*2 + qqAPITimeout + replyReserve
+	if timeout < minimum {
+		return minimum
+	}
+	return timeout
 }
 
 func identityFromEvent(event qq.MessageEvent) model.QQIdentity {
@@ -538,7 +556,7 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 	}
 	record := model.CheckinRecord{
 		CanonicalID: canonical, NewAPIID: binding.NewAPIID, PeriodKey: period,
-		RawQuota: rawQuota, DisplayCredit: credit, CreatedAt: time.Now(), Status: "pending",
+		RawQuota: rawQuota, DisplayCredit: credit, CreatedAt: time.Now(), UpdatedAt: time.Now(), Status: "pending",
 	}
 	record, created, err := s.store.ReserveCheckin(record)
 	if err != nil {
@@ -548,14 +566,28 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 		if record.Status == "completed" {
 			return s.reply(ctx, event, fmt.Sprintf("本周期已经签到，额度 %s 已发放至绑定的 New API 用户 %d；下次可签到时间：%s", record.DisplayCredit, record.NewAPIID, next.Format("2006-01-02 15:04 MST")))
 		}
+		if record.Status == "pending_confirmation" {
+			return s.reply(ctx, event, "本周期签到额度发放结果待确认，请勿重复签到；如长时间未到账请联系管理员核查。")
+		}
 		return s.reply(ctx, event, "本周期签到请求正在处理中，请勿重复提交；如长时间未到账请联系管理员核查。")
 	}
 	if err := s.newAPI.AddQuota(ctx, binding.NewAPIID, rawQuota); err != nil {
+		if isAmbiguousQuotaWrite(err) {
+			record.Status = "pending_confirmation"
+			record.UpdatedAt = time.Now()
+			record.LastError = publicError(err)
+			if saveErr := s.store.FinalizeCheckin(record); saveErr != nil {
+				s.logger.Error("签到结果待确认状态保存失败", "canonical", canonical, "newapi_user_id", binding.NewAPIID, "error", saveErr)
+			}
+			_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: "额度写入结果待确认：" + publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota}})
+			return s.reply(ctx, event, "签到额度请求超时，发放结果待确认。请勿重复签到；如长时间未到账请联系管理员核查。")
+		}
 		_ = s.store.DeletePendingCheckin(record)
 		_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota}})
 		return s.reply(ctx, event, publicError(err))
 	}
 	record.Status = "completed"
+	record.UpdatedAt = time.Now()
 	if err := s.store.FinalizeCheckin(record); err != nil {
 		s.logger.Error("签到额度已发放但保存完成状态失败", "canonical", canonical, "newapi_user_id", binding.NewAPIID, "error", err)
 		return s.reply(ctx, event, "额度已经发放，但本地签到状态保存失败，请联系管理员核查，勿重复签到。")
@@ -573,8 +605,24 @@ func (s *Service) handleCheckinStatus(ctx context.Context, event qq.MessageEvent
 	status := "处理中"
 	if record.Status == "completed" {
 		status = "已签到"
+	} else if record.Status == "pending_confirmation" {
+		status = "待确认"
 	}
 	return s.reply(ctx, event, fmt.Sprintf("当前周期：%s\n签到状态：%s\n已发放额度：%s\n绑定用户 ID：%d\n下个周期：%s", period, status, record.DisplayCredit, record.NewAPIID, next.Format("2006-01-02 15:04 MST")))
+}
+
+// isAmbiguousQuotaWrite identifies a request which may have reached New API
+// and been applied, but whose response was not received by the bot.
+func isAmbiguousQuotaWrite(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *newapi.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 0 {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "awaiting headers") || strings.Contains(text, "context deadline exceeded")
 }
 
 func (s *Service) handleCredit(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {

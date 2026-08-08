@@ -163,7 +163,7 @@ func Load() (Config, error) {
 	c.BindCodeTTL = parseDuration("BIND_CODE_TTL", 10*time.Minute)
 	c.BindEmailWindow = parseDuration("BIND_EMAIL_WINDOW", time.Hour)
 	c.LinkCodeTTL = parseDuration("LINK_CODE_TTL", 10*time.Minute)
-	c.NewAPITimeout = parseDuration("NEWAPI_TIMEOUT", 10*time.Second)
+	c.NewAPITimeout = parseDuration("NEWAPI_TIMEOUT", 30*time.Second)
 	c.QQAPITimeout = parseDuration("QQ_API_TIMEOUT", 10*time.Second)
 	c.NotifyCheckInterval = parseDuration("NOTIFY_CHECK_INTERVAL", 10*time.Minute)
 	c.NotifyGroupCooldown = parseDuration("NOTIFY_GROUP_COOLDOWN", time.Minute)

@@ -44,6 +44,7 @@ type fakeNewAPI struct {
 	reset2FA      int
 	resetPasskey  int
 	redemptions   []newapi.Redemption
+	addQuotaErr   error
 }
 
 func (f *fakeNewAPI) GetStatus(context.Context, bool) (newapi.Status, error) {
@@ -81,7 +82,7 @@ func (f *fakeNewAPI) AddQuota(_ context.Context, userID int, quota int64) error 
 	f.quotaAdds++
 	f.lastQuotaUser = userID
 	f.lastQuota = quota
-	return nil
+	return f.addQuotaErr
 }
 func (f *fakeNewAPI) SubtractQuota(_ context.Context, userID int, quota int64) error {
 	f.quotaSubs++
@@ -810,6 +811,46 @@ func TestCheckinIsIdempotent(t *testing.T) {
 	}
 	if api.lastQuotaUser != 42 || api.lastQuota != 500000 {
 		t.Fatalf("quota user=%d raw=%d", api.lastQuotaUser, api.lastQuota)
+	}
+}
+
+func TestCheckinResponseHeaderTimeoutStaysPendingWithoutRetry(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	now := time.Now()
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	api.addQuotaErr = &newapi.APIError{Message: `Post "https://example.com/api/user/manage": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`}
+
+	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "发放结果待确认") {
+		t.Fatalf("unexpected timeout reply: %q", reply)
+	}
+	period, _ := periodKey(time.Now(), service.cfg.CheckinPeriod, service.cfg.CheckinTimezone)
+	record, err := storage.GetCheckin("user:u1", period)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "pending_confirmation" || record.LastError == "" {
+		t.Fatalf("unexpected checkin record: %#v", record)
+	}
+
+	api.addQuotaErr = nil
+	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	if api.quotaAdds != 1 {
+		t.Fatalf("ambiguous request was retried: quota adds=%d", api.quotaAdds)
+	}
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "发放结果待确认") {
+		t.Fatalf("unexpected pending reply: %q", reply)
+	}
+}
+
+func TestCommandTimeoutAllowsTwoNewAPIRequestsAndReply(t *testing.T) {
+	if got, want := commandTimeout(30*time.Second, 10*time.Second), 75*time.Second; got != want {
+		t.Fatalf("commandTimeout()=%s, want %s", got, want)
+	}
+	if got, want := commandTimeout(time.Second, time.Second), 25*time.Second; got != want {
+		t.Fatalf("commandTimeout minimum=%s, want %s", got, want)
 	}
 }
 
