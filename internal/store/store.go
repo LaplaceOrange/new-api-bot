@@ -39,6 +39,7 @@ var buckets = [][]byte{
 	[]byte("audit"),
 	[]byte("quota_notifications"),
 	[]byte("group_welcome"),
+	[]byte("group_join_approval"),
 	[]byte("pending_admin_actions"),
 	[]byte("sent_bot_messages"),
 	[]byte("benefit_campaigns"),
@@ -776,6 +777,32 @@ func (s *Store) GetGroupWelcome(group string) (model.GroupWelcome, error) {
 	var result model.GroupWelcome
 	err := s.db.View(func(tx *bolt.Tx) error {
 		data := tx.Bucket([]byte("group_welcome")).Get([]byte(group))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &result)
+	})
+	return result, err
+}
+
+func (s *Store) PutGroupJoinApproval(setting model.GroupJoinApproval) error {
+	if strings.TrimSpace(setting.GroupOpenID) == "" {
+		return errors.New("群 OpenID 不能为空")
+	}
+	setting.UpdatedAt = time.Now()
+	data, err := json.Marshal(setting)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("group_join_approval")).Put([]byte(setting.GroupOpenID), data)
+	})
+}
+
+func (s *Store) GetGroupJoinApproval(group string) (model.GroupJoinApproval, error) {
+	var result model.GroupJoinApproval
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("group_join_approval")).Get([]byte(group))
 		if data == nil {
 			return ErrNotFound
 		}

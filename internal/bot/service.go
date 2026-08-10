@@ -121,7 +121,9 @@ func (s *Service) Stop() {
 func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) {
 	msgIndex := sceneValue(event.Message.Scene.Ext, "msg_idx")
 	dedupKey := event.EventType + "|" + event.Message.ID + "|" + msgIndex
-	if event.Member.GroupOpenID != "" {
+	if event.JoinRequest.JoinRequestID != "" {
+		dedupKey = strings.Join([]string{event.EventType, event.JoinRequest.GroupOpenID, event.JoinRequest.MemberOpenID, event.JoinRequest.JoinRequestID}, "|")
+	} else if event.Member.GroupOpenID != "" {
 		dedupKey = fmt.Sprintf("%s|%s|%s|%d", event.EventType, event.Member.GroupOpenID, event.Member.MemberOpenID, event.Member.Timestamp)
 	}
 	duplicate, err := s.store.CheckAndMarkMessage(dedupKey, time.Now(), s.cfg.MessageDedupTTL)
@@ -136,6 +138,9 @@ func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) {
 	case s.queue <- event:
 	default:
 		s.logger.Warn("命令队列已满，拒绝消息", "event", event.EventType)
+		if event.Message.ID == "" {
+			return
+		}
 		replyCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		_ = s.reply(replyCtx, event, "机器人当前任务较多，请稍后重试。")
@@ -147,6 +152,10 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	defer cancel()
 	if event.EventType == "GROUP_MEMBER_ADD" {
 		s.handleMemberAdd(ctx, event)
+		return
+	}
+	if event.EventType == "GROUP_JOIN_REQUEST" {
+		s.handleGroupJoinRequest(ctx, event)
 		return
 	}
 	content := strings.TrimSpace(event.Message.Content)
@@ -238,6 +247,10 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 			}
 		case "/welcome":
 			err = s.handleWelcome(ctx, event, identity, fields, content)
+		case "/join":
+			err = s.handleJoinCommand(ctx, event, canonical, identity, fields)
+		case "/mute":
+			err = s.handleMute(ctx, event, canonical, identity, fields)
 		case "/bot":
 			err = s.handleBotStatus(ctx, event, fields)
 		case "/recall":
@@ -1261,6 +1274,8 @@ func helpText(cfg config.Config) string {
 		"管理员：/admin checkin、/admin checkin edit <发放额度>",
 		"管理员：/admin report [时间长度] - 查看全站用量摘要",
 		"管理员：/welcome on|off|set <欢迎语>、/recall",
+		"管理员：/join on|off|status - 配置 New API 账户入群自动审批",
+		"管理员：/mute <@成员> <时长>、/mute off <@成员>、/mute status",
 		"/bot status - 查看机器人与群聊状态",
 	}
 	if cfg.UsageChartEnabled {

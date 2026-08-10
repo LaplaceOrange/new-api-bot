@@ -16,6 +16,8 @@
 - 管理员增加/扣除额度、管理用户订阅、查看绑定和解除绑定。
 - 查询个人、指定用户或全站用户用量，查看调用记录和站点已启用模型。
 - 在指定群内发送低额度提醒；管理员可查看全站用户与模型用量报表。
+- 支持 QQ 2026-08-10 新增的入群申请事件与审批接口；可按群开启 New API 邮箱/用户 ID 自动核验。
+- 支持 QQ 官方群成员禁言状态查询、定时禁言和解除禁言接口。
 - bbolt 单文件持久化、AES-256-GCM 敏感数据加密、JSON 结构化日志。
 - `/healthz` 和 `/readyz` 健康检查。
 
@@ -65,6 +67,10 @@
 | `/admin checkin edit <发放额度>` | 管理员 | 立即更新后续签到的单次发放额度，并持久化保存 |
 | `/welcome on\|off` | 管理员 | 开启或关闭当前群的新成员欢迎；欢迎消息会实际 @ 新成员 |
 | `/welcome set <欢迎语>` | 管理员 | 设置当前群欢迎语并自动开启 |
+| `/join on\|off\|status` | 管理员 | 按群开启、关闭或查看 New API 账户入群自动审批 |
+| `/mute <@成员或member_openid> <时长>` | 管理员 | 禁言普通群成员，时长支持 `10m`、`2h`、`3d`，最长 30 天 |
+| `/mute off <@成员或member_openid>` | 管理员 | 解除指定普通群成员禁言 |
+| `/mute status` | 管理员 | 查看全员禁言模式和当前成员禁言列表 |
 | `/recall [消息ID]` | 管理员 | 回复机器人两分钟内的消息进行撤回；消息 ID 可作回退 |
 | `/admin user status <用户ID或@用户>` | 管理员 | 查看用户状态、角色和分组 |
 | `/admin user enable <用户ID或@用户>` | 管理员 | 启用用户 |
@@ -86,8 +92,9 @@
 
 1. 在 QQ 开放平台创建机器人，记录 AppID 和 AppSecret/ClientSecret。
 2. 开通群聊消息能力，并允许 `GROUP_MESSAGE_CREATE`（兼容旧名 `GROUP_AT_MESSAGE_CREATE`）及 `GROUP_MEMBER_ADD` 对应事件。
-3. 群聊中需要 @ 机器人后发送指令；官方事件会自动移除消息开头的机器人 @ 前缀。
-4. QQ API v2 不提供数字 QQ 号。启动机器人后执行 `/whoami`，将输出的 OpenID 写入 `QQ_ADMIN_OPENIDS`。
+3. 如需入群自动审批，将机器人设置为目标群管理员，并确保开放平台向 Gateway 投递 `GROUP_JOIN_REQUEST`；该事件与群/C2C 消息使用同一个 `GROUP_AND_C2C_EVENT (1<<25)` Intent。
+4. 群聊中需要 @ 机器人后发送指令；官方事件会自动移除消息开头的机器人 @ 前缀。
+5. QQ API v2 不提供数字 QQ 号。启动机器人后执行 `/whoami`，将输出的 OpenID 写入 `QQ_ADMIN_OPENIDS`。
 
 管理员名单格式示例：
 
@@ -197,6 +204,16 @@ $bytes = New-Object byte[] 32
 - `/usage chart 7d`、`/usage chart 7d @某成员` 和 `/usage chart 7d all` 将 PNG 上传到当前群；`all` 仅统计当前群内已被机器人识别且已绑定 New API 的成员。`/admin report export 7d` 将 CSV 文件上传到当前群。需要 QQ 机器人具备群文件/富媒体接口权限。
 - `/recall` 仅撤回机器人自己发送且不超过两分钟的消息。
 - 禁用用户、重置 2FA 和重置 Passkey 使用 `/confirm <code>` 文本确认，并写入本地审计记录。
+
+### 入群审批和群禁言
+
+- QQ 官方在 2026-08-10 新增 `GROUP_JOIN_REQUEST`、入群申请审批和群禁言接口，并将所有 HTTP API 域名统一为 `api.bot.qq.com`；本项目已使用统一域名。
+- 自动审批默认对所有群关闭。管理员需在目标群执行 `/join on`，关闭时使用 `/join off`。
+- 开启后，机器人从验证消息或管理员问答答案中查找完整邮箱或正整数 New API 用户 ID；账户存在且状态正常时才调用 QQ `approve`。不匹配、账户禁用、申请人为机器人、QQ 返回 `risk_tips` 或接口查询失败时均保留为人工审核。
+- 自动审批不会建立 QQ 与 New API 的绑定关系；入群后仍需执行 `/bind` 完成邮箱验证。
+- 入群申请事件和审批接口都要求机器人是目标群管理员。事件按 `group_openid`、`member_openid` 和 `join_request_id` 去重，避免重复审批。
+- `/mute` 使用 QQ `/v2/groups/{group_openid}/restrict_chat_setting` 接口，只能操作普通成员，不能禁言群主、管理员或机器人；QQ 返回的权限或参数错误会直接回复执行者。
+- 新增的 Markdown 参数 `force_verify_image_resource` 仅影响 Markdown 图片资源转存；当前机器人发送文本和上传文件，不受该参数影响。
 
 ### 群福利兑换码
 

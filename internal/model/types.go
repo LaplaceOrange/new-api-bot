@@ -72,6 +72,12 @@ type GroupWelcome struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+type GroupJoinApproval struct {
+	GroupOpenID string    `json:"group_openid"`
+	Enabled     bool      `json:"enabled"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 type PendingAdminAction struct {
 	Code        string    `json:"code"`
 	Actor       string    `json:"actor"`

@@ -201,8 +201,13 @@ func (f *fakeNewAPI) InvalidateUserSubscription(_ context.Context, subscriptionI
 }
 
 type fakeQQ struct {
-	mu       sync.Mutex
-	messages []string
+	mu            sync.Mutex
+	messages      []string
+	joinApprovals []qq.GroupJoinRequest
+	muteState     qq.GroupMuteState
+	muteMember    string
+	muteOperation string
+	muteExpiresAt time.Time
 }
 
 func (f *fakeQQ) ReplyC2C(_ context.Context, _, _, content string) error {
@@ -213,6 +218,25 @@ func (f *fakeQQ) ReplyC2C(_ context.Context, _, _, content string) error {
 }
 func (f *fakeQQ) ReplyGroup(_ context.Context, _, _, content string) error {
 	return f.ReplyC2C(context.Background(), "", "", content)
+}
+func (f *fakeQQ) ReviewGroupJoinRequest(_ context.Context, group, member, requestID, operation, _ string, _ bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.joinApprovals = append(f.joinApprovals, qq.GroupJoinRequest{GroupOpenID: group, MemberOpenID: member, JoinRequestID: requestID, ApplySource: operation})
+	return nil
+}
+func (f *fakeQQ) GetGroupMuteState(context.Context, string) (qq.GroupMuteState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.muteState, nil
+}
+func (f *fakeQQ) SetGroupMemberMute(_ context.Context, _ string, member, operation string, expiresAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.muteMember = member
+	f.muteOperation = operation
+	f.muteExpiresAt = expiresAt
+	return nil
 }
 
 type fakeMailer struct {
@@ -443,6 +467,98 @@ func TestWelcomeAndMemberAdd(t *testing.T) {
 	service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_MEMBER_ADD", Member: qq.GroupMemberEvent{GroupOpenID: "g1", MemberOpenID: "new-user", Timestamp: time.Now().Unix()}})
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "欢迎使用机器人") || !strings.Contains(reply, `<qqbot-at-user id="new-user" />`) {
 		t.Fatalf("unexpected welcome reply: %q", reply)
+	}
+}
+
+func TestGroupJoinApprovalMatchesNewAPIEmailAndID(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if err := storage.PutGroupJoinApproval(model.GroupJoinApproval{GroupOpenID: "g1", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	for index, answer := range []string{"alice@example.com", "42"} {
+		service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_JOIN_REQUEST", JoinRequest: qq.GroupJoinRequest{
+			GroupOpenID: "g1", MemberOpenID: fmt.Sprintf("member-%d", index), JoinRequestID: fmt.Sprintf("request-%d", index),
+			VerifyInfo: qq.GroupJoinVerifyInfo{Method: "verify_message", VerifyMessage: answer},
+		}})
+	}
+	qqAPI.mu.Lock()
+	defer qqAPI.mu.Unlock()
+	if len(qqAPI.joinApprovals) != 2 {
+		t.Fatalf("join approvals=%d, want 2", len(qqAPI.joinApprovals))
+	}
+	for _, approval := range qqAPI.joinApprovals {
+		if approval.GroupOpenID != "g1" || approval.JoinRequestID == "" || approval.ApplySource != "approve" {
+			t.Fatalf("unexpected approval: %#v", approval)
+		}
+	}
+}
+
+func TestGroupJoinApprovalLeavesUnsafeOrUnknownRequestsPending(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if err := storage.PutGroupJoinApproval(model.GroupJoinApproval{GroupOpenID: "g1", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	requests := []qq.GroupJoinRequest{
+		{GroupOpenID: "g1", MemberOpenID: "unsafe", JoinRequestID: "r1", RiskTips: "warning", VerifyInfo: qq.GroupJoinVerifyInfo{VerifyMessage: "42"}},
+		{GroupOpenID: "g1", MemberOpenID: "unknown", JoinRequestID: "r2", VerifyInfo: qq.GroupJoinVerifyInfo{VerifyMessage: "not-an-account"}},
+		{GroupOpenID: "g2", MemberOpenID: "disabled-group", JoinRequestID: "r3", VerifyInfo: qq.GroupJoinVerifyInfo{VerifyMessage: "42"}},
+	}
+	for _, request := range requests {
+		service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_JOIN_REQUEST", JoinRequest: request})
+	}
+	qqAPI.mu.Lock()
+	defer qqAPI.mu.Unlock()
+	if len(qqAPI.joinApprovals) != 0 {
+		t.Fatalf("unexpected approvals: %#v", qqAPI.joinApprovals)
+	}
+}
+
+func TestJoinCommandConfiguresCurrentGroup(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	service.process(context.Background(), groupEvent("g1", "admin", "/join on"))
+	setting, err := storage.GetGroupJoinApproval("g1")
+	if err != nil || !setting.Enabled {
+		t.Fatalf("join setting=%#v err=%v", setting, err)
+	}
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已开启") {
+		t.Fatalf("unexpected reply: %q", reply)
+	}
+	service.process(context.Background(), groupEvent("g1", "admin", "/join status"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "自动审批：开启") {
+		t.Fatalf("unexpected status: %q", reply)
+	}
+}
+
+func TestMuteCommandsUseOfficialGroupModerationAPI(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	event := groupEvent("g1", "admin", "/mute @alice 2h")
+	event.Message.Mentions = []qq.MessageAuthor{{MemberOpenID: "target", Username: "alice"}}
+	service.process(context.Background(), event)
+	qqAPI.mu.Lock()
+	if qqAPI.muteMember != "target" || qqAPI.muteOperation != "add" || time.Until(qqAPI.muteExpiresAt) < 119*time.Minute {
+		qqAPI.mu.Unlock()
+		t.Fatalf("unexpected mute call: member=%q operation=%q expires=%s", qqAPI.muteMember, qqAPI.muteOperation, qqAPI.muteExpiresAt)
+	}
+	qqAPI.mu.Unlock()
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "禁言 2 小时") {
+		t.Fatalf("unexpected mute reply: %q", reply)
+	}
+
+	event.Message.ID = "mute-off"
+	event.Message.Content = "/mute off @alice"
+	service.process(context.Background(), event)
+	qqAPI.mu.Lock()
+	defer qqAPI.mu.Unlock()
+	if qqAPI.muteOperation != "del" || qqAPI.muteMember != "target" {
+		t.Fatalf("unexpected unmute call: member=%q operation=%q", qqAPI.muteMember, qqAPI.muteOperation)
 	}
 }
 

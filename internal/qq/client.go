@@ -85,6 +85,22 @@ type GroupInfo struct {
 	GroupMemberNum int    `json:"group_member_num"`
 }
 
+type GroupMuteState struct {
+	GlobalRule GroupMuteGlobalRule    `json:"global_rule"`
+	Members    []GroupMemberMuteState `json:"members"`
+}
+
+type GroupMuteGlobalRule struct {
+	Mode string `json:"mode"`
+}
+
+type GroupMemberMuteState struct {
+	MemberOpenID string `json:"member_openid"`
+	MuteExpireAt string `json:"mute_expire_at"`
+	Username     string `json:"username"`
+	UnionOpenID  string `json:"union_openid"`
+}
+
 func NewClient(appID, appSecret string, timeout time.Duration) *Client {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -215,6 +231,61 @@ func (c *Client) GetGroupInfo(ctx context.Context, group string) (GroupInfo, err
 }
 func (c *Client) RecallGroupMessage(ctx context.Context, group, messageID string) error {
 	return c.request(ctx, http.MethodDelete, "/v2/groups/"+url.PathEscape(group)+"/messages/"+url.PathEscape(messageID), nil, nil)
+}
+
+func (c *Client) ReviewGroupJoinRequest(ctx context.Context, group, member, requestID, operation, rejectReason string, blacklist bool) error {
+	if operation != "approve" && operation != "decline" {
+		return errors.New("入群审批操作必须是 approve 或 decline")
+	}
+	body := map[string]any{"op": operation}
+	if strings.TrimSpace(requestID) != "" {
+		body["join_request_id"] = requestID
+	}
+	if operation == "decline" {
+		if strings.TrimSpace(rejectReason) != "" {
+			body["reject_reason"] = rejectReason
+		}
+		body["add_to_member_blacklist"] = blacklist
+	}
+	path := "/v2/groups/" + url.PathEscape(group) + "/approval_join_request/" + url.PathEscape(member)
+	return c.request(ctx, http.MethodPost, path, body, nil)
+}
+
+func (c *Client) ListGroupJoinRequests(ctx context.Context, group, cursor string, limit int) (GroupJoinRequestPage, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	query := url.Values{}
+	query.Set("limit", strconv.Itoa(limit))
+	if strings.TrimSpace(cursor) != "" {
+		query.Set("cursor", cursor)
+	}
+	var page GroupJoinRequestPage
+	path := "/v2/groups/" + url.PathEscape(group) + "/join_request_list?" + query.Encode()
+	err := c.request(ctx, http.MethodGet, path, nil, &page)
+	return page, err
+}
+
+func (c *Client) GetGroupMuteState(ctx context.Context, group string) (GroupMuteState, error) {
+	var state GroupMuteState
+	path := "/v2/groups/" + url.PathEscape(group) + "/restrict_chat_setting"
+	err := c.request(ctx, http.MethodGet, path, nil, &state)
+	return state, err
+}
+
+func (c *Client) SetGroupMemberMute(ctx context.Context, group, member, operation string, expiresAt time.Time) error {
+	if operation != "add" && operation != "update" && operation != "del" {
+		return errors.New("禁言操作必须是 add、update 或 del")
+	}
+	item := map[string]any{"op": operation, "member_openid": member}
+	if operation != "del" {
+		item["mute_expire_at"] = expiresAt.Format(time.RFC3339)
+	}
+	path := "/v2/groups/" + url.PathEscape(group) + "/restrict_chat_setting"
+	return c.request(ctx, http.MethodPost, path, map[string]any{"members": []any{item}}, nil)
 }
 
 func (c *Client) SendGroupFile(ctx context.Context, group, replyTo, fileName string, fileType int, data []byte) (SentMessage, error) {

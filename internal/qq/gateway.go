@@ -44,10 +44,11 @@ type Payload struct {
 }
 
 type MessageEvent struct {
-	EventType string
-	Sequence  int64
-	Message   Message
-	Member    GroupMemberEvent
+	EventType   string
+	Sequence    int64
+	Message     Message
+	Member      GroupMemberEvent
+	JoinRequest GroupJoinRequest
 }
 
 type Message struct {
@@ -73,6 +74,41 @@ type GroupMemberEvent struct {
 	GroupOpenID  string `json:"group_openid"`
 	MemberOpenID string `json:"member_openid"`
 	UserOpenID   string `json:"user_openid"`
+}
+
+type GroupJoinRequest struct {
+	GroupOpenID   string              `json:"group_openid"`
+	JoinRequestID string              `json:"join_request_id"`
+	RiskTips      string              `json:"risk_tips"`
+	UnionOpenID   string              `json:"union_openid"`
+	MemberOpenID  string              `json:"member_openid"`
+	Username      string              `json:"username"`
+	ApplyAt       string              `json:"apply_at"`
+	ApplySource   string              `json:"apply_source"`
+	InvitedBy     string              `json:"invited_by"`
+	Bot           bool                `json:"bot"`
+	VerifyInfo    GroupJoinVerifyInfo `json:"verify_info"`
+	AutoApproved  *GroupAutoApproved  `json:"auto_approved,omitempty"`
+}
+
+type GroupJoinVerifyInfo struct {
+	Method        string              `json:"method"`
+	VerifyMessage string              `json:"verify_message"`
+	ReviewQAList  []GroupJoinReviewQA `json:"review_qa_list"`
+}
+
+type GroupJoinReviewQA struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
+}
+
+type GroupAutoApproved struct {
+	StrategyID string `json:"strategy_id"`
+}
+
+type GroupJoinRequestPage struct {
+	List       []GroupJoinRequest `json:"list"`
+	NextCursor string             `json:"next_cursor"`
 }
 
 type MessageAuthor struct {
@@ -266,6 +302,21 @@ func (g *Gateway) connect(ctx context.Context, handler func(context.Context, Mes
 				}
 				g.logger.Info("收到 QQ 群成员事件", "event", payload.T, "group_openid_present", member.GroupOpenID != "", "member_openid_present", member.MemberOpenID != "")
 				handler(ctx, MessageEvent{EventType: payload.T, Sequence: sequence.Load(), Member: member})
+				continue
+			}
+			if payload.T == "GROUP_JOIN_REQUEST" {
+				var request GroupJoinRequest
+				if err := json.Unmarshal(payload.D, &request); err != nil {
+					g.logger.Warn("解析用户入群申请事件失败", "error", err)
+					continue
+				}
+				g.logger.Info("收到用户入群申请事件",
+					"group_openid_present", request.GroupOpenID != "",
+					"member_openid_present", request.MemberOpenID != "",
+					"join_request_id_present", request.JoinRequestID != "",
+					"verify_method", request.VerifyInfo.Method,
+				)
+				handler(ctx, MessageEvent{EventType: payload.T, Sequence: sequence.Load(), JoinRequest: request})
 				continue
 			}
 			// QQ 当前生产环境的群消息事件名为 GROUP_MESSAGE_CREATE；
