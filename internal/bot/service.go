@@ -248,7 +248,7 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		case "/welcome":
 			err = s.handleWelcome(ctx, event, identity, fields, content)
 		case "/join":
-			err = s.handleJoinCommand(ctx, event, canonical, identity, fields)
+			err = s.handleJoinCommand(ctx, event, canonical, identity, fields, content)
 		case "/mute":
 			err = s.handleMute(ctx, event, canonical, identity, fields)
 		case "/bot":
@@ -1274,7 +1274,7 @@ func helpText(cfg config.Config) string {
 		"管理员：/admin checkin、/admin checkin edit <发放额度>",
 		"管理员：/admin report [时间长度] - 查看全站用量摘要",
 		"管理员：/welcome on|off|set <欢迎语>、/recall",
-		"管理员：/join on|off|status - 配置 New API 账户入群自动审批",
+		"管理员：/join on|off|status、/join limit <QQ等级>、/join check \"<匹配字符串>\" - 配置入群自动审批",
 		"管理员：/mute <@成员> <时长>、/mute off <@成员>、/mute status",
 		"/bot status - 查看机器人与群聊状态",
 	}

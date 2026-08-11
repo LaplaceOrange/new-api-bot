@@ -75,6 +75,8 @@ type GroupWelcome struct {
 type GroupJoinApproval struct {
 	GroupOpenID string    `json:"group_openid"`
 	Enabled     bool      `json:"enabled"`
+	MinQQLevel  int       `json:"min_qq_level"`
+	MatchText   string    `json:"match_text"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 

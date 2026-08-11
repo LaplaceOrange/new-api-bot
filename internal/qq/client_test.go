@@ -71,3 +71,29 @@ func TestGroupJoinRequestEventSchema(t *testing.T) {
 		t.Fatalf("unexpected verification info: %#v", request.VerifyInfo)
 	}
 }
+
+func TestGroupJoinRequestUserLevelAcceptsNumberAndString(t *testing.T) {
+	for _, input := range []string{
+		`{"qq_level":42}`,
+		`{"qq_level":"42"}`,
+		`{"level":42}`,
+		`{"level":"42"}`,
+	} {
+		var request GroupJoinRequest
+		if err := json.Unmarshal([]byte(input), &request); err != nil {
+			t.Fatalf("input %s: %v", input, err)
+		}
+		level, present := request.UserLevel()
+		if !present || level != 42 {
+			t.Fatalf("input %s: level=%d present=%v", input, level, present)
+		}
+	}
+
+	var request GroupJoinRequest
+	if err := json.Unmarshal([]byte(`{"username":"alice"}`), &request); err != nil {
+		t.Fatal(err)
+	}
+	if level, present := request.UserLevel(); present || level != 0 {
+		t.Fatalf("missing level should remain absent: level=%d present=%v", level, present)
+	}
+}

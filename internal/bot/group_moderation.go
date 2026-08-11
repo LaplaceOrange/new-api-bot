@@ -24,7 +24,7 @@ type groupMuteAPI interface {
 	SetGroupMemberMute(context.Context, string, string, string, time.Time) error
 }
 
-func (s *Service) handleJoinCommand(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
+func (s *Service) handleJoinCommand(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string, content string) error {
 	if !s.isAdmin(identity) {
 		return s.reply(ctx, event, "你没有配置入群自动审批的权限。")
 	}
@@ -32,8 +32,8 @@ func (s *Service) handleJoinCommand(ctx context.Context, event qq.MessageEvent, 
 	if group == "" {
 		return s.reply(ctx, event, "该指令只能在群聊中使用。")
 	}
-	if len(fields) != 2 {
-		return s.reply(ctx, event, "格式错误。正确用法：/join on、/join off 或 /join status")
+	if len(fields) < 2 {
+		return s.reply(ctx, event, joinCommandUsage())
 	}
 	setting, err := s.store.GetGroupJoinApproval(group)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -42,26 +42,95 @@ func (s *Service) handleJoinCommand(ctx context.Context, event qq.MessageEvent, 
 	setting.GroupOpenID = group
 	switch strings.ToLower(fields[1]) {
 	case "status":
+		if len(fields) != 2 {
+			return s.reply(ctx, event, joinCommandUsage())
+		}
 		status := "关闭"
 		if setting.Enabled {
 			status = "开启"
 		}
-		return s.reply(ctx, event, "当前群 New API 账户入群自动审批："+status+"。\n仅当答案是已启用账户的邮箱或正整数用户 ID，且 QQ 未返回安全提示时自动通过。")
+		levelText := "不限制"
+		if setting.MinQQLevel > 0 {
+			levelText = fmt.Sprintf("至少 %d 级（事件缺少等级时转人工审核）", setting.MinQQLevel)
+		}
+		matchText := "不限制"
+		if setting.MatchText != "" {
+			matchText = strconv.Quote(setting.MatchText)
+		}
+		return s.reply(ctx, event, fmt.Sprintf("当前群 New API 账户入群自动审批：%s。\nQQ 等级限制：%s。\n申请内容匹配：%s。\n申请还必须匹配已启用的 New API 账户，且 QQ 未返回安全提示。", status, levelText, matchText))
 	case "on":
+		if len(fields) != 2 {
+			return s.reply(ctx, event, joinCommandUsage())
+		}
 		setting.Enabled = true
 	case "off":
+		if len(fields) != 2 {
+			return s.reply(ctx, event, joinCommandUsage())
+		}
 		setting.Enabled = false
+	case "limit":
+		if len(fields) != 3 {
+			return s.reply(ctx, event, "格式错误。正确用法：/join limit <非负QQ等级数>；设为 0 表示不限制。")
+		}
+		level, parseErr := strconv.Atoi(fields[2])
+		if parseErr != nil || level < 0 {
+			return s.reply(ctx, event, "QQ 等级必须是非负整数；设为 0 表示不限制。")
+		}
+		setting.MinQQLevel = level
+	case "check":
+		matchText, parseErr := parseJoinCheckText(content)
+		if parseErr != nil {
+			return s.reply(ctx, event, "格式错误。正确用法：/join check \"<匹配字符串>\"；设为 \"\" 表示不限制。")
+		}
+		setting.MatchText = matchText
 	default:
-		return s.reply(ctx, event, "格式错误。正确用法：/join on、/join off 或 /join status")
+		return s.reply(ctx, event, joinCommandUsage())
 	}
 	if err := s.store.PutGroupJoinApproval(setting); err != nil {
 		return s.reply(ctx, event, "保存入群自动审批设置失败。")
 	}
-	_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "qq.join_approval.configure", Target: group, Success: true, Metadata: map[string]any{"enabled": setting.Enabled}})
+	_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "qq.join_approval.configure", Target: group, Success: true, Metadata: map[string]any{"enabled": setting.Enabled, "min_qq_level": setting.MinQQLevel, "match_text_configured": setting.MatchText != ""}})
+	if strings.EqualFold(fields[1], "limit") {
+		if setting.MinQQLevel == 0 {
+			return s.reply(ctx, event, "当前群入群自动审批已取消 QQ 等级限制。")
+		}
+		return s.reply(ctx, event, fmt.Sprintf("当前群入群自动审批已设置为仅允许 QQ 等级至少 %d 级的申请；事件未提供等级时将等待人工审核。", setting.MinQQLevel))
+	}
+	if strings.EqualFold(fields[1], "check") {
+		if setting.MatchText == "" {
+			return s.reply(ctx, event, "当前群入群自动审批已取消申请内容匹配限制。")
+		}
+		return s.reply(ctx, event, "当前群入群自动审批仅允许申请内容包含 "+strconv.Quote(setting.MatchText)+" 的申请。")
+	}
 	if setting.Enabled {
 		return s.reply(ctx, event, "当前群 New API 账户入群自动审批已开启。机器人必须是群管理员，并在 QQ 开放平台接收 GROUP_JOIN_REQUEST 事件。")
 	}
 	return s.reply(ctx, event, "当前群 New API 账户入群自动审批已关闭，后续申请将等待人工审核。")
+}
+
+func joinCommandUsage() string {
+	return "格式错误。正确用法：/join on、/join off、/join status、/join limit <QQ等级数> 或 /join check \"<匹配字符串>\""
+}
+
+func parseJoinCheckText(content string) (string, error) {
+	content = strings.TrimSpace(content)
+	fields := strings.Fields(content)
+	if len(fields) < 3 || !strings.EqualFold(fields[0], "/join") || !strings.EqualFold(fields[1], "check") {
+		return "", errors.New("invalid join check command")
+	}
+	remainder := strings.TrimSpace(content[len(fields[0]):])
+	if len(remainder) < len(fields[1]) || !strings.EqualFold(remainder[:len(fields[1])], fields[1]) {
+		return "", errors.New("invalid join check command")
+	}
+	argument := strings.TrimSpace(remainder[len(fields[1]):])
+	if len(argument) < 2 || argument[0] != '"' || argument[len(argument)-1] != '"' {
+		return "", errors.New("join check argument must be quoted")
+	}
+	value, err := strconv.Unquote(argument)
+	if err != nil {
+		return "", err
+	}
+	return value, nil
 }
 
 func (s *Service) handleGroupJoinRequest(ctx context.Context, event qq.MessageEvent) {
@@ -79,6 +148,21 @@ func (s *Service) handleGroupJoinRequest(ctx context.Context, event qq.MessageEv
 			"applicant_is_bot", request.Bot,
 			"risk_tips_present", strings.TrimSpace(request.RiskTips) != "",
 		)
+		return
+	}
+	if setting.MinQQLevel > 0 {
+		level, present := request.UserLevel()
+		if !present {
+			s.logger.Info("入群申请事件缺少 QQ 等级，等待人工审核", "group_openid", request.GroupOpenID, "member_openid", request.MemberOpenID, "required_qq_level", setting.MinQQLevel)
+			return
+		}
+		if level < setting.MinQQLevel {
+			s.logger.Info("入群申请 QQ 等级不足，等待人工审核", "group_openid", request.GroupOpenID, "member_openid", request.MemberOpenID, "qq_level", level, "required_qq_level", setting.MinQQLevel)
+			return
+		}
+	}
+	if setting.MatchText != "" && !joinRequestContains(request, setting.MatchText) {
+		s.logger.Info("入群申请内容未匹配自动审批字符串，等待人工审核", "group_openid", request.GroupOpenID, "member_openid", request.MemberOpenID)
 		return
 	}
 	api, ok := s.qq.(groupJoinApprovalAPI)
@@ -105,6 +189,18 @@ func (s *Service) handleGroupJoinRequest(ctx context.Context, event qq.MessageEv
 		return
 	}
 	s.logger.Info("已自动通过匹配 New API 账户的入群申请", "group_openid", request.GroupOpenID, "member_openid", request.MemberOpenID, "newapi_user_id", user.ID)
+}
+
+func joinRequestContains(request qq.GroupJoinRequest, matchText string) bool {
+	if strings.Contains(request.VerifyInfo.VerifyMessage, matchText) {
+		return true
+	}
+	for _, item := range request.VerifyInfo.ReviewQAList {
+		if strings.Contains(item.Answer, matchText) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) matchJoinRequestUser(ctx context.Context, request qq.GroupJoinRequest) (newapi.User, bool, error) {

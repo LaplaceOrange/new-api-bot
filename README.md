@@ -68,6 +68,8 @@
 | `/welcome on\|off` | 管理员 | 开启或关闭当前群的新成员欢迎；欢迎消息会实际 @ 新成员 |
 | `/welcome set <欢迎语>` | 管理员 | 设置当前群欢迎语并自动开启 |
 | `/join on\|off\|status` | 管理员 | 按群开启、关闭或查看 New API 账户入群自动审批 |
+| `/join limit <QQ等级数>` | 管理员 | 设置自动审批最低 QQ 用户等级；`0` 表示不限制 |
+| `/join check "<匹配字符串>"` | 管理员 | 要求申请内容包含指定字符串；`""` 表示不限制 |
 | `/mute <@成员或member_openid> <时长>` | 管理员 | 禁言普通群成员，时长支持 `10m`、`2h`、`3d`，最长 30 天 |
 | `/mute off <@成员或member_openid>` | 管理员 | 解除指定普通群成员禁言 |
 | `/mute status` | 管理员 | 查看全员禁言模式和当前成员禁言列表 |
@@ -210,6 +212,8 @@ $bytes = New-Object byte[] 32
 - QQ 官方在 2026-08-10 新增 `GROUP_JOIN_REQUEST`、入群申请审批和群禁言接口，并将所有 HTTP API 域名统一为 `api.bot.qq.com`；本项目已使用统一域名。
 - 自动审批默认对所有群关闭。管理员需在目标群执行 `/join on`，关闭时使用 `/join off`。
 - 开启后，机器人从验证消息或管理员问答答案中查找完整邮箱或正整数 New API 用户 ID；账户存在且状态正常时才调用 QQ `approve`。不匹配、账户禁用、申请人为机器人、QQ 返回 `risk_tips` 或接口查询失败时均保留为人工审核。
+- `/join check "内部用户"` 会额外要求验证消息或任一管理员问答答案包含大小写敏感的字面字符串 `内部用户`；使用 `/join check ""` 清除该限制。
+- `/join limit 20` 会额外要求 QQ 入群申请事件中的 `qq_level` 或 `level` 至少为 20；使用 `/join limit 0` 清除该限制。当前 QQ 官方 `GROUP_JOIN_REQUEST` 文档未承诺提供用户 QQ 等级，因此阈值大于 0 且事件缺少等级字段时，机器人会保留该申请等待人工审核，不会猜测等级或自动放行。
 - 自动审批不会建立 QQ 与 New API 的绑定关系；入群后仍需执行 `/bind` 完成邮箱验证。
 - 入群申请事件和审批接口都要求机器人是目标群管理员。事件按 `group_openid`、`member_openid` 和 `join_request_id` 去重，避免重复审批。
 - `/mute` 使用 QQ `/v2/groups/{group_openid}/restrict_chat_setting` 接口，只能操作普通成员，不能禁言群主、管理员或机器人；QQ 返回的权限或参数错误会直接回复执行者。

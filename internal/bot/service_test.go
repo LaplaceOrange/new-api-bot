@@ -533,6 +533,87 @@ func TestJoinCommandConfiguresCurrentGroup(t *testing.T) {
 	}
 }
 
+func TestJoinCommandConfiguresLevelAndContentLimits(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "admin", "/join limit 20"))
+	service.process(context.Background(), groupEvent("g1", "admin", `/join check "内部 用户"`))
+	setting, err := storage.GetGroupJoinApproval("g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setting.MinQQLevel != 20 || setting.MatchText != "内部 用户" {
+		t.Fatalf("unexpected setting: %#v", setting)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "admin", "/join status"))
+	status := lastReply(t, qqAPI)
+	if !strings.Contains(status, "至少 20 级") || !strings.Contains(status, `"内部 用户"`) {
+		t.Fatalf("unexpected status: %q", status)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "admin", "/join limit 0"))
+	service.process(context.Background(), groupEvent("g1", "admin", `/join check ""`))
+	setting, err = storage.GetGroupJoinApproval("g1")
+	if err != nil || setting.MinQQLevel != 0 || setting.MatchText != "" {
+		t.Fatalf("limits were not cleared: setting=%#v err=%v", setting, err)
+	}
+}
+
+func TestJoinCommandRejectsInvalidLevelAndUnquotedCheck(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "admin", "/join limit -1"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "非负整数") {
+		t.Fatalf("unexpected level error: %q", reply)
+	}
+	service.process(context.Background(), groupEvent("g1", "admin", "/join check unquoted"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, `/join check "<匹配字符串>"`) {
+		t.Fatalf("unexpected check error: %q", reply)
+	}
+}
+
+func TestGroupJoinApprovalRequiresConfiguredLevelAndContent(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if err := storage.PutGroupJoinApproval(model.GroupJoinApproval{GroupOpenID: "g1", Enabled: true, MinQQLevel: 20, MatchText: "内部用户"}); err != nil {
+		t.Fatal(err)
+	}
+	requests := []qq.GroupJoinRequest{
+		{
+			GroupOpenID: "g1", MemberOpenID: "approved", JoinRequestID: "r1", QQLevel: qq.OptionalInt{Value: 25, Set: true},
+			VerifyInfo: qq.GroupJoinVerifyInfo{ReviewQAList: []qq.GroupJoinReviewQA{{Answer: "alice@example.com"}, {Answer: "我是内部用户"}}},
+		},
+		{
+			GroupOpenID: "g1", MemberOpenID: "low-level", JoinRequestID: "r2", QQLevel: qq.OptionalInt{Value: 19, Set: true},
+			VerifyInfo: qq.GroupJoinVerifyInfo{ReviewQAList: []qq.GroupJoinReviewQA{{Answer: "alice@example.com"}, {Answer: "我是内部用户"}}},
+		},
+		{
+			GroupOpenID: "g1", MemberOpenID: "missing-level", JoinRequestID: "r3",
+			VerifyInfo: qq.GroupJoinVerifyInfo{ReviewQAList: []qq.GroupJoinReviewQA{{Answer: "alice@example.com"}, {Answer: "我是内部用户"}}},
+		},
+		{
+			GroupOpenID: "g1", MemberOpenID: "wrong-content", JoinRequestID: "r4", QQLevel: qq.OptionalInt{Value: 25, Set: true},
+			VerifyInfo: qq.GroupJoinVerifyInfo{ReviewQAList: []qq.GroupJoinReviewQA{{Answer: "alice@example.com"}, {Answer: "外部用户"}}},
+		},
+	}
+	for _, request := range requests {
+		service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_JOIN_REQUEST", JoinRequest: request})
+	}
+	qqAPI.mu.Lock()
+	defer qqAPI.mu.Unlock()
+	if len(qqAPI.joinApprovals) != 1 || qqAPI.joinApprovals[0].MemberOpenID != "approved" {
+		t.Fatalf("unexpected approvals: %#v", qqAPI.joinApprovals)
+	}
+}
+
 func TestMuteCommandsUseOfficialGroupModerationAPI(t *testing.T) {
 	service, storage, _, qqAPI, _ := testService(t)
 	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}

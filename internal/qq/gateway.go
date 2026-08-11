@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,8 +89,42 @@ type GroupJoinRequest struct {
 	ApplySource   string              `json:"apply_source"`
 	InvitedBy     string              `json:"invited_by"`
 	Bot           bool                `json:"bot"`
+	QQLevel       OptionalInt         `json:"qq_level"`
+	Level         OptionalInt         `json:"level"`
 	VerifyInfo    GroupJoinVerifyInfo `json:"verify_info"`
 	AutoApproved  *GroupAutoApproved  `json:"auto_approved,omitempty"`
+}
+
+// OptionalInt accepts both JSON numbers and numeric strings while retaining
+// whether QQ actually supplied the field.
+type OptionalInt struct {
+	Value int
+	Set   bool
+}
+
+func (i *OptionalInt) UnmarshalJSON(data []byte) error {
+	value := strings.TrimSpace(string(data))
+	if value == "" || value == "null" {
+		return nil
+	}
+	value = strings.Trim(value, "\"")
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fmt.Errorf("invalid optional integer %q", value)
+	}
+	i.Value = parsed
+	i.Set = true
+	return nil
+}
+
+func (r GroupJoinRequest) UserLevel() (int, bool) {
+	if r.QQLevel.Set {
+		return r.QQLevel.Value, true
+	}
+	if r.Level.Set {
+		return r.Level.Value, true
+	}
+	return 0, false
 }
 
 type GroupJoinVerifyInfo struct {
