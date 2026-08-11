@@ -20,7 +20,11 @@ import (
 
 const maxResponseBody = 8 << 20
 
-var ErrRedemptionNotFound = errors.New("未找到对应的兑换码记录")
+var (
+	ErrRedemptionNotFound = errors.New("未找到对应的兑换码记录")
+	errResponseTooLarge   = errors.New("response body exceeds limit")
+	errResponseTrailing   = errors.New("response contains trailing content")
+)
 
 type Client struct {
 	baseURL     string
@@ -28,6 +32,7 @@ type Client struct {
 	adminUserID int
 	httpClient  *http.Client
 	statusMu    sync.RWMutex
+	statusFetch chan struct{}
 	status      Status
 	statusAt    time.Time
 	lastSuccess atomic.Int64
@@ -36,6 +41,7 @@ type Client struct {
 type APIError struct {
 	StatusCode int
 	Message    string
+	Cause      error
 }
 
 func (e *APIError) Error() string {
@@ -44,6 +50,8 @@ func (e *APIError) Error() string {
 	}
 	return "New API 请求失败：" + e.Message
 }
+
+func (e *APIError) Unwrap() error { return e.Cause }
 
 type Status struct {
 	SystemName   string `json:"system_name"`
@@ -107,6 +115,7 @@ func New(baseURL, adminToken string, adminUserID int, timeout time.Duration) *Cl
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          4,
 		MaxIdleConnsPerHost:   2,
+		MaxConnsPerHost:       4,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
@@ -116,6 +125,7 @@ func New(baseURL, adminToken string, adminUserID int, timeout time.Duration) *Cl
 		adminToken:  adminToken,
 		adminUserID: adminUserID,
 		httpClient:  &http.Client{Transport: transport, Timeout: timeout},
+		statusFetch: make(chan struct{}, 1),
 	}
 }
 
@@ -129,7 +139,22 @@ func (c *Client) LastSuccess() time.Time {
 
 func (c *Client) GetStatus(ctx context.Context, force bool) (Status, error) {
 	c.statusMu.RLock()
+	observedAt := c.statusAt
 	if !force && c.status.QuotaPerUnit > 0 && time.Since(c.statusAt) < 10*time.Minute {
+		status := c.status
+		c.statusMu.RUnlock()
+		return status, nil
+	}
+	c.statusMu.RUnlock()
+	select {
+	case c.statusFetch <- struct{}{}:
+		defer func() { <-c.statusFetch }()
+	case <-ctx.Done():
+		return Status{}, ctx.Err()
+	}
+
+	c.statusMu.RLock()
+	if c.status.QuotaPerUnit > 0 && (c.statusAt.After(observedAt) || (!force && time.Since(c.statusAt) < 10*time.Minute)) {
 		status := c.status
 		c.statusMu.RUnlock()
 		return status, nil
@@ -414,25 +439,31 @@ func (c *Client) do(ctx context.Context, method, path string, body any, auth boo
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return envelope{}, &APIError{Message: sanitizeMessage(err.Error())}
+		return envelope{}, &APIError{Message: sanitizeMessage(err.Error()), Cause: err}
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody+1))
-	if err != nil {
-		return envelope{}, &APIError{StatusCode: resp.StatusCode, Message: "读取响应失败"}
-	}
-	if len(data) > maxResponseBody {
-		return envelope{}, &APIError{StatusCode: resp.StatusCode, Message: "响应体超过 1 MiB 限制"}
-	}
+	limited := &io.LimitedReader{R: resp.Body, N: maxResponseBody + 1}
 	var env envelope
-	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder := json.NewDecoder(limited)
 	decoder.UseNumber()
 	if err := decoder.Decode(&env); err != nil {
-		message := strings.TrimSpace(string(data))
-		if len(message) > 200 {
-			message = message[:200]
+		if limited.N == 0 {
+			return envelope{}, &APIError{StatusCode: resp.StatusCode, Message: "响应体超过 8 MiB 限制", Cause: errResponseTooLarge}
 		}
-		return envelope{}, &APIError{StatusCode: resp.StatusCode, Message: sanitizeMessage(message)}
+		return envelope{}, &APIError{StatusCode: resp.StatusCode, Message: "解析响应失败：" + sanitizeMessage(err.Error()), Cause: err}
+	}
+	if limited.N == 0 {
+		return envelope{}, &APIError{StatusCode: resp.StatusCode, Message: "响应体超过 8 MiB 限制", Cause: errResponseTooLarge}
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if limited.N == 0 {
+			return envelope{}, &APIError{StatusCode: resp.StatusCode, Message: "响应体超过 8 MiB 限制", Cause: errResponseTooLarge}
+		}
+		return envelope{}, &APIError{StatusCode: resp.StatusCode, Message: "响应包含多余内容", Cause: errResponseTrailing}
+	}
+	if limited.N == 0 {
+		return envelope{}, &APIError{StatusCode: resp.StatusCode, Message: "响应体超过 8 MiB 限制", Cause: errResponseTooLarge}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !env.Success {
 		message := strings.TrimSpace(env.Message)

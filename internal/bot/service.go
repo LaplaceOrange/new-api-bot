@@ -3,16 +3,20 @@ package bot
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/fsykk/new-api-bot/internal/config"
 	"github.com/fsykk/new-api-bot/internal/mailer"
@@ -48,6 +52,16 @@ type QQAPI interface {
 	ReplyGroup(context.Context, string, string, string) error
 }
 
+const (
+	maxCommandBytes         = 4 << 10
+	maxPendingGatewayEvents = 512
+)
+
+type queuedGatewayEvent struct {
+	key   string
+	event qq.MessageEvent
+}
+
 type Service struct {
 	cfg              config.Config
 	store            *store.Store
@@ -56,29 +70,53 @@ type Service struct {
 	qq               QQAPI
 	mailer           mailer.Sender
 	logger           *slog.Logger
-	queue            chan qq.MessageEvent
+	queue            chan queuedGatewayEvent
 	workers          sync.WaitGroup
-	checkins         sync.Map
-	credits          sync.Map
-	plans            sync.Map
+	workersDone      chan struct{}
+	checkins         keyedLocker[string]
+	credits          keyedLocker[int]
+	plans            keyedLocker[int]
+	groupSettings    keyedLocker[string]
 	notifyStop       chan struct{}
+	dispatchStop     chan struct{}
+	dispatchDone     chan struct{}
+	inboxWake        chan struct{}
+	started          atomic.Bool
 	stopOnce         sync.Once
+	queueCloseOnce   sync.Once
 	gatewayConnected func() bool
+	lifecycleCtx     context.Context
+	inflightMu       sync.Mutex
+	inflight         map[string]struct{}
 	notifyMu         sync.Mutex
 	groupLastNotify  map[string]time.Time
 	benefitMu        sync.Mutex
+	lastPruneAt      time.Time
+	chartSemaphore   chan struct{}
+	commandRulesMu   sync.Mutex
+	commandRules     atomic.Pointer[[]model.CommandRule]
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
+	if cfg.GatewayQueueSize <= 0 {
+		cfg.GatewayQueueSize = 64
+	}
+	if cfg.GatewayWorkers <= 0 {
+		cfg.GatewayWorkers = 2
+	}
 	return &Service{
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
-		queue: make(chan qq.MessageEvent, cfg.GatewayQueueSize), notifyStop: make(chan struct{}), groupLastNotify: make(map[string]time.Time),
+		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1),
 	}
 }
 
 func (s *Service) SetGatewayConnectedFunc(fn func() bool) { s.gatewayConnected = fn }
 
 func (s *Service) Start(ctx context.Context) {
+	if !s.started.CompareAndSwap(false, true) {
+		return
+	}
+	s.lifecycleCtx = ctx
 	for i := 0; i < s.cfg.GatewayWorkers; i++ {
 		s.workers.Add(1)
 		go func(worker int) {
@@ -87,11 +125,11 @@ func (s *Service) Start(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
-				case event, ok := <-s.queue:
+				case item, ok := <-s.queue:
 					if !ok {
 						return
 					}
-					s.process(ctx, event)
+					s.processQueuedGatewayEvent(ctx, item)
 				}
 			}
 		}(i)
@@ -108,17 +146,64 @@ func (s *Service) Start(ctx context.Context) {
 		defer s.workers.Done()
 		s.runBenefitWorker(ctx)
 	}()
+	go s.runInboxDispatcher(ctx)
+	go func() {
+		s.workers.Wait()
+		close(s.workersDone)
+	}()
 }
 
 func (s *Service) Stop() {
-	s.stopOnce.Do(func() {
-		close(s.queue)
-		close(s.notifyStop)
-	})
-	s.workers.Wait()
+	_ = s.StopContext(context.Background())
 }
 
-func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) {
+func (s *Service) StopContext(ctx context.Context) error {
+	s.stopOnce.Do(func() {
+		close(s.notifyStop)
+		close(s.dispatchStop)
+	})
+	if !s.started.Load() {
+		s.queueCloseOnce.Do(func() { close(s.queue) })
+		return nil
+	}
+	select {
+	case <-s.dispatchDone:
+		s.queueCloseOnce.Do(func() { close(s.queue) })
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-s.workersDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// backgroundCommandContext lets a long command outlive the short per-message
+// deadline while still being canceled immediately when the service shuts down.
+func (s *Service) backgroundCommandContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	stopLifecycle := context.AfterFunc(s.lifecycleCtx, cancel)
+	return ctx, func() {
+		stopLifecycle()
+		cancel()
+	}
+}
+
+func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) bool {
+	if event.Message.ID != "" {
+		content := strings.TrimSpace(event.Message.Content)
+		if content == "" || !strings.HasPrefix(content, "/") {
+			s.logger.Debug("忽略非指令 QQ 消息", "event", event.EventType, "content_length", utf8.RuneCountInString(content))
+			return true
+		}
+		if len(content) > maxCommandBytes {
+			event.Message.Content = "/__command_too_long"
+			event.Message.Mentions = nil
+			event.Message.Elements = nil
+		}
+	}
 	msgIndex := sceneValue(event.Message.Scene.Ext, "msg_idx")
 	dedupKey := event.EventType + "|" + event.Message.ID + "|" + msgIndex
 	if event.JoinRequest.JoinRequestID != "" {
@@ -126,25 +211,128 @@ func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) {
 	} else if event.Member.GroupOpenID != "" {
 		dedupKey = fmt.Sprintf("%s|%s|%s|%d", event.EventType, event.Member.GroupOpenID, event.Member.MemberOpenID, event.Member.Timestamp)
 	}
-	duplicate, err := s.store.CheckAndMarkMessage(dedupKey, time.Now(), s.cfg.MessageDedupTTL)
+	payload, err := json.Marshal(event)
 	if err != nil {
-		s.logger.Error("消息去重存储失败", "error", err)
-		return
+		s.logger.Error("序列化 QQ Gateway 事件失败", "event", event.EventType, "error", err)
+		return false
 	}
-	if duplicate {
-		return
+	encryptedPayload, err := s.secure.Encrypt(string(payload))
+	if err != nil {
+		s.logger.Error("加密 QQ Gateway 事件失败", "event", event.EventType, "error", err)
+		return false
 	}
+	pending, err := s.store.EnqueueGatewayEvent(dedupKey, []byte(encryptedPayload), time.Now(), s.cfg.MessageDedupTTL, maxPendingGatewayEvents)
+	if err != nil {
+		if errors.Is(err, store.ErrEventInboxFull) {
+			s.logger.Warn("持久化命令收件箱已满，请求 Gateway 退避重投", "event", event.EventType)
+		} else {
+			s.logger.Error("持久化 QQ Gateway 事件失败", "event", event.EventType, "error", err)
+		}
+		return false
+	}
+	if !pending {
+		return true
+	}
+	if !s.tryDispatchGatewayEvent(queuedGatewayEvent{key: dedupKey, event: event}) {
+		s.wakeInboxDispatcher()
+	}
+	return true
+}
+
+func (s *Service) tryDispatchGatewayEvent(item queuedGatewayEvent) bool {
+	s.inflightMu.Lock()
+	if _, exists := s.inflight[item.key]; exists {
+		s.inflightMu.Unlock()
+		return true
+	}
+	s.inflight[item.key] = struct{}{}
+	s.inflightMu.Unlock()
 	select {
-	case s.queue <- event:
+	case s.queue <- item:
+		return true
 	default:
-		s.logger.Warn("命令队列已满，拒绝消息", "event", event.EventType)
-		if event.Message.ID == "" {
+		s.releaseGatewayEvent(item.key)
+		return false
+	}
+}
+
+func (s *Service) releaseGatewayEvent(key string) {
+	s.inflightMu.Lock()
+	delete(s.inflight, key)
+	s.inflightMu.Unlock()
+}
+
+func (s *Service) wakeInboxDispatcher() {
+	select {
+	case s.inboxWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) runInboxDispatcher(ctx context.Context) {
+	defer close(s.dispatchDone)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		s.dispatchPendingGatewayEvents()
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.dispatchStop:
+			return
+		case <-s.inboxWake:
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Service) dispatchPendingGatewayEvents() {
+	limit := cap(s.queue) + s.cfg.GatewayWorkers + 1
+	items, err := s.store.ListPendingGatewayEvents(limit)
+	if err != nil {
+		s.logger.Error("读取持久化命令收件箱失败", "error", err)
+		return
+	}
+	for _, pending := range items {
+		plaintext, err := s.secure.Decrypt(string(pending.Payload))
+		if err != nil {
+			s.logger.Error("解密持久化 QQ Gateway 事件失败，已移除损坏记录", "key", pending.Key, "error", err)
+			_ = s.store.CompleteGatewayEvent(pending.Key)
+			continue
+		}
+		var event qq.MessageEvent
+		if err := json.Unmarshal([]byte(plaintext), &event); err != nil {
+			s.logger.Error("解析持久化 QQ Gateway 事件失败，已移除损坏记录", "key", pending.Key, "error", err)
+			_ = s.store.CompleteGatewayEvent(pending.Key)
+			continue
+		}
+		if !s.tryDispatchGatewayEvent(queuedGatewayEvent{key: pending.Key, event: event}) {
 			return
 		}
-		replyCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		_ = s.reply(replyCtx, event, "机器人当前任务较多，请稍后重试。")
 	}
+}
+
+func (s *Service) processQueuedGatewayEvent(ctx context.Context, item queuedGatewayEvent) {
+	if ctx.Err() != nil {
+		s.releaseGatewayEvent(item.key)
+		return
+	}
+	completed := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("处理 QQ Gateway 事件时发生 panic，事件保留至下次重启恢复", "key", item.key, "panic", recovered)
+		}
+		if completed {
+			s.releaseGatewayEvent(item.key)
+			s.wakeInboxDispatcher()
+		}
+	}()
+	s.process(ctx, item.event)
+	if err := s.store.CompleteGatewayEvent(item.key); err != nil {
+		s.logger.Error("完成命令后移除持久化收件箱记录失败", "key", item.key, "error", err)
+		return
+	}
+	completed = true
 }
 
 func (s *Service) process(parent context.Context, event qq.MessageEvent) {
@@ -160,9 +348,9 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	}
 	content := strings.TrimSpace(event.Message.Content)
 	if content == "" || !strings.HasPrefix(content, "/") {
-		s.logger.Info("忽略非指令 QQ 消息",
+		s.logger.Debug("忽略非指令 QQ 消息",
 			"event", event.EventType,
-			"content_length", len([]rune(content)),
+			"content_length", utf8.RuneCountInString(content),
 			"starts_with_slash", strings.HasPrefix(content, "/"),
 		)
 		return
@@ -174,7 +362,7 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		return
 	}
 	command := strings.ToLower(fields[0])
-	s.logger.Info("开始处理 QQ 命令", "event", event.EventType, "command", command)
+	s.logger.Debug("开始处理 QQ 命令", "event", event.EventType, "command", command)
 	identity := identityFromEvent(event)
 	if command == "/enable" || command == "/disable" {
 		if err := s.handleCommandRule(ctx, event, identity, command, content); err != nil {
@@ -187,12 +375,10 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		return
 	}
 	canonical, resolveErr := s.store.ResolveCanonical(identity)
-	if event.EventType == "C2C_MESSAGE_CREATE" && identity.UserOpenID != "" && canonical != "" {
-		_ = s.store.PutContact(canonical, identity.UserOpenID)
-	}
-
 	var err error
 	switch command {
+	case "/__command_too_long":
+		err = s.reply(ctx, event, "指令内容过长，请缩短到 4096 字节以内后重试。")
 	case "/help":
 		if len(fields) != 1 {
 			err = s.reply(ctx, event, "格式错误。正确用法：/help")
@@ -550,10 +736,8 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 	}
 	period, next := periodKey(time.Now(), s.cfg.CheckinPeriod, s.cfg.CheckinTimezone)
 	lockKey := canonical + "|" + period
-	lockValue, _ := s.checkins.LoadOrStore(lockKey, &sync.Mutex{})
-	mutex := lockValue.(*sync.Mutex)
-	mutex.Lock()
-	defer mutex.Unlock()
+	unlock := s.checkins.Lock(lockKey)
+	defer unlock()
 
 	credit, err := s.currentCheckinCredit()
 	if err != nil {
@@ -624,15 +808,23 @@ func (s *Service) handleCheckinStatus(ctx context.Context, event qq.MessageEvent
 	return s.reply(ctx, event, fmt.Sprintf("当前周期：%s\n签到状态：%s\n已发放额度：%s\n绑定用户 ID：%d\n下个周期：%s", period, status, record.DisplayCredit, record.NewAPIID, next.Format("2006-01-02 15:04 MST")))
 }
 
-// isAmbiguousQuotaWrite identifies a request which may have reached New API
-// and been applied, but whose response was not received by the bot.
+// isAmbiguousQuotaWrite identifies a non-idempotent request which may have
+// reached New API and been applied, but whose response was not received.
 func isAmbiguousQuotaWrite(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
 	var apiErr *newapi.APIError
-	if !errors.As(err, &apiErr) || apiErr.StatusCode != 0 {
-		return false
+	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode == 0 || apiErr.StatusCode == http.StatusRequestTimeout || apiErr.StatusCode >= 500 {
+			return true
+		}
+		if apiErr.StatusCode >= 200 && apiErr.StatusCode < 300 && apiErr.Cause != nil {
+			return true
+		}
 	}
 	text := strings.ToLower(err.Error())
 	return strings.Contains(text, "awaiting headers") || strings.Contains(text, "context deadline exceeded")
@@ -679,10 +871,8 @@ func (s *Service) handleCredit(ctx context.Context, event qq.MessageEvent, canon
 		if err != nil {
 			return s.reply(ctx, event, err.Error())
 		}
-		lockValue, _ := s.credits.LoadOrStore(userID, &sync.Mutex{})
-		mutex := lockValue.(*sync.Mutex)
-		mutex.Lock()
-		defer mutex.Unlock()
+		unlock := s.credits.Lock(userID)
+		defer unlock()
 		if action == "sub" {
 			user, err := s.newAPI.GetUser(ctx, userID)
 			if err != nil {
@@ -693,6 +883,9 @@ func (s *Service) handleCredit(ctx context.Context, event qq.MessageEvent, canon
 			}
 			if err := s.newAPI.SubtractQuota(ctx, userID, rawQuota); err != nil {
 				_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "credit.sub", Target: strconv.Itoa(userID), Success: false, Description: publicError(err)})
+				if isAmbiguousQuotaWrite(err) {
+					return s.reply(ctx, event, "额度扣除结果待确认，请先使用 /credit show 查询当前余额，确认后再决定是否重试。")
+				}
 				return s.reply(ctx, event, publicError(err))
 			}
 			remaining := user.Quota - rawQuota
@@ -701,6 +894,9 @@ func (s *Service) handleCredit(ctx context.Context, event qq.MessageEvent, canon
 		}
 		if err := s.newAPI.AddQuota(ctx, userID, rawQuota); err != nil {
 			_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "credit.add", Target: strconv.Itoa(userID), Success: false, Description: publicError(err)})
+			if isAmbiguousQuotaWrite(err) {
+				return s.reply(ctx, event, "额度增加结果待确认，请先使用 /credit show 查询当前余额，确认后再决定是否重试。")
+			}
 			return s.reply(ctx, event, publicError(err))
 		}
 		_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "credit.add", Target: strconv.Itoa(userID), Success: true, Metadata: map[string]any{"display_credit": fields[3], "quota": rawQuota}})
@@ -825,15 +1021,17 @@ func (s *Service) handlePlan(ctx context.Context, event qq.MessageEvent, canonic
 		if err != nil {
 			return s.reply(ctx, event, err.Error())
 		}
-		lock := s.planLock(userID)
-		lock.Lock()
-		defer lock.Unlock()
+		unlock := s.plans.Lock(userID)
+		defer unlock()
 		before, err := s.newAPI.ListUserSubscriptions(ctx, userID)
 		if err != nil {
 			return s.reply(ctx, event, publicError(err))
 		}
 		if err := s.newAPI.CreateUserSubscription(ctx, userID, planID); err != nil {
 			_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "plan.add", Target: strconv.Itoa(userID), Success: false, Description: publicError(err), Metadata: map[string]any{"plan_id": planID}})
+			if isAmbiguousQuotaWrite(err) {
+				return s.reply(ctx, event, "添加订阅结果待确认，请先使用 /plan view 查询当前订阅，确认后再决定是否重试。")
+			}
 			return s.reply(ctx, event, "添加订阅失败："+publicError(err))
 		}
 		after, listErr := s.newAPI.ListUserSubscriptions(ctx, userID)
@@ -859,9 +1057,8 @@ func (s *Service) handlePlan(ctx context.Context, event qq.MessageEvent, canonic
 		if err != nil {
 			return s.reply(ctx, event, err.Error())
 		}
-		lock := s.planLock(userID)
-		lock.Lock()
-		defer lock.Unlock()
+		unlock := s.plans.Lock(userID)
+		defer unlock()
 		records, err := s.newAPI.ListUserSubscriptions(ctx, userID)
 		if err != nil {
 			return s.reply(ctx, event, publicError(err))
@@ -875,6 +1072,9 @@ func (s *Service) handlePlan(ctx context.Context, event qq.MessageEvent, canonic
 		}
 		if err := s.newAPI.InvalidateUserSubscription(ctx, subscriptionID); err != nil {
 			_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "plan.sub", Target: strconv.Itoa(userID), Success: false, Description: publicError(err), Metadata: map[string]any{"subscription_id": subscriptionID}})
+			if isAmbiguousQuotaWrite(err) {
+				return s.reply(ctx, event, "取消订阅结果待确认，请先使用 /plan view 查询当前订阅状态，确认后再决定是否重试。")
+			}
 			return s.reply(ctx, event, "取消订阅失败："+publicError(err))
 		}
 		_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "plan.sub", Target: strconv.Itoa(userID), Success: true, Metadata: map[string]any{"subscription_id": subscriptionID, "plan_id": record.Subscription.PlanID}})
@@ -882,11 +1082,6 @@ func (s *Service) handlePlan(ctx context.Context, event qq.MessageEvent, canonic
 	default:
 		return s.reply(ctx, event, planUsage())
 	}
-}
-
-func (s *Service) planLock(userID int) *sync.Mutex {
-	value, _ := s.plans.LoadOrStore(userID, &sync.Mutex{})
-	return value.(*sync.Mutex)
 }
 
 func findCreatedSubscriptionID(before, after []newapi.UserSubscriptionRecord, planID int) int {

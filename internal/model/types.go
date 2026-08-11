@@ -96,23 +96,31 @@ type SentBotMessage struct {
 	SentAt      time.Time `json:"sent_at"`
 }
 
+type PendingGatewayEvent struct {
+	Key       string    `json:"-"`
+	Payload   []byte    `json:"payload"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type BenefitCampaign struct {
-	ID             string    `json:"id"`
-	Name           string    `json:"name"`
-	Actor          string    `json:"actor"`
-	GroupOpenID    string    `json:"group_openid"`
-	DisplayCredit  string    `json:"display_credit"`
-	RawQuota       int64     `json:"raw_quota"`
-	Count          int       `json:"count"`
-	ValidHours     int       `json:"valid_hours"`
-	BanDays        int       `json:"ban_days"`
-	RedemptionIDs  []int     `json:"redemption_ids"`
-	EncryptedCodes []string  `json:"encrypted_codes"`
-	CreatedAt      time.Time `json:"created_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	Status         string    `json:"status"`
-	Announced      bool      `json:"announced"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             string        `json:"id"`
+	Name           string        `json:"name"`
+	Actor          string        `json:"actor"`
+	GroupOpenID    string        `json:"group_openid"`
+	DisplayCredit  string        `json:"display_credit"`
+	RawQuota       int64         `json:"raw_quota"`
+	Count          int           `json:"count"`
+	ValidHours     int           `json:"valid_hours"`
+	BanDays        int           `json:"ban_days"`
+	RedemptionIDs  []int         `json:"redemption_ids"`
+	EncryptedCodes []string      `json:"encrypted_codes"`
+	ClaimedCodes   map[int][]int `json:"claimed_codes,omitempty"`
+	CreatedAt      time.Time     `json:"created_at"`
+	ExpiresAt      time.Time     `json:"expires_at"`
+	LastCheckedAt  time.Time     `json:"last_checked_at,omitempty"`
+	Status         string        `json:"status"`
+	Announced      bool          `json:"announced"`
+	UpdatedAt      time.Time     `json:"updated_at"`
 }
 
 type BenefitBan struct {

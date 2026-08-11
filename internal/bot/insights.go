@@ -430,13 +430,13 @@ func (s *Service) runQuotaNotifier(ctx context.Context) {
 		case <-s.notifyStop:
 			return
 		case <-ticker.C:
-			s.checkQuotaNotifications()
+			s.checkQuotaNotifications(ctx)
 		}
 	}
 }
 
-func (s *Service) checkQuotaNotifications() {
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.NewAPITimeout*2)
+func (s *Service) checkQuotaNotifications(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, s.cfg.NewAPITimeout*2)
 	defer cancel()
 	preferences, err := s.store.ListQuotaNotifications()
 	if err != nil || len(preferences) == 0 {
@@ -468,6 +468,9 @@ func (s *Service) checkQuotaNotifications() {
 	local := now.In(s.cfg.CheckinTimezone)
 	dailyDue := local.Hour() == dailyAt.Hour() && local.Minute() >= dailyAt.Minute()
 	dailyKey := local.Format("2006-01-02")
+	var dailyTotals map[string]usageTotal
+	var dailyUsageErr error
+	dailyUsageLoaded := false
 	for _, preference := range preferences {
 		user, exists := byID[preference.NewAPIID]
 		if !exists {
@@ -492,10 +495,27 @@ func (s *Service) checkQuotaNotifications() {
 			}
 		}
 		if preference.DailyEnabled && dailyDue && preference.LastDailyKey != dailyKey {
-			start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, s.cfg.CheckinTimezone)
-			rows, usageErr := s.newAPI.ListUsageByUser(ctx, start, now)
-			if usageErr == nil && notificationGroupAllowed(s, preference.GroupOpenID, groupAllowed) {
-				total := usageForUsername(rows, user.Username)
+			if !dailyUsageLoaded {
+				dailyUsageLoaded = true
+				start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, s.cfg.CheckinTimezone)
+				rows, usageErr := s.newAPI.ListUsageByUser(ctx, start, now)
+				dailyUsageErr = usageErr
+				if usageErr == nil {
+					dailyTotals = make(map[string]usageTotal, len(rows))
+					for _, row := range rows {
+						key := strings.ToLower(strings.TrimSpace(row.Username))
+						total := dailyTotals[key]
+						total.UserID = row.UserID
+						total.Username = row.Username
+						total.Quota += row.Quota
+						total.Tokens += row.TokenUsed
+						total.Count += row.Count
+						dailyTotals[key] = total
+					}
+				}
+			}
+			if dailyUsageErr == nil && notificationGroupAllowed(s, preference.GroupOpenID, groupAllowed) {
+				total := dailyTotals[strings.ToLower(strings.TrimSpace(user.Username))]
 				groupMessages[preference.GroupOpenID] = append(groupMessages[preference.GroupOpenID], fmt.Sprintf("📊 %s 今日用量：%d 次请求，%d Token，消耗额度 %s，余额 %s。", mentionMember(preference.MemberOpenID), total.Count, total.Tokens, newapi.QuotaToDisplay(total.Quota, status.QuotaPerUnit), newapi.QuotaToDisplay(user.Quota, status.QuotaPerUnit)))
 				preference.LastDailyKey = dailyKey
 				updates[preference.CanonicalID] = preference

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"github.com/fsykk/new-api-bot/internal/store"
@@ -25,6 +26,7 @@ type Gateway struct {
 	logger    *slog.Logger
 	connected atomic.Bool
 	lastEvent atomic.Int64
+	sessions  atomic.Uint64
 }
 
 type FatalGatewayError struct {
@@ -102,6 +104,13 @@ type OptionalInt struct {
 	Set   bool
 }
 
+func (i OptionalInt) MarshalJSON() ([]byte, error) {
+	if !i.Set {
+		return []byte("null"), nil
+	}
+	return []byte(strconv.Itoa(i.Value)), nil
+}
+
 func (i *OptionalInt) UnmarshalJSON(data []byte) error {
 	value := strings.TrimSpace(string(data))
 	if value == "" || value == "null" {
@@ -177,9 +186,16 @@ func (g *Gateway) LastEvent() time.Time {
 	return time.Unix(v, 0)
 }
 
-func (g *Gateway) Run(ctx context.Context, handler func(context.Context, MessageEvent)) error {
+var (
+	errGatewayReconnect    = errors.New("QQ Gateway 要求重新连接")
+	errGatewayInvalidState = errors.New("QQ Gateway Session 已失效")
+	errGatewayBackpressure = errors.New("QQ Gateway 事件队列已满")
+)
+
+func (g *Gateway) Run(ctx context.Context, handler func(context.Context, MessageEvent) bool) error {
 	backoff := time.Second
 	for ctx.Err() == nil {
+		generation := g.sessions.Load()
 		err := g.connect(ctx, handler)
 		g.connected.Store(false)
 		if ctx.Err() != nil {
@@ -189,21 +205,40 @@ func (g *Gateway) Run(ctx context.Context, handler func(context.Context, Message
 		if errors.As(err, &fatal) {
 			return fatal
 		}
+		if g.sessions.Load() != generation && !errors.Is(err, errGatewayBackpressure) {
+			backoff = time.Second
+		}
 		g.logger.Warn("QQ Gateway 连接中断", "error", err, "retry_in", backoff)
 		jitter := time.Duration(rand.IntN(500)) * time.Millisecond
+		timer := time.NewTimer(backoff + jitter)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return nil
-		case <-time.After(backoff + jitter):
+		case <-timer.C:
 		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
+		backoff = nextGatewayBackoff(backoff)
 	}
 	return nil
 }
 
-func (g *Gateway) connect(ctx context.Context, handler func(context.Context, MessageEvent)) error {
+func nextGatewayBackoff(current time.Duration) time.Duration {
+	if current < time.Second {
+		return time.Second
+	}
+	if current >= 30*time.Second {
+		return 30 * time.Second
+	}
+	next := current * 2
+	if next > 30*time.Second {
+		return 30 * time.Second
+	}
+	return next
+}
+
+func (g *Gateway) connect(ctx context.Context, handler func(context.Context, MessageEvent) bool) error {
 	info, err := g.client.Gateway(ctx)
 	if err != nil {
 		return err
@@ -254,8 +289,37 @@ func (g *Gateway) connect(ctx context.Context, handler func(context.Context, Mes
 
 	var writeMu sync.Mutex
 	var sequence atomic.Int64
+	committedSequence := int64(0)
 	if stateErr == nil {
 		sequence.Store(state.Sequence)
+		committedSequence = state.Sequence
+	}
+	persistState := true
+	lastCheckpoint := time.Time{}
+	checkpoint := func(force bool) {
+		if !persistState || state.SessionID == "" || committedSequence <= 0 {
+			return
+		}
+		if !force && time.Since(lastCheckpoint) < time.Second {
+			return
+		}
+		if err := g.store.PutGatewayState(store.GatewayState{SessionID: state.SessionID, Sequence: committedSequence}); err != nil {
+			g.logger.Warn("保存 QQ Gateway 会话进度失败", "error", err)
+			return
+		}
+		lastCheckpoint = time.Now()
+	}
+	defer func() { checkpoint(true) }()
+	commitPayload := func() {
+		committedSequence = sequence.Load()
+		checkpoint(false)
+	}
+	acceptEvent := func(event MessageEvent) error {
+		if !handler(ctx, event) {
+			return errGatewayBackpressure
+		}
+		commitPayload()
+		return nil
 	}
 	lastAck := atomic.Int64{}
 	lastAck.Store(time.Now().UnixNano())
@@ -282,6 +346,7 @@ func (g *Gateway) connect(ctx context.Context, handler func(context.Context, Mes
 				err := writeJSON(heartbeatCtx, conn, map[string]any{"op": 1, "d": heartbeatSequence})
 				writeMu.Unlock()
 				if err != nil {
+					conn.CloseNow()
 					return
 				}
 			}
@@ -293,9 +358,15 @@ func (g *Gateway) connect(ctx context.Context, handler func(context.Context, Mes
 		if err != nil {
 			status := websocket.CloseStatus(err)
 			switch {
-			case status == 4006 || status == 4007 || (status >= 4900 && status <= 4913):
+			case status == 4004:
+				g.client.InvalidateAccessToken()
+				persistState = false
+				_ = g.store.ClearGatewayState()
+			case status == 4006 || status == 4007 || status == 4009 || (status >= 4900 && status <= 4913):
+				persistState = false
 				_ = g.store.ClearGatewayState()
 			case status == 4001 || status == 4002 || (status >= 4010 && status <= 4014) || status == 4914 || status == 4915:
+				persistState = false
 				_ = g.store.ClearGatewayState()
 				return &FatalGatewayError{Code: int(status), Err: err}
 			}
@@ -308,42 +379,59 @@ func (g *Gateway) connect(ctx context.Context, handler func(context.Context, Mes
 		}
 		if payload.S != nil {
 			sequence.Store(*payload.S)
-			_ = g.store.PutGatewayState(store.GatewayState{SessionID: state.SessionID, Sequence: *payload.S})
 		}
 		switch payload.Op {
+		case 7:
+			return errGatewayReconnect
+		case 9:
+			var resumable bool
+			_ = json.Unmarshal(payload.D, &resumable)
+			if !resumable {
+				persistState = false
+				state = store.GatewayState{}
+				_ = g.store.ClearGatewayState()
+			}
+			return errGatewayInvalidState
 		case 11:
 			lastAck.Store(time.Now().UnixNano())
 		case 0:
-			g.connected.Store(true)
+			if !g.connected.Swap(true) {
+				g.sessions.Add(1)
+			}
 			g.lastEvent.Store(time.Now().Unix())
-			g.logger.Info("收到 QQ Gateway 事件", "event", payload.T, "sequence", sequence.Load())
+			g.logger.Debug("收到 QQ Gateway 事件", "event", payload.T, "sequence", sequence.Load())
 			if payload.T == "READY" {
 				var ready struct {
 					SessionID string `json:"session_id"`
 				}
 				if json.Unmarshal(payload.D, &ready) == nil && ready.SessionID != "" {
 					state.SessionID = ready.SessionID
-					_ = g.store.PutGatewayState(store.GatewayState{SessionID: ready.SessionID, Sequence: sequence.Load()})
+					commitPayload()
 				}
 				continue
 			}
 			if payload.T == "RESUMED" {
+				commitPayload()
 				continue
 			}
 			if payload.T == "GROUP_MEMBER_ADD" || payload.T == "GROUP_MEMBER_REMOVE" {
 				var member GroupMemberEvent
 				if err := json.Unmarshal(payload.D, &member); err != nil {
 					g.logger.Warn("解析群成员事件失败", "event", payload.T, "error", err)
+					commitPayload()
 					continue
 				}
 				g.logger.Info("收到 QQ 群成员事件", "event", payload.T, "group_openid_present", member.GroupOpenID != "", "member_openid_present", member.MemberOpenID != "")
-				handler(ctx, MessageEvent{EventType: payload.T, Sequence: sequence.Load(), Member: member})
+				if err := acceptEvent(MessageEvent{EventType: payload.T, Sequence: sequence.Load(), Member: member}); err != nil {
+					return err
+				}
 				continue
 			}
 			if payload.T == "GROUP_JOIN_REQUEST" {
 				var request GroupJoinRequest
 				if err := json.Unmarshal(payload.D, &request); err != nil {
 					g.logger.Warn("解析用户入群申请事件失败", "error", err)
+					commitPayload()
 					continue
 				}
 				g.logger.Info("收到用户入群申请事件",
@@ -352,27 +440,33 @@ func (g *Gateway) connect(ctx context.Context, handler func(context.Context, Mes
 					"join_request_id_present", request.JoinRequestID != "",
 					"verify_method", request.VerifyInfo.Method,
 				)
-				handler(ctx, MessageEvent{EventType: payload.T, Sequence: sequence.Load(), JoinRequest: request})
+				if err := acceptEvent(MessageEvent{EventType: payload.T, Sequence: sequence.Load(), JoinRequest: request}); err != nil {
+					return err
+				}
 				continue
 			}
 			// QQ 当前生产环境的群消息事件名为 GROUP_MESSAGE_CREATE；
 			// 同时保留旧文档/旧环境使用的 GROUP_AT_MESSAGE_CREATE 兼容性。
 			if !isMessageCreateEvent(payload.T) {
+				commitPayload()
 				continue
 			}
 			var message Message
 			if err := json.Unmarshal(payload.D, &message); err != nil {
 				g.logger.Warn("解析 QQ 消息事件失败", "event", payload.T, "error", err)
+				commitPayload()
 				continue
 			}
-			g.logger.Info("收到 QQ 消息事件",
+			g.logger.Debug("收到 QQ 消息事件",
 				"event", payload.T,
 				"message_id_present", message.ID != "",
-				"content_length", len([]rune(message.Content)),
+				"content_length", utf8.RuneCountInString(message.Content),
 				"group_present", message.GroupOpenID != "",
 				"mention_count", len(message.Mentions),
 			)
-			handler(ctx, MessageEvent{EventType: payload.T, Sequence: sequence.Load(), Message: message})
+			if err := acceptEvent(MessageEvent{EventType: payload.T, Sequence: sequence.Load(), Message: message}); err != nil {
+				return err
+			}
 		}
 	}
 }

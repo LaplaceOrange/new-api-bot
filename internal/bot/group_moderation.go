@@ -32,6 +32,8 @@ func (s *Service) handleJoinCommand(ctx context.Context, event qq.MessageEvent, 
 	if group == "" {
 		return s.reply(ctx, event, "该指令只能在群聊中使用。")
 	}
+	unlock := s.groupSettings.Lock("join:" + group)
+	defer unlock()
 	if len(fields) < 2 {
 		return s.reply(ctx, event, joinCommandUsage())
 	}

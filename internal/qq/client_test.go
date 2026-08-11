@@ -3,6 +3,7 @@ package qq
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func TestFlexIntAcceptsStringAndNumber(t *testing.T) {
@@ -45,6 +46,16 @@ func TestMessageCreateEventCompatibility(t *testing.T) {
 	}
 	if isMessageCreateEvent("READY") {
 		t.Fatal("READY must not be treated as a message event")
+	}
+}
+
+func TestGatewayBackoffIsBounded(t *testing.T) {
+	backoff := time.Second
+	for range 10 {
+		backoff = nextGatewayBackoff(backoff)
+	}
+	if backoff != 30*time.Second {
+		t.Fatalf("backoff=%s, want 30s", backoff)
 	}
 }
 
@@ -95,5 +106,21 @@ func TestGroupJoinRequestUserLevelAcceptsNumberAndString(t *testing.T) {
 	}
 	if level, present := request.UserLevel(); present || level != 0 {
 		t.Fatalf("missing level should remain absent: level=%d present=%v", level, present)
+	}
+}
+
+func TestGroupJoinRequestUserLevelSurvivesPersistenceRoundTrip(t *testing.T) {
+	original := GroupJoinRequest{QQLevel: OptionalInt{Value: 42, Set: true}}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored GroupJoinRequest
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	level, present := restored.UserLevel()
+	if !present || level != 42 {
+		t.Fatalf("round-trip level=%d present=%v payload=%s", level, present, data)
 	}
 }

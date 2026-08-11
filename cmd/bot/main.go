@@ -105,11 +105,25 @@ func main() {
 	<-appCtx.Done()
 	logger.Info("收到退出信号，开始优雅关闭")
 	<-gatewayDone
-	service.Stop()
-	cancelService()
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_ = httpServer.Shutdown(shutdownCtx)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := service.StopContext(shutdownCtx); err != nil {
+		logger.Warn("命令队列未在宽限期内完成，取消剩余任务", "error", err)
+		cancelService()
+		forceCtx, forceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if forceErr := service.StopContext(forceCtx); forceErr != nil {
+			logger.Error("取消任务后服务仍未及时停止", "error", forceErr)
+		}
+		forceCancel()
+	} else {
+		cancelService()
+	}
 	shutdownCancel()
+	httpShutdownCtx, httpShutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
+		logger.Warn("健康检查服务优雅停止超时，执行强制关闭", "error", err)
+		_ = httpServer.Close()
+	}
+	httpShutdownCancel()
 	<-httpDone
 	logger.Info("服务已停止")
 }

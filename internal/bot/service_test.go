@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -28,23 +29,26 @@ func TestPublicErrorMapsExistingAdministratorPermissionFailure(t *testing.T) {
 }
 
 type fakeNewAPI struct {
-	user          newapi.User
-	users         []newapi.User
-	quotaAdds     int
-	quotaSubs     int
-	lastQuotaUser int
-	lastQuota     int64
-	subscriptions map[int][]newapi.UserSubscriptionRecord
-	nextSubID     int
-	usageByUser   []newapi.UsageRecord
-	usageByModel  []newapi.UsageRecord
-	logs          []newapi.LogRecord
-	models        []string
-	managedAction string
-	reset2FA      int
-	resetPasskey  int
-	redemptions   []newapi.Redemption
-	addQuotaErr   error
+	user           newapi.User
+	users          []newapi.User
+	quotaAdds      int
+	quotaSubs      int
+	lastQuotaUser  int
+	lastQuota      int64
+	subscriptions  map[int][]newapi.UserSubscriptionRecord
+	nextSubID      int
+	usageByUser    []newapi.UsageRecord
+	usageUserCalls int
+	usageByModel   []newapi.UsageRecord
+	logs           []newapi.LogRecord
+	models         []string
+	managedAction  string
+	reset2FA       int
+	resetPasskey   int
+	redemptions    []newapi.Redemption
+	addQuotaErr    error
+	logQueryStarts []time.Time
+	logSplitAfter  time.Duration
 }
 
 func (f *fakeNewAPI) GetStatus(context.Context, bool) (newapi.Status, error) {
@@ -91,6 +95,7 @@ func (f *fakeNewAPI) SubtractQuota(_ context.Context, userID int, quota int64) e
 	return nil
 }
 func (f *fakeNewAPI) ListUsageByUser(context.Context, time.Time, time.Time) ([]newapi.UsageRecord, error) {
+	f.usageUserCalls++
 	return append([]newapi.UsageRecord(nil), f.usageByUser...), nil
 }
 func (f *fakeNewAPI) ListUsageByModel(_ context.Context, _ time.Time, _ time.Time, username string) ([]newapi.UsageRecord, error) {
@@ -148,7 +153,11 @@ func (f *fakeNewAPI) SearchRedemptions(_ context.Context, name string, _ int) ([
 	}
 	return result, nil
 }
-func (f *fakeNewAPI) ListLogsByType(_ context.Context, _ time.Time, _ time.Time, username string, logType, _, pageSize int) (newapi.LogPage, error) {
+func (f *fakeNewAPI) ListLogsByType(_ context.Context, start time.Time, end time.Time, username string, logType, _, pageSize int) (newapi.LogPage, error) {
+	f.logQueryStarts = append(f.logQueryStarts, start)
+	if f.logSplitAfter > 0 && end.Sub(start) > f.logSplitAfter {
+		return newapi.LogPage{Items: []newapi.LogRecord{}, Total: maxBenefitLogPages*100 + 1}, nil
+	}
 	items := make([]newapi.LogRecord, 0, pageSize)
 	for _, record := range f.logs {
 		if logType != 0 && record.Type != logType {
@@ -448,6 +457,113 @@ func TestUnknownSlashCommandGetsReply(t *testing.T) {
 	}
 }
 
+func TestOversizedCommandIsCollapsedBeforeQueueing(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.Start(ctx)
+	event := groupEvent("g1", "u1", "/"+strings.Repeat("x", maxCommandBytes+1))
+	if accepted := service.HandleGateway(ctx, event); !accepted {
+		t.Fatal("oversized command was not accepted for a bounded error reply")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && replyCount(qqAPI) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	service.Stop()
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "4096") {
+		t.Fatalf("unexpected reply: %q", reply)
+	}
+}
+
+func TestNonCommandBypassesPersistentDedup(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	event := groupEvent("g1", "u1", "hello")
+	if accepted := service.HandleGateway(context.Background(), event); !accepted {
+		t.Fatal("non-command event should be intentionally accepted")
+	}
+	key := event.EventType + "|" + event.Message.ID + "|"
+	duplicate, err := storage.CheckAndMarkMessage(key, time.Now(), time.Hour)
+	if err != nil || duplicate {
+		t.Fatalf("non-command touched persistent dedup: duplicate=%v err=%v", duplicate, err)
+	}
+}
+
+func TestQueueBackpressureSpillsToPersistentInbox(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	for index := 0; index < cap(service.queue); index++ {
+		event := groupEvent("g1", "u1", fmt.Sprintf("/queued-%d", index))
+		if accepted := service.HandleGateway(context.Background(), event); !accepted {
+			t.Fatalf("queue rejected event %d before reaching capacity", index)
+		}
+	}
+	overflow := groupEvent("g1", "u1", "/overflow")
+	if accepted := service.HandleGateway(context.Background(), overflow); !accepted {
+		t.Fatal("full memory queue should accept a durably stored event")
+	}
+	if accepted := service.HandleGateway(context.Background(), overflow); !accepted {
+		t.Fatal("duplicate pending event should be acknowledged")
+	}
+	pending, err := storage.ListPendingGatewayEvents(cap(service.queue) + 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != cap(service.queue)+1 {
+		t.Fatalf("pending events=%d, want %d", len(pending), cap(service.queue)+1)
+	}
+}
+
+func TestPendingGatewayEventIsRecoveredByDispatcher(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	event := groupEvent("g1", "u1", "/help")
+	if accepted := service.HandleGateway(context.Background(), event); !accepted {
+		t.Fatal("event was not accepted")
+	}
+	queued := <-service.queue
+	service.releaseGatewayEvent(queued.key)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	service.Start(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for replyCount(qqAPI) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	service.Stop()
+	cancel()
+	if replyCount(qqAPI) == 0 {
+		t.Fatal("recovered event was not processed")
+	}
+	pending, err := storage.ListPendingGatewayEvents(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("completed event remained in inbox: %#v", pending)
+	}
+}
+
+func TestPendingGatewayEventPayloadIsEncrypted(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	event := groupEvent("g1", "u1", "/bind verify 123456")
+	if accepted := service.HandleGateway(context.Background(), event); !accepted {
+		t.Fatal("event was not accepted")
+	}
+	items, err := storage.ListPendingGatewayEvents(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("pending events=%d, want 1", len(items))
+	}
+	if bytes.Contains(items[0].Payload, []byte("123456")) || bytes.Contains(items[0].Payload, []byte("bind verify")) {
+		t.Fatalf("pending event contains plaintext command: %q", items[0].Payload)
+	}
+	plaintext, err := service.secure.Decrypt(string(items[0].Payload))
+	if err != nil || !strings.Contains(plaintext, "123456") {
+		t.Fatalf("encrypted payload could not be restored: plaintext=%q err=%v", plaintext, err)
+	}
+}
+
 func TestBindMissingArgumentShowsExactUsage(t *testing.T) {
 	service, _, _, qqAPI, _ := testService(t)
 	service.process(context.Background(), groupEvent("g1", "u1", "/bind"))
@@ -682,8 +798,9 @@ func TestBenefitCreatesCodesAndEnforcesSingleClaim(t *testing.T) {
 	if err != nil || len(campaign.RedemptionIDs) != 3 {
 		t.Fatalf("campaign not stored: %#v err=%v", campaign, err)
 	}
+	campaign.CreatedAt = campaign.CreatedAt.Add(-2 * time.Minute)
 	api.logs = []newapi.LogRecord{{ID: 1, UserID: 9, Type: 1, Content: fmt.Sprintf("通过兑换码充值，兑换码ID %d", campaign.RedemptionIDs[0])}, {ID: 2, UserID: 9, Type: 1, Content: fmt.Sprintf("通过兑换码充值，兑换码ID %d", campaign.RedemptionIDs[1])}}
-	if err := service.detectBenefitViolations(context.Background(), campaign); err != nil {
+	if err := service.detectBenefitViolations(context.Background(), &campaign); err != nil {
 		t.Fatal(err)
 	}
 	if api.managedAction != "disable" || api.lastQuotaUser != 9 {
@@ -693,6 +810,20 @@ func TestBenefitCreatesCodesAndEnforcesSingleClaim(t *testing.T) {
 	if err != nil || ban.Status != "disabled" {
 		t.Fatalf("ban not stored: %#v err=%v", ban, err)
 	}
+	firstCheckedAt := campaign.LastCheckedAt
+	if firstCheckedAt.IsZero() || len(campaign.ClaimedCodes[9]) != 2 {
+		t.Fatalf("campaign scan state not persisted: %#v", campaign)
+	}
+	if err := service.detectBenefitViolations(context.Background(), &campaign); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.logQueryStarts) < 2 {
+		t.Fatalf("benefit scan did not run twice: starts=%v", api.logQueryStarts)
+	}
+	secondStart := api.logQueryStarts[len(api.logQueryStarts)-1]
+	if secondStart.Before(campaign.CreatedAt) || secondStart.After(firstCheckedAt) {
+		t.Fatalf("benefit scan overlap is outside the safe window: start=%v created=%v checked=%v", secondStart, campaign.CreatedAt, firstCheckedAt)
+	}
 	ban.EnableAt = time.Now().Add(-time.Minute)
 	if err := storage.PutBenefitBan(ban); err != nil {
 		t.Fatal(err)
@@ -700,6 +831,50 @@ func TestBenefitCreatesCodesAndEnforcesSingleClaim(t *testing.T) {
 	service.processBenefitBans(context.Background())
 	if api.managedAction != "enable" {
 		t.Fatalf("user not re-enabled: %s", api.managedAction)
+	}
+}
+
+func TestBenefitLogScanSplitsOversizedTimeRange(t *testing.T) {
+	service, _, api, _, _ := testService(t)
+	api.logSplitAfter = time.Second
+	start := time.Unix(100, 0)
+	if err := service.scanBenefitLogs(context.Background(), start, start.Add(4*time.Second), map[int]struct{}{1: {}}, make(map[int]map[int]struct{})); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.logQueryStarts) < 3 {
+		t.Fatalf("oversized log range was not split: starts=%v", api.logQueryStarts)
+	}
+}
+
+func TestBenefitCampaignKeepsFinalScanGrace(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	now := time.Now()
+	campaign := model.BenefitCampaign{
+		ID: "benefit-grace", GroupOpenID: "g1", Status: "active", Announced: true,
+		CreatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(-time.Minute), RedemptionIDs: []int{1},
+	}
+	if err := storage.PutBenefitCampaign(campaign); err != nil {
+		t.Fatal(err)
+	}
+	service.processBenefitCampaign(context.Background(), campaign)
+	stored, err := storage.GetBenefitCampaign(campaign.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != "active" || len(stored.RedemptionIDs) != 1 {
+		t.Fatalf("campaign expired before ingestion grace: %#v", stored)
+	}
+	stored.ExpiresAt = now.Add(-benefitLogIngestionGrace - time.Minute)
+	if err := storage.PutBenefitCampaign(stored); err != nil {
+		t.Fatal(err)
+	}
+	service.processBenefitCampaign(context.Background(), stored)
+	stored, err = storage.GetBenefitCampaign(campaign.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != "expired" || len(stored.RedemptionIDs) != 0 {
+		t.Fatalf("campaign did not expire after ingestion grace: %#v", stored)
 	}
 }
 
@@ -954,7 +1129,7 @@ func TestQuotaNotificationSendsOnceAndRearms(t *testing.T) {
 	if err := storage.PutQuotaNotification(preference); err != nil {
 		t.Fatal(err)
 	}
-	service.checkQuotaNotifications()
+	service.checkQuotaNotifications(context.Background())
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "额度提醒") || !strings.Contains(reply, "Alice") {
 		t.Fatalf("unexpected notify reply: %q", reply)
 	}
@@ -963,15 +1138,40 @@ func TestQuotaNotificationSendsOnceAndRearms(t *testing.T) {
 		t.Fatalf("notification not marked alerted: %#v err=%v", saved, err)
 	}
 	messageCount := len(qqAPI.messages)
-	service.checkQuotaNotifications()
+	service.checkQuotaNotifications(context.Background())
 	if len(qqAPI.messages) != messageCount {
 		t.Fatal("duplicate quota notification was sent")
 	}
 	api.user.Quota = 1000000
-	service.checkQuotaNotifications()
+	service.checkQuotaNotifications(context.Background())
 	saved, _ = storage.GetQuotaNotification("member:g1:u1")
 	if saved.Alerted {
 		t.Fatal("quota notification was not rearmed after balance recovery")
+	}
+}
+
+func TestDailyNotificationsShareOneUsageQuery(t *testing.T) {
+	service, storage, api, _, _ := testService(t)
+	service.cfg.NotifyDailyTime = time.Now().UTC().Format("15:04")
+	api.users = []newapi.User{
+		{ID: 42, Username: "alice", Quota: 500000},
+		{ID: 43, Username: "bob", Quota: 500000},
+	}
+	api.usageByUser = []newapi.UsageRecord{
+		{Username: "alice", Count: 2, TokenUsed: 10, Quota: 100},
+		{Username: "bob", Count: 3, TokenUsed: 20, Quota: 200},
+	}
+	for _, preference := range []model.QuotaNotification{
+		{CanonicalID: "member:g1:u1", NewAPIID: 42, GroupOpenID: "g1", DailyEnabled: true},
+		{CanonicalID: "member:g2:u2", NewAPIID: 43, GroupOpenID: "g2", DailyEnabled: true},
+	} {
+		if err := storage.PutQuotaNotification(preference); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service.checkQuotaNotifications(context.Background())
+	if api.usageUserCalls != 1 {
+		t.Fatalf("daily usage queries=%d, want 1", api.usageUserCalls)
 	}
 }
 
@@ -1039,6 +1239,43 @@ func TestCheckinResponseHeaderTimeoutStaysPendingWithoutRetry(t *testing.T) {
 	}
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "发放结果待确认") {
 		t.Fatalf("unexpected pending reply: %q", reply)
+	}
+}
+
+func TestCheckinTruncatedHTTP200StaysPendingWithoutRetry(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	api.addQuotaErr = &newapi.APIError{StatusCode: 200, Message: "解析响应失败", Cause: io.ErrUnexpectedEOF}
+	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "发放结果待确认") {
+		t.Fatalf("unexpected truncated response reply: %q", reply)
+	}
+	period, _ := periodKey(time.Now(), service.cfg.CheckinPeriod, service.cfg.CheckinTimezone)
+	record, err := storage.GetCheckin("user:u1", period)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "pending_confirmation" {
+		t.Fatalf("checkin status=%q, want pending_confirmation", record.Status)
+	}
+}
+
+func TestUsageChartBusyFailsFast(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+	service.chartSemaphore <- struct{}{}
+	start := time.Now()
+	err := service.handleUsageChart(context.Background(), groupEvent("g1", "u1", "/usage chart 7d"), "member:g1:u1", model.QQIdentity{}, "7d", "")
+	<-service.chartSemaphore
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("busy chart waited instead of failing fast: %s", elapsed)
+	}
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已有用量图表") {
+		t.Fatalf("unexpected busy chart reply: %q", reply)
 	}
 }
 

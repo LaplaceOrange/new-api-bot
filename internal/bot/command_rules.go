@@ -28,9 +28,13 @@ func (s *Service) handleCommandRule(ctx context.Context, event qq.MessageEvent, 
 	}
 	enabled := command == "/enable"
 	actor := commandRuleActor(identity)
+	s.commandRulesMu.Lock()
 	if err := s.store.PutCommandRule(model.CommandRule{Keyword: keyword, Enabled: enabled, Actor: actor}); err != nil {
+		s.commandRulesMu.Unlock()
 		return s.reply(ctx, event, "保存命令关键词状态失败，请稍后重试。")
 	}
+	s.commandRules.Store(nil)
+	s.commandRulesMu.Unlock()
 	action := "command.disable"
 	message := fmt.Sprintf("已禁用包含关键词“%s”的命令；匹配到的命令将被静默忽略。", keyword)
 	if enabled {
@@ -90,7 +94,7 @@ func commandRuleActor(identity model.QQIdentity) string {
 }
 
 func (s *Service) commandRuleListText(enabled bool) string {
-	rules, err := s.store.ListCommandRules()
+	rules, err := s.commandRuleSnapshot()
 	if err != nil {
 		s.logger.Error("读取命令关键词状态失败", "error", err)
 		return "读取命令关键词状态失败，请稍后重试。"
@@ -112,7 +116,7 @@ func (s *Service) commandRuleListText(enabled bool) string {
 }
 
 func (s *Service) disabledCommandKeywords() ([]string, error) {
-	rules, err := s.store.ListCommandRules()
+	rules, err := s.commandRuleSnapshot()
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +127,24 @@ func (s *Service) disabledCommandKeywords() ([]string, error) {
 		}
 	}
 	return keywords, nil
+}
+
+func (s *Service) commandRuleSnapshot() ([]model.CommandRule, error) {
+	if cached := s.commandRules.Load(); cached != nil {
+		return *cached, nil
+	}
+	s.commandRulesMu.Lock()
+	defer s.commandRulesMu.Unlock()
+	if cached := s.commandRules.Load(); cached != nil {
+		return *cached, nil
+	}
+	rules, err := s.store.ListCommandRules()
+	if err != nil {
+		return nil, err
+	}
+	snapshot := append([]model.CommandRule(nil), rules...)
+	s.commandRules.Store(&snapshot)
+	return snapshot, nil
 }
 
 func (s *Service) matchDisabledCommand(content string) (string, bool) {

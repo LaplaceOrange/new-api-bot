@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsykk/new-api-bot/internal/model"
@@ -22,7 +24,10 @@ var (
 	ErrNewAPIUserBound   = errors.New("该 New API 账户已经被其他 QQ 身份绑定")
 	ErrLinkCodeInvalid   = errors.New("关联码无效或已过期")
 	ErrCheckinDuplicated = errors.New("本周期已经签到")
+	ErrEventInboxFull    = errors.New("gateway event inbox is full")
 )
+
+const maxAuditRecords = 10_000
 
 var buckets = [][]byte{
 	[]byte("bindings"),
@@ -35,6 +40,7 @@ var buckets = [][]byte{
 	[]byte("checkins"),
 	[]byte("checkins_by_user"),
 	[]byte("message_dedup"),
+	[]byte("event_inbox"),
 	[]byte("gateway"),
 	[]byte("audit"),
 	[]byte("quota_notifications"),
@@ -49,7 +55,8 @@ var buckets = [][]byte{
 }
 
 type Store struct {
-	db *bolt.DB
+	db                   *bolt.DB
+	lastDedupCleanupUnix atomic.Int64
 }
 
 type GatewayState struct {
@@ -112,10 +119,10 @@ func (s *Store) ResolveCanonical(identity model.QQIdentity) (string, error) {
 	if len(candidates) == 0 {
 		return "", ErrNotFound
 	}
-	var resolved string
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	resolve := func(tx *bolt.Tx) (string, bool, error) {
 		aliases := tx.Bucket([]byte("aliases"))
 		bindings := tx.Bucket([]byte("bindings"))
+		resolved := ""
 		for _, key := range candidates {
 			if value := aliases.Get([]byte(key)); value != nil {
 				resolved = string(value)
@@ -136,20 +143,54 @@ func (s *Store) ResolveCanonical(identity model.QQIdentity) (string, error) {
 				// 在纯群聊模式下直接以群成员身份作为主身份，无需再通过私聊 /link。
 				resolved = groupKey
 			} else {
-				return ErrNotFound
+				return "", false, ErrNotFound
 			}
 		}
+		needsUpdate := false
 		for _, key := range candidates {
 			if key != resolved {
+				if current := aliases.Get([]byte(key)); current == nil || string(current) != resolved {
+					needsUpdate = true
+				}
+			}
+		}
+		return resolved, needsUpdate, nil
+	}
+
+	var resolved string
+	var needsUpdate bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		var resolveErr error
+		resolved, needsUpdate, resolveErr = resolve(tx)
+		return resolveErr
+	})
+	if err != nil {
+		return "", err
+	}
+	if needsUpdate {
+		err = s.db.Update(func(tx *bolt.Tx) error {
+			var resolveErr error
+			resolved, _, resolveErr = resolve(tx)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			aliases := tx.Bucket([]byte("aliases"))
+			for _, key := range candidates {
+				if key == resolved {
+					continue
+				}
+				if current := aliases.Get([]byte(key)); current != nil && string(current) == resolved {
+					continue
+				}
 				if err := aliases.Put([]byte(key), []byte(resolved)); err != nil {
 					return err
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			return "", err
 		}
-		return nil
-	})
-	if err != nil {
-		return "", err
 	}
 	if identity.UserOpenID != "" {
 		_ = s.PutContact(resolved, identity.UserOpenID)
@@ -161,7 +202,20 @@ func (s *Store) PutAlias(alias, canonical string) error {
 	if alias == "" || canonical == "" {
 		return errors.New("alias and canonical identity are required")
 	}
+	var unchanged bool
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		unchanged = string(tx.Bucket([]byte("aliases")).Get([]byte(alias))) == canonical
+		return nil
+	}); err != nil {
+		return err
+	}
+	if unchanged {
+		return nil
+	}
 	return s.db.Update(func(tx *bolt.Tx) error {
+		if string(tx.Bucket([]byte("aliases")).Get([]byte(alias))) == canonical {
+			return nil
+		}
 		return tx.Bucket([]byte("aliases")).Put([]byte(alias), []byte(canonical))
 	})
 }
@@ -170,7 +224,20 @@ func (s *Store) PutContact(canonical, userOpenID string) error {
 	if canonical == "" || userOpenID == "" {
 		return errors.New("canonical identity and user openid are required")
 	}
+	var unchanged bool
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		unchanged = string(tx.Bucket([]byte("contacts")).Get([]byte(canonical))) == userOpenID
+		return nil
+	}); err != nil {
+		return err
+	}
+	if unchanged {
+		return nil
+	}
 	return s.db.Update(func(tx *bolt.Tx) error {
+		if string(tx.Bucket([]byte("contacts")).Get([]byte(canonical))) == userOpenID {
+			return nil
+		}
 		return tx.Bucket([]byte("contacts")).Put([]byte(canonical), []byte(userOpenID))
 	})
 }
@@ -314,21 +381,16 @@ func (s *Store) ListGroupBindings(groupOpenID string) ([]model.Binding, error) {
 		bindings := tx.Bucket([]byte("bindings"))
 		aliases := tx.Bucket([]byte("aliases"))
 		canonicalIDs := make(map[string]struct{})
-		if err := aliases.ForEach(func(key, value []byte) error {
-			if strings.HasPrefix(string(key), prefix) && len(value) > 0 {
+		prefixBytes := []byte(prefix)
+		aliasCursor := aliases.Cursor()
+		for key, value := aliasCursor.Seek(prefixBytes); key != nil && bytes.HasPrefix(key, prefixBytes); key, value = aliasCursor.Next() {
+			if len(value) > 0 {
 				canonicalIDs[string(value)] = struct{}{}
 			}
-			return nil
-		}); err != nil {
-			return err
 		}
-		if err := bindings.ForEach(func(key, _ []byte) error {
-			if strings.HasPrefix(string(key), prefix) {
-				canonicalIDs[string(key)] = struct{}{}
-			}
-			return nil
-		}); err != nil {
-			return err
+		bindingCursor := bindings.Cursor()
+		for key, _ := bindingCursor.Seek(prefixBytes); key != nil && bytes.HasPrefix(key, prefixBytes); key, _ = bindingCursor.Next() {
+			canonicalIDs[string(key)] = struct{}{}
 		}
 		for canonicalID := range canonicalIDs {
 			value := bindings.Get([]byte(canonicalID))
@@ -639,6 +701,13 @@ func checkinKey(canonical, period string) []byte {
 }
 
 func (s *Store) CheckAndMarkMessage(key string, now time.Time, ttl time.Duration) (bool, error) {
+	const cleanupInterval = 5 * time.Minute
+	nowUnix := now.Unix()
+	cleanup := false
+	lastCleanup := s.lastDedupCleanupUnix.Load()
+	if lastCleanup == 0 || nowUnix-lastCleanup >= int64(cleanupInterval/time.Second) {
+		cleanup = s.lastDedupCleanupUnix.CompareAndSwap(lastCleanup, nowUnix)
+	}
 	duplicate := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte("message_dedup"))
@@ -654,15 +723,117 @@ func (s *Store) CheckAndMarkMessage(key string, now time.Time, ttl time.Duration
 		if err := bucket.Put([]byte(key), encoded[:]); err != nil {
 			return err
 		}
-		cursor := bucket.Cursor()
-		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			if len(v) == 8 && int64(binary.BigEndian.Uint64(v)) <= now.Unix() {
-				_ = cursor.Delete()
+		if cleanup {
+			cursor := bucket.Cursor()
+			for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+				if len(v) == 8 && int64(binary.BigEndian.Uint64(v)) <= nowUnix {
+					_ = cursor.Delete()
+				}
 			}
 		}
 		return nil
 	})
 	return duplicate, err
+}
+
+func (s *Store) UnmarkMessage(key string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("message_dedup")).Delete([]byte(key))
+	})
+}
+
+// EnqueueGatewayEvent atomically records deduplication state and a recoverable
+// event payload. The returned pending value is true for both newly accepted
+// events and duplicate deliveries that still need processing.
+func (s *Store) EnqueueGatewayEvent(key string, payload []byte, now time.Time, ttl time.Duration, maxPending int) (pending bool, err error) {
+	key = strings.TrimSpace(key)
+	if key == "" || len(payload) == 0 {
+		return false, errors.New("gateway event key and payload are required")
+	}
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	if maxPending <= 0 {
+		maxPending = 512
+	}
+	const cleanupInterval = 5 * time.Minute
+	nowUnix := now.Unix()
+	cleanup := false
+	lastCleanup := s.lastDedupCleanupUnix.Load()
+	if lastCleanup == 0 || nowUnix-lastCleanup >= int64(cleanupInterval/time.Second) {
+		cleanup = s.lastDedupCleanupUnix.CompareAndSwap(lastCleanup, nowUnix)
+	}
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		dedup := tx.Bucket([]byte("message_dedup"))
+		inbox := tx.Bucket([]byte("event_inbox"))
+		keyBytes := []byte(key)
+		if inbox.Get(keyBytes) != nil {
+			var encoded [8]byte
+			binary.BigEndian.PutUint64(encoded[:], uint64(now.Add(ttl).Unix()))
+			if err := dedup.Put(keyBytes, encoded[:]); err != nil {
+				return err
+			}
+			pending = true
+			return nil
+		}
+		if value := dedup.Get(keyBytes); len(value) == 8 && int64(binary.BigEndian.Uint64(value)) > nowUnix {
+			return nil
+		}
+		if inbox.Stats().KeyN >= maxPending {
+			return ErrEventInboxFull
+		}
+		record, err := json.Marshal(model.PendingGatewayEvent{Payload: append([]byte(nil), payload...), CreatedAt: now})
+		if err != nil {
+			return err
+		}
+		var encoded [8]byte
+		binary.BigEndian.PutUint64(encoded[:], uint64(now.Add(ttl).Unix()))
+		if err := dedup.Put(keyBytes, encoded[:]); err != nil {
+			return err
+		}
+		if err := inbox.Put(keyBytes, record); err != nil {
+			return err
+		}
+		pending = true
+		if cleanup {
+			cursor := dedup.Cursor()
+			for existingKey, value := cursor.First(); existingKey != nil; existingKey, value = cursor.Next() {
+				if len(value) == 8 && int64(binary.BigEndian.Uint64(value)) <= nowUnix && inbox.Get(existingKey) == nil {
+					if err := cursor.Delete(); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	})
+	return pending, err
+}
+
+func (s *Store) ListPendingGatewayEvents(limit int) ([]model.PendingGatewayEvent, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	result := make([]model.PendingGatewayEvent, 0, limit)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		cursor := tx.Bucket([]byte("event_inbox")).Cursor()
+		for key, value := cursor.First(); key != nil && len(result) < limit; key, value = cursor.Next() {
+			var item model.PendingGatewayEvent
+			if err := json.Unmarshal(value, &item); err != nil {
+				return err
+			}
+			item.Key = string(key)
+			result = append(result, item)
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) CompleteGatewayEvent(key string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("event_inbox")).Delete([]byte(key))
+	})
 }
 
 func (s *Store) GetGatewayState() (GatewayState, error) {
@@ -706,8 +877,99 @@ func (s *Store) AddAudit(record model.AuditRecord) error {
 		}
 		var key [8]byte
 		binary.BigEndian.PutUint64(key[:], seq)
-		return bucket.Put(key[:], data)
+		if err := bucket.Put(key[:], data); err != nil {
+			return err
+		}
+		if seq > maxAuditRecords {
+			var expired [8]byte
+			binary.BigEndian.PutUint64(expired[:], seq-maxAuditRecords)
+			_ = bucket.Delete(expired[:])
+		}
+		return nil
 	})
+}
+
+// PruneEphemeral removes records that have no value after their expiry window.
+// It runs infrequently from the existing maintenance worker to keep bbolt and
+// its mmap-backed resident set bounded during long-lived deployments.
+func (s *Store) PruneEphemeral(now time.Time, emailWindow, sentRetention time.Duration) error {
+	if emailWindow <= 0 {
+		emailWindow = time.Hour
+	}
+	if sentRetention <= 0 {
+		sentRetention = 10 * time.Minute
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if err := pruneJSONExpiry[model.PendingBind](tx.Bucket([]byte("pending_binds")), now, func(item model.PendingBind) time.Time { return item.ExpiresAt }); err != nil {
+			return err
+		}
+		if err := pruneJSONExpiry[model.LinkChallenge](tx.Bucket([]byte("link_codes")), now, func(item model.LinkChallenge) time.Time { return item.ExpiresAt }); err != nil {
+			return err
+		}
+		if err := pruneJSONExpiry[model.PendingAdminAction](tx.Bucket([]byte("pending_admin_actions")), now, func(item model.PendingAdminAction) time.Time { return item.ExpiresAt }); err != nil {
+			return err
+		}
+		sentCutoff := now.Add(-sentRetention)
+		if err := pruneJSONExpiry[model.SentBotMessage](tx.Bucket([]byte("sent_bot_messages")), sentCutoff, func(item model.SentBotMessage) time.Time { return item.SentAt }); err != nil {
+			return err
+		}
+		rateBucket := tx.Bucket([]byte("email_rate"))
+		rateCutoff := now.Add(-emailWindow).Unix()
+		cursor := rateBucket.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			times, err := readTimes(value)
+			if err != nil {
+				return err
+			}
+			active := times[:0]
+			for _, timestamp := range times {
+				if timestamp > rateCutoff {
+					active = append(active, timestamp)
+				}
+			}
+			if len(active) == 0 {
+				if err := cursor.Delete(); err != nil {
+					return err
+				}
+				continue
+			}
+			if len(active) != len(times) {
+				if err := rateBucket.Put(key, writeTimes(active)); err != nil {
+					return err
+				}
+			}
+		}
+		audit := tx.Bucket([]byte("audit"))
+		excess := audit.Stats().KeyN - maxAuditRecords
+		auditCursor := audit.Cursor()
+		for index := 0; index < excess; index++ {
+			key, _ := auditCursor.First()
+			if key == nil {
+				break
+			}
+			if err := auditCursor.Delete(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func pruneJSONExpiry[T any](bucket *bolt.Bucket, cutoff time.Time, expiresAt func(T) time.Time) error {
+	cursor := bucket.Cursor()
+	for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+		var item T
+		if err := json.Unmarshal(value, &item); err != nil {
+			return err
+		}
+		expires := expiresAt(item)
+		if expires.IsZero() || !expires.After(cutoff) {
+			if err := cursor.Delete(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) PutQuotaNotification(preference model.QuotaNotification) error {
@@ -842,6 +1104,9 @@ func (s *Store) TakePendingAdminAction(code, actor string, now time.Time) (model
 }
 
 func (s *Store) PutSentBotMessage(message model.SentBotMessage) error {
+	if message.SentAt.IsZero() {
+		message.SentAt = time.Now()
+	}
 	data, err := json.Marshal(message)
 	if err != nil {
 		return err
@@ -958,7 +1223,7 @@ func (s *Store) ListBenefitBans() ([]model.BenefitBan, error) {
 			if err := json.Unmarshal(data, &item); err != nil {
 				return err
 			}
-			if item.Status == "disabled" || item.Status == "disable_failed" || item.Status == "enable_failed" {
+			if item.Status == "disabled" || item.Status == "disable_pending" || item.Status == "disable_failed" || item.Status == "enable_failed" {
 				result = append(result, item)
 			}
 			return nil

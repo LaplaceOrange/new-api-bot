@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fsykk/new-api-bot/internal/model"
 	"github.com/fsykk/new-api-bot/internal/newapi"
@@ -77,6 +78,8 @@ func (s *Service) handleWelcome(ctx context.Context, event qq.MessageEvent, iden
 	if event.Message.GroupOpenID == "" {
 		return s.reply(ctx, event, "该指令只能在群聊中使用。")
 	}
+	unlock := s.groupSettings.Lock("welcome:" + event.Message.GroupOpenID)
+	defer unlock()
 	if len(fields) < 2 {
 		return s.reply(ctx, event, "格式错误。正确用法：/welcome on、/welcome off、/welcome set <欢迎语>")
 	}
@@ -100,7 +103,7 @@ func (s *Service) handleWelcome(ctx context.Context, event qq.MessageEvent, iden
 	default:
 		return s.reply(ctx, event, "格式错误。正确用法：/welcome on、/welcome off、/welcome set <欢迎语>")
 	}
-	if len([]rune(setting.Message)) > 500 {
+	if utf8.RuneCountInString(setting.Message) > 500 {
 		return s.reply(ctx, event, "欢迎语不能超过 500 个字符。")
 	}
 	if err := s.store.PutGroupWelcome(setting); err != nil {
@@ -269,6 +272,12 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 	if event.Message.GroupOpenID == "" {
 		return s.reply(ctx, event, "用量图表目前仅支持群聊发送。")
 	}
+	select {
+	case s.chartSemaphore <- struct{}{}:
+		defer func() { <-s.chartSemaphore }()
+	default:
+		return s.replyUsageChartResult(ctx, event, "当前已有用量图表正在生成，请稍后重试。")
+	}
 	start, end, label, err := parseInsightRange(duration, time.Now(), s.cfg.CheckinTimezone)
 	if err != nil {
 		return s.reply(ctx, event, err.Error())
@@ -285,7 +294,7 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 			return s.reply(ctx, event, "当前群内尚无已绑定并被机器人识别的成员，无法生成汇总图表。")
 		}
 		memberCount = len(bindings)
-		queryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageChartTimeout(s.cfg.NewAPITimeout, memberCount))
+		queryCtx, cancel := s.backgroundCommandContext(ctx, usageChartTimeout(s.cfg.NewAPITimeout, memberCount))
 		defer cancel()
 		ctx = queryCtx
 		var queryErr error
@@ -295,7 +304,7 @@ func (s *Service) handleUsageChart(ctx context.Context, event qq.MessageEvent, c
 		}
 		targetText = fmt.Sprintf("本群已绑定成员（%d 人）", len(bindings))
 	} else {
-		queryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageChartTimeout(s.cfg.NewAPITimeout, memberCount))
+		queryCtx, cancel := s.backgroundCommandContext(ctx, usageChartTimeout(s.cfg.NewAPITimeout, memberCount))
 		defer cancel()
 		ctx = queryCtx
 		userID := 0
@@ -372,7 +381,7 @@ func (s *Service) replyUsageChartResult(ctx context.Context, event qq.MessageEve
 	if replyTimeout <= 0 {
 		replyTimeout = 10 * time.Second
 	}
-	replyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replyTimeout)
+	replyCtx, cancel := s.backgroundCommandContext(ctx, replyTimeout)
 	defer cancel()
 	return s.reply(replyCtx, event, content)
 }

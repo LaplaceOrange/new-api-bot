@@ -108,6 +108,7 @@ func NewClient(appID, appSecret string, timeout time.Duration) *Client {
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          4,
 		MaxIdleConnsPerHost:   2,
+		MaxConnsPerHost:       4,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
@@ -121,6 +122,13 @@ func (c *Client) LastSuccess() time.Time {
 		return time.Time{}
 	}
 	return time.Unix(value, 0)
+}
+
+func (c *Client) InvalidateAccessToken() {
+	c.tokenMu.Lock()
+	c.token = ""
+	c.expiresAt = time.Time{}
+	c.tokenMu.Unlock()
 }
 
 func (c *Client) AccessToken(ctx context.Context) (string, error) {
