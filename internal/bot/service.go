@@ -23,6 +23,7 @@ import (
 	"github.com/fsykk/new-api-bot/internal/model"
 	"github.com/fsykk/new-api-bot/internal/newapi"
 	"github.com/fsykk/new-api-bot/internal/qq"
+	"github.com/fsykk/new-api-bot/internal/resetradar"
 	"github.com/fsykk/new-api-bot/internal/secure"
 	"github.com/fsykk/new-api-bot/internal/store"
 )
@@ -95,6 +96,9 @@ type Service struct {
 	chartSemaphore   chan struct{}
 	commandRulesMu   sync.Mutex
 	commandRules     atomic.Pointer[[]model.CommandRule]
+	resetRadar       *resetradar.Scanner
+	resetMu          sync.Mutex
+	resetNotifyMu    sync.Mutex
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
@@ -104,10 +108,14 @@ func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI
 	if cfg.GatewayWorkers <= 0 {
 		cfg.GatewayWorkers = 2
 	}
-	return &Service{
+	service := &Service{
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
 		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1),
 	}
+	if cfg.ResetEnabled {
+		service.resetRadar = resetradar.NewScanner(cfg.ResetHTTPTimeout, cfg.ResetSignalMaxAge)
+	}
+	return service
 }
 
 func (s *Service) SetGatewayConnectedFunc(fn func() bool) { s.gatewayConnected = fn }
@@ -146,6 +154,19 @@ func (s *Service) Start(ctx context.Context) {
 		defer s.workers.Done()
 		s.runBenefitWorker(ctx)
 	}()
+	if s.resetRadar != nil {
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			defer s.resetRadar.Close()
+			s.runResetPollWorker(ctx)
+		}()
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			s.runResetSettlementWorker(ctx)
+		}()
+	}
 	go s.runInboxDispatcher(ctx)
 	go func() {
 		s.workers.Wait()
@@ -393,8 +414,26 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		}
 	case "/bind":
 		err = s.handleBind(ctx, event, canonical, fields)
+	case "/reset":
+		if len(fields) >= 2 && strings.EqualFold(fields[1], "check") {
+			err = s.handleReset(ctx, event, canonical, identity, fields)
+			break
+		}
+		fallthrough
 	case "/link":
-		err = s.reply(ctx, event, "当前已启用纯群聊模式，无需使用 /link；请直接在群内使用 /bind <邮箱或用户ID> 绑定。")
+		if command == "/link" {
+			err = s.reply(ctx, event, "当前已启用纯群聊模式，无需使用 /link；请直接在群内使用 /bind <邮箱或用户ID> 绑定。")
+			break
+		}
+		if resolveErr != nil || canonical == "" {
+			err = s.reply(ctx, event, "你尚未绑定 New API 账户，请在当前群内使用 /bind <邮箱或用户ID> 完成绑定。")
+			break
+		}
+		if _, bindErr := s.store.GetBinding(canonical); bindErr != nil {
+			err = s.reply(ctx, event, "你尚未绑定 New API 账户，请在当前群内使用 /bind <邮箱或用户ID> 完成绑定。")
+			break
+		}
+		err = s.handleReset(ctx, event, canonical, identity, fields)
 	default:
 		if resolveErr != nil || canonical == "" {
 			err = s.reply(ctx, event, "你尚未绑定 New API 账户，请在当前群内使用 /bind <邮箱或用户ID> 完成绑定。")
@@ -1487,6 +1526,16 @@ func helpText(cfg config.Config) string {
 	}
 	if cfg.BenefitEnabled {
 		lines = append(lines, "管理员：/benefit <面额> <数量> <有效期(h)> <封禁时间(day)> - 发放限领福利")
+	}
+	if cfg.ResetEnabled {
+		lines = append(lines,
+			"/reset check - 查看当前群的重置状态",
+			"/reset join - 参加当前群正在进行的重置补偿抽奖",
+			"管理员：/reset set duration <时长> - 设置下一轮活动有效期",
+			"管理员：/reset set winners <人数> - 设置下一轮抽取人数",
+			"管理员：/reset set lookback <时长> - 设置下一轮补偿回溯时间",
+			"管理员：/reset proxy <代理链接|off> - 设置 X 检测代理",
+		)
 	}
 	return strings.Join(lines, "\n")
 }

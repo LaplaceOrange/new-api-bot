@@ -35,6 +35,7 @@ type fakeNewAPI struct {
 	quotaSubs      int
 	lastQuotaUser  int
 	lastQuota      int64
+	quotaAddCalls  []quotaAddCall
 	subscriptions  map[int][]newapi.UserSubscriptionRecord
 	nextSubID      int
 	usageByUser    []newapi.UsageRecord
@@ -49,6 +50,11 @@ type fakeNewAPI struct {
 	addQuotaErr    error
 	logQueryStarts []time.Time
 	logSplitAfter  time.Duration
+}
+
+type quotaAddCall struct {
+	UserID int
+	Quota  int64
 }
 
 func (f *fakeNewAPI) GetStatus(context.Context, bool) (newapi.Status, error) {
@@ -86,6 +92,7 @@ func (f *fakeNewAPI) AddQuota(_ context.Context, userID int, quota int64) error 
 	f.quotaAdds++
 	f.lastQuotaUser = userID
 	f.lastQuota = quota
+	f.quotaAddCalls = append(f.quotaAddCalls, quotaAddCall{UserID: userID, Quota: quota})
 	return f.addQuotaErr
 }
 func (f *fakeNewAPI) SubtractQuota(_ context.Context, userID int, quota int64) error {
@@ -210,13 +217,16 @@ func (f *fakeNewAPI) InvalidateUserSubscription(_ context.Context, subscriptionI
 }
 
 type fakeQQ struct {
-	mu            sync.Mutex
-	messages      []string
-	joinApprovals []qq.GroupJoinRequest
-	muteState     qq.GroupMuteState
-	muteMember    string
-	muteOperation string
-	muteExpiresAt time.Time
+	mu              sync.Mutex
+	messages        []string
+	groupReplyErr   error
+	groupReplyErrAt int
+	groupReplies    int
+	joinApprovals   []qq.GroupJoinRequest
+	muteState       qq.GroupMuteState
+	muteMember      string
+	muteOperation   string
+	muteExpiresAt   time.Time
 }
 
 func (f *fakeQQ) ReplyC2C(_ context.Context, _, _, content string) error {
@@ -226,7 +236,14 @@ func (f *fakeQQ) ReplyC2C(_ context.Context, _, _, content string) error {
 	return nil
 }
 func (f *fakeQQ) ReplyGroup(_ context.Context, _, _, content string) error {
-	return f.ReplyC2C(context.Background(), "", "", content)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.groupReplies++
+	if f.groupReplyErr != nil && (f.groupReplyErrAt == 0 || f.groupReplyErrAt == f.groupReplies) {
+		return f.groupReplyErr
+	}
+	f.messages = append(f.messages, content)
+	return nil
 }
 func (f *fakeQQ) ReviewGroupJoinRequest(_ context.Context, group, member, requestID, operation, _ string, _ bool) error {
 	f.mu.Lock()
@@ -294,6 +311,13 @@ func testService(t *testing.T) (*Service, *store.Store, *fakeNewAPI, *fakeQQ, *f
 		BenefitMaxCount:            100,
 		BenefitMaxBanDays:          365,
 		BenefitCheckInterval:       time.Minute,
+		ResetEnabled:               true,
+		ResetPollInterval:          3 * time.Minute,
+		ResetHTTPTimeout:           time.Second,
+		ResetSignalMaxAge:          24 * time.Hour,
+		ResetDefaultDuration:       5 * time.Hour,
+		ResetDefaultWinners:        5,
+		ResetDefaultLookback:       24 * time.Hour,
 	}
 	api := &fakeNewAPI{
 		user:          newapi.User{ID: 42, Username: "alice", Email: "alice@example.com", Status: 1},

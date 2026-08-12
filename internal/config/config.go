@@ -61,6 +61,13 @@ type Config struct {
 	BenefitMaxCount            int
 	BenefitMaxBanDays          int
 	BenefitCheckInterval       time.Duration
+	ResetEnabled               bool
+	ResetPollInterval          time.Duration
+	ResetHTTPTimeout           time.Duration
+	ResetSignalMaxAge          time.Duration
+	ResetDefaultDuration       time.Duration
+	ResetDefaultWinners        int
+	ResetDefaultLookback       time.Duration
 }
 
 func Load() (Config, error) {
@@ -153,12 +160,19 @@ func Load() (Config, error) {
 	c.AdminReportExportEnabled = parseBool("ADMIN_REPORT_EXPORT_ENABLED", true)
 	c.AdminUserManagementEnabled = parseBool("ADMIN_USER_MANAGEMENT_ENABLED", true)
 	c.BenefitEnabled = parseBool("BENEFIT_ENABLED", true)
+	c.ResetEnabled = parseBool("RESET_ENABLED", true)
 	c.BenefitMaxCount = parseInt("BENEFIT_MAX_COUNT", 100, 1)
 	if c.BenefitMaxCount > 100 {
 		errs = append(errs, errors.New("BENEFIT_MAX_COUNT 不能超过 New API 单次上限 100"))
 	}
 	c.BenefitMaxBanDays = parseInt("BENEFIT_MAX_BAN_DAYS", 365, 1)
 	c.BenefitCheckInterval = parseDuration("BENEFIT_CHECK_INTERVAL", time.Minute)
+	c.ResetPollInterval = parseDuration("RESET_POLL_INTERVAL", 3*time.Minute)
+	c.ResetHTTPTimeout = parseDuration("RESET_HTTP_TIMEOUT", 20*time.Second)
+	c.ResetSignalMaxAge = parseDuration("RESET_SIGNAL_MAX_AGE", 24*time.Hour)
+	c.ResetDefaultDuration = parseDuration("RESET_DEFAULT_DURATION", 5*time.Hour)
+	c.ResetDefaultWinners = parseInt("RESET_DEFAULT_WINNERS", 5, 1)
+	c.ResetDefaultLookback = parseDuration("RESET_DEFAULT_LOOKBACK", 24*time.Hour)
 	c.CheckinCodeTTL = parseDuration("CHECKIN_CODE_TTL", 24*time.Hour)
 	c.BindCodeTTL = parseDuration("BIND_CODE_TTL", 10*time.Minute)
 	c.BindEmailWindow = parseDuration("BIND_EMAIL_WINDOW", time.Hour)
@@ -167,6 +181,24 @@ func Load() (Config, error) {
 	c.QQAPITimeout = parseDuration("QQ_API_TIMEOUT", 10*time.Second)
 	c.NotifyCheckInterval = parseDuration("NOTIFY_CHECK_INTERVAL", 10*time.Minute)
 	c.NotifyGroupCooldown = parseDuration("NOTIFY_GROUP_COOLDOWN", time.Minute)
+	if c.ResetPollInterval < time.Minute {
+		errs = append(errs, errors.New("RESET_POLL_INTERVAL 不能小于 1m"))
+	}
+	if c.ResetHTTPTimeout > 2*time.Minute {
+		errs = append(errs, errors.New("RESET_HTTP_TIMEOUT 不能超过 2m"))
+	}
+	if c.ResetSignalMaxAge > 7*24*time.Hour {
+		errs = append(errs, errors.New("RESET_SIGNAL_MAX_AGE 不能超过 168h"))
+	}
+	if c.ResetDefaultDuration > 7*24*time.Hour {
+		errs = append(errs, errors.New("RESET_DEFAULT_DURATION 不能超过 168h"))
+	}
+	if c.ResetDefaultWinners > 100 {
+		errs = append(errs, errors.New("RESET_DEFAULT_WINNERS 不能超过 100"))
+	}
+	if c.ResetDefaultLookback > 31*24*time.Hour {
+		errs = append(errs, errors.New("RESET_DEFAULT_LOOKBACK 不能超过 744h"))
+	}
 	if _, err := time.Parse("15:04", c.NotifyDailyTime); err != nil {
 		errs = append(errs, errors.New("NOTIFY_DAILY_TIME 必须是 HH:MM 格式，例如 09:00"))
 	}

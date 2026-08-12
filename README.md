@@ -18,6 +18,7 @@
 - 在指定群内发送低额度提醒；管理员可查看全站用户与模型用量报表。
 - 支持 QQ 2026-08-10 新增的入群申请事件与审批接口；可按群开启 New API 邮箱/用户 ID 自动核验。
 - 支持 QQ 官方群成员禁言状态查询、定时禁言和解除禁言接口。
+- 低资源监测 Codex 重置信号，并按群发起可恢复的用量补偿抽奖。
 - bbolt 单文件持久化、AES-256-GCM 敏感数据加密、JSON 结构化日志。
 - `/healthz` 和 `/readyz` 健康检查。
 
@@ -81,8 +82,14 @@
 | `/admin user resetpasskey <用户ID或@用户>` | 管理员 | 二次确认后重置用户 Passkey |
 | `/confirm <一次性操作码>` | 管理员 | 确认五分钟内的敏感管理操作 |
 | `/benefit <面额> <数量> <有效期(h)> <违者封禁时间(day)>` | 管理员 | @全体成员并批量发放一人限领一个的福利兑换码；自动检测多领、封禁并到期解封 |
+| `/reset check` | 任意 | 查看当前群状态：未知、可能重置、即将重置或确认重置（抽奖进行中） |
+| `/reset join` | 已绑定用户 | 参加当前群有效期内正在进行的重置补偿抽奖 |
+| `/reset set duration <时长>` | 管理员 | 设置下一轮活动有效期，默认 `5h` |
+| `/reset set winners <人数>` | 管理员 | 设置下一轮抽取人数，默认 `5` |
+| `/reset set lookback <时长>` | 管理员 | 设置获奖者用量补偿回溯时间，默认 `24h` |
+| `/reset proxy <代理链接或off>` | 管理员 | 设置仅用于 X 检测的 HTTP/SOCKS5 代理，凭据加密保存 |
 
-除 `/help`、`/whoami`、`/bind`、`/enable list`、`/disable list` 以及管理员的 `/enable`、`/disable` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
+除 `/help`、`/whoami`、`/bind`、`/reset check`、`/enable list`、`/disable list` 以及管理员的 `/enable`、`/disable` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
 
 命令关键词状态持久化保存在 bbolt。示例：管理员执行 `/disable "bind view"` 后，标准化内容中包含 `bind view` 的指令会被静默忽略，`/help` 中匹配该关键词的行也会隐藏；执行 `/enable "bind view"` 即可恢复。匹配不区分英文大小写，并会合并连续空白字符。`/enable` 和 `/disable` 管理指令本身始终可执行，避免规则将管理入口锁死。
 
@@ -226,6 +233,18 @@ $bytes = New-Object byte[] 32
 - 同一用户在活动有效期内兑换两个或以上活动兑换码时，机器人会在发放群公布用户 ID、违反规则和封禁天数，并调用 New API 禁用用户。
 - 封禁记录持久化在 bbolt；达到解封时间后自动重新启用用户并发送群消息，机器人重启不会丢失封禁计划。
 - 兑换码在本地数据库中使用 AES-256-GCM 加密保存；日志不输出完整兑换码。
+
+### Codex 重置监测与补偿
+
+- 首次在某个群执行 `/reset check`、`/reset join` 或管理员设置命令时，该群会自动登记为重置通知群。没有登记群时后台不会发起监测请求。
+- 后台默认每 `3m` 顺序检查 `X @thsottiaux`、`X @OpenAI`、`X @OpenAIDevs`、`codexreset.org` 和 OpenAI Status，只处理最近 `24h` 的相关信号。网络响应有严格大小限制，不运行浏览器、Node 或其他常驻进程。
+- 状态分为：未知、可能重置、即将重置、确认重置（抽奖进行中）。可能或即将重置信号过期后恢复未知；确认信号为每群开启一轮活动，活动结算后立即恢复未知。
+- 活动默认持续 `5h`，随机抽取最多 `5` 名参与者。每名获奖者获得该活动结束前近 `24h` 的实际消耗额度；参与人数不足时抽取全部参与者，消耗为零时不调用额度写入接口。
+- 中奖名单、补偿额度和逐人发放状态会先写入 bbolt。服务重启不会重新抽取；额度写入超时等结果不确定的情况会标记待确认，不会自动重复加额。
+- 重置信号、活动开始和活动结束通知使用持久化 outbox；正文与分块边界会冻结保存，每发送一块就持久化游标，QQ 暂时发送失败或服务重启后会从未完成分块继续退避重试。
+- QQ 主动群消息接口没有可查询的幂等键，因此若消息已被 QQ 接收、但进程在写入发送游标前异常退出，该分块存在极小概率重复。服务采用至少一次投递以避免通知静默丢失。
+- `/reset proxy http://user:password@host:port` 与 `/reset proxy socks5://user:password@host:port` 均受支持；用户名或密码中的特殊字符需使用 URL 编码。代理只用于访问 X，OpenAI Status、聚合站、QQ 和 New API 始终直连。代理完整地址使用 `BOT_DATA_KEY` 加密保存，回复与日志不显示密码。
+- 可通过 `RESET_ENABLED`、`RESET_POLL_INTERVAL`、`RESET_HTTP_TIMEOUT`、`RESET_SIGNAL_MAX_AGE`、`RESET_DEFAULT_DURATION`、`RESET_DEFAULT_WINNERS` 和 `RESET_DEFAULT_LOOKBACK` 调整全局默认值。管理员的群内设置只影响后续新活动。
 
 ## Docker Compose 部署
 

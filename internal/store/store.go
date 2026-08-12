@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -19,12 +20,15 @@ import (
 )
 
 var (
-	ErrNotFound          = errors.New("not found")
-	ErrIdentityBound     = errors.New("QQ 身份已经绑定 New API 账户")
-	ErrNewAPIUserBound   = errors.New("该 New API 账户已经被其他 QQ 身份绑定")
-	ErrLinkCodeInvalid   = errors.New("关联码无效或已过期")
-	ErrCheckinDuplicated = errors.New("本周期已经签到")
-	ErrEventInboxFull    = errors.New("gateway event inbox is full")
+	ErrNotFound              = errors.New("not found")
+	ErrIdentityBound         = errors.New("QQ 身份已经绑定 New API 账户")
+	ErrNewAPIUserBound       = errors.New("该 New API 账户已经被其他 QQ 身份绑定")
+	ErrLinkCodeInvalid       = errors.New("关联码无效或已过期")
+	ErrCheckinDuplicated     = errors.New("本周期已经签到")
+	ErrEventInboxFull        = errors.New("gateway event inbox is full")
+	ErrResetActivityInactive = errors.New("当前没有可参加的重置活动")
+	ErrResetActivityNotDue   = errors.New("重置活动尚未到期")
+	ErrResetAwardFinalized   = errors.New("重置活动奖项已经完成发放")
 )
 
 const maxAuditRecords = 10_000
@@ -52,6 +56,17 @@ var buckets = [][]byte{
 	[]byte("benefit_bans"),
 	[]byte("command_rules"),
 	[]byte("runtime_settings"),
+	[]byte("reset_settings"),
+	[]byte("reset_signals"),
+	[]byte("reset_signal_deliveries"),
+	[]byte("reset_group_states"),
+	[]byte("reset_activities"),
+	[]byte("reset_active_by_group"),
+	[]byte("reset_participants"),
+	[]byte("reset_due_activities"),
+	[]byte("reset_notifications"),
+	[]byte("reset_notification_due"),
+	[]byte("reset_runtime"),
 }
 
 type Store struct {
@@ -80,7 +95,7 @@ func Open(path string) (*Store, error) {
 				return err
 			}
 		}
-		return nil
+		return rebuildResetIndexesTx(tx)
 	}); err != nil {
 		db.Close()
 		return nil, err
@@ -96,6 +111,57 @@ func (s *Store) Ping() error {
 			return errors.New("bindings bucket is missing")
 		}
 		return nil
+	})
+}
+
+func clearBucketTx(bucket *bolt.Bucket) error {
+	cursor := bucket.Cursor()
+	for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
+		if err := cursor.Delete(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func resetDueKey(at time.Time, id string) []byte {
+	key := make([]byte, 8+len(id))
+	binary.BigEndian.PutUint64(key[:8], uint64(at.UnixNano()))
+	copy(key[8:], id)
+	return key
+}
+
+func rebuildResetIndexesTx(tx *bolt.Tx) error {
+	dueActivities := tx.Bucket([]byte("reset_due_activities"))
+	if err := clearBucketTx(dueActivities); err != nil {
+		return err
+	}
+	if err := tx.Bucket([]byte("reset_activities")).ForEach(func(_, data []byte) error {
+		var activity model.ResetActivity
+		if err := json.Unmarshal(data, &activity); err != nil {
+			return err
+		}
+		if activity.Status != model.ResetActivityActive && activity.Status != model.ResetActivitySettling {
+			return nil
+		}
+		return dueActivities.Put(resetDueKey(activity.EndsAt, activity.ID), []byte(activity.ID))
+	}); err != nil {
+		return err
+	}
+
+	dueNotifications := tx.Bucket([]byte("reset_notification_due"))
+	if err := clearBucketTx(dueNotifications); err != nil {
+		return err
+	}
+	return tx.Bucket([]byte("reset_notifications")).ForEach(func(_, data []byte) error {
+		var notification model.ResetNotification
+		if err := json.Unmarshal(data, &notification); err != nil {
+			return err
+		}
+		if notification.Status != model.ResetNotificationPending {
+			return nil
+		}
+		return dueNotifications.Put(resetDueKey(notification.NextAttemptAt, notification.ID), []byte(notification.ID))
 	})
 }
 
@@ -1273,6 +1339,1112 @@ func (s *Store) ListCommandRules() ([]model.CommandRule, error) {
 		})
 	})
 	sort.Slice(result, func(i, j int) bool { return result[i].Keyword < result[j].Keyword })
+	return result, err
+}
+
+func defaultResetSettings(group string, now time.Time) model.ResetSettings {
+	return model.ResetSettings{
+		GroupOpenID: group,
+		Duration:    model.DefaultResetDuration,
+		WinnerCount: model.DefaultResetWinnerCount,
+		Lookback:    model.DefaultResetLookback,
+		Subscribed:  true,
+		UpdatedAt:   now,
+	}
+}
+
+func validateResetSettings(setting model.ResetSettings) error {
+	if strings.TrimSpace(setting.GroupOpenID) == "" {
+		return errors.New("群 OpenID 不能为空")
+	}
+	if setting.Duration <= 0 {
+		return errors.New("重置活动有效期必须大于 0")
+	}
+	if setting.WinnerCount <= 0 {
+		return errors.New("重置活动抽取人数必须大于 0")
+	}
+	if setting.Lookback <= 0 {
+		return errors.New("重置活动补偿回溯时间必须大于 0")
+	}
+	return nil
+}
+
+func (s *Store) GetOrCreateResetSettings(group string) (model.ResetSettings, error) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return model.ResetSettings{}, errors.New("群 OpenID 不能为空")
+	}
+	var result model.ResetSettings
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("reset_settings"))
+		if data := bucket.Get([]byte(group)); data != nil {
+			return json.Unmarshal(data, &result)
+		}
+		result = defaultResetSettings(group, time.Now())
+		data, err := json.Marshal(result)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(group), data)
+	})
+	return result, err
+}
+
+func (s *Store) GetResetSettings(group string) (model.ResetSettings, error) {
+	var result model.ResetSettings
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("reset_settings")).Get([]byte(strings.TrimSpace(group)))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &result)
+	})
+	return result, err
+}
+
+func (s *Store) PutResetSettings(setting model.ResetSettings) error {
+	setting.GroupOpenID = strings.TrimSpace(setting.GroupOpenID)
+	if err := validateResetSettings(setting); err != nil {
+		return err
+	}
+	setting.UpdatedAt = time.Now()
+	data, err := json.Marshal(setting)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("reset_settings")).Put([]byte(setting.GroupOpenID), data)
+	})
+}
+
+func (s *Store) ListSubscribedResetSettings() ([]model.ResetSettings, error) {
+	result := make([]model.ResetSettings, 0)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("reset_settings")).ForEach(func(_, data []byte) error {
+			var setting model.ResetSettings
+			if err := json.Unmarshal(data, &setting); err != nil {
+				return err
+			}
+			if setting.Subscribed {
+				result = append(result, setting)
+			}
+			return nil
+		})
+	})
+	sort.Slice(result, func(i, j int) bool { return result[i].GroupOpenID < result[j].GroupOpenID })
+	return result, err
+}
+
+func (s *Store) GetResetProxy() (string, error) {
+	var result string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("reset_runtime")).Get([]byte("encrypted_proxy"))
+		if data == nil {
+			return ErrNotFound
+		}
+		result = string(data)
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) PutResetProxy(encryptedProxy string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("reset_runtime"))
+		if encryptedProxy == "" {
+			return bucket.Delete([]byte("encrypted_proxy"))
+		}
+		return bucket.Put([]byte("encrypted_proxy"), []byte(encryptedProxy))
+	})
+}
+
+func resetStageRank(stage model.ResetStage) int {
+	switch stage {
+	case model.ResetStagePossible:
+		return 1
+	case model.ResetStageImminent:
+		return 2
+	case model.ResetStageConfirmed:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func validateResetSignal(signal model.ResetSignal) error {
+	if signal.ID == "" {
+		return errors.New("重置信号 ID 不能为空")
+	}
+	if resetStageRank(signal.Stage) == 0 {
+		return errors.New("重置信号状态无效")
+	}
+	return nil
+}
+
+func normalizeResetSignal(signal model.ResetSignal, now time.Time) model.ResetSignal {
+	if signal.DetectedAt.IsZero() {
+		signal.DetectedAt = now
+	}
+	if signal.OccurredAt.IsZero() {
+		signal.OccurredAt = signal.DetectedAt
+	}
+	signal.UpdatedAt = now
+	return signal
+}
+
+func putResetSignalTx(tx *bolt.Tx, signal model.ResetSignal) (bool, error) {
+	bucket := tx.Bucket([]byte("reset_signals"))
+	if data := bucket.Get([]byte(signal.ID)); data != nil {
+		var current model.ResetSignal
+		if err := json.Unmarshal(data, &current); err != nil {
+			return false, err
+		}
+		if resetStageRank(signal.Stage) <= resetStageRank(current.Stage) {
+			return false, nil
+		}
+	}
+	data, err := json.Marshal(signal)
+	if err != nil {
+		return false, err
+	}
+	if err := bucket.Put([]byte(signal.ID), data); err != nil {
+		return false, err
+	}
+
+	runtime := tx.Bucket([]byte("reset_runtime"))
+	shouldReplaceHighest := true
+	if highestID := runtime.Get([]byte("highest_signal_id")); highestID != nil {
+		if currentData := bucket.Get(highestID); currentData != nil {
+			var current model.ResetSignal
+			if err := json.Unmarshal(currentData, &current); err != nil {
+				return false, err
+			}
+			shouldReplaceHighest = resetStageRank(signal.Stage) > resetStageRank(current.Stage) ||
+				(resetStageRank(signal.Stage) == resetStageRank(current.Stage) && signal.OccurredAt.After(current.OccurredAt))
+		}
+	}
+	if shouldReplaceHighest {
+		if err := runtime.Put([]byte("highest_signal_id"), []byte(signal.ID)); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (s *Store) RecordResetSignal(signal model.ResetSignal) (bool, error) {
+	if err := validateResetSignal(signal); err != nil {
+		return false, err
+	}
+	signal = normalizeResetSignal(signal, time.Now())
+	var changed bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		changed, err = putResetSignalTx(tx, signal)
+		return err
+	})
+	return changed, err
+}
+
+func (s *Store) GetResetSignal(id string) (model.ResetSignal, error) {
+	var result model.ResetSignal
+	err := s.db.View(func(tx *bolt.Tx) error {
+		var err error
+		result, err = getResetSignalTx(tx, strings.TrimSpace(id))
+		return err
+	})
+	return result, err
+}
+
+func getResetSignalTx(tx *bolt.Tx, id string) (model.ResetSignal, error) {
+	var result model.ResetSignal
+	data := tx.Bucket([]byte("reset_signals")).Get([]byte(id))
+	if data == nil {
+		return result, ErrNotFound
+	}
+	return result, json.Unmarshal(data, &result)
+}
+
+func resetNotificationID(kind model.ResetNotificationKind, group, signalID string, stage model.ResetStage, activityID string) string {
+	sum := sha256.Sum256([]byte(string(kind) + "\x00" + group + "\x00" + signalID + "\x00" + string(stage) + "\x00" + activityID))
+	return fmt.Sprintf("reset-notification-%x", sum[:12])
+}
+
+func enqueueResetNotificationTx(tx *bolt.Tx, kind model.ResetNotificationKind, group string, signal model.ResetSignal, activityID string, now time.Time) error {
+	id := resetNotificationID(kind, group, signal.ID, signal.Stage, activityID)
+	notifications := tx.Bucket([]byte("reset_notifications"))
+	due := tx.Bucket([]byte("reset_notification_due"))
+	if notifications == nil || due == nil {
+		return errors.New("reset notification buckets are missing")
+	}
+	if notifications.Get([]byte(id)) != nil {
+		return nil
+	}
+	notification := model.ResetNotification{
+		ID:            id,
+		Kind:          kind,
+		Status:        model.ResetNotificationPending,
+		GroupOpenID:   group,
+		SignalID:      signal.ID,
+		SignalStage:   signal.Stage,
+		SignalSource:  signal.Source,
+		SignalSummary: signal.Summary,
+		SignalURL:     signal.URL,
+		ActivityID:    activityID,
+		NextAttemptAt: now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	data, err := json.Marshal(notification)
+	if err != nil {
+		return err
+	}
+	if err := notifications.Put([]byte(id), data); err != nil {
+		return err
+	}
+	return due.Put(resetDueKey(now, id), []byte(id))
+}
+
+func getResetNotificationTx(tx *bolt.Tx, id string) (model.ResetNotification, error) {
+	var result model.ResetNotification
+	data := tx.Bucket([]byte("reset_notifications")).Get([]byte(id))
+	if data == nil {
+		return result, ErrNotFound
+	}
+	return result, json.Unmarshal(data, &result)
+}
+
+func putResetNotificationTx(tx *bolt.Tx, notification model.ResetNotification) error {
+	data, err := json.Marshal(notification)
+	if err != nil {
+		return err
+	}
+	return tx.Bucket([]byte("reset_notifications")).Put([]byte(notification.ID), data)
+}
+
+func (s *Store) ListDueResetNotifications(now time.Time, limit int) ([]model.ResetNotification, error) {
+	result := make([]model.ResetNotification, 0)
+	if limit <= 0 {
+		return result, nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	cutoff := resetDueKey(now, "\xff")
+	err := s.db.View(func(tx *bolt.Tx) error {
+		due := tx.Bucket([]byte("reset_notification_due"))
+		cursor := due.Cursor()
+		for key, id := cursor.First(); key != nil && bytes.Compare(key, cutoff) <= 0 && len(result) < limit; key, id = cursor.Next() {
+			notification, err := getResetNotificationTx(tx, string(id))
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if notification.Status == model.ResetNotificationPending && !notification.NextAttemptAt.After(now) {
+				result = append(result, notification)
+			}
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) PrepareResetNotification(id string, chunks []string, now time.Time) (model.ResetNotification, error) {
+	var result model.ResetNotification
+	if len(chunks) == 0 {
+		return result, errors.New("重置通知内容为空")
+	}
+	for _, chunk := range chunks {
+		if chunk == "" {
+			return result, errors.New("重置通知包含空分块")
+		}
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		result, err = getResetNotificationTx(tx, strings.TrimSpace(id))
+		if err != nil {
+			return err
+		}
+		if result.Status != model.ResetNotificationPending || len(result.Chunks) > 0 {
+			return nil
+		}
+		result.Chunks = append([]string(nil), chunks...)
+		result.NextChunk = 0
+		result.UpdatedAt = now
+		return putResetNotificationTx(tx, result)
+	})
+	return result, err
+}
+
+func (s *Store) MarkResetNotificationChunkSent(id string, chunkIndex int, now time.Time) (model.ResetNotification, error) {
+	var result model.ResetNotification
+	if now.IsZero() {
+		now = time.Now()
+	}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		result, err = getResetNotificationTx(tx, strings.TrimSpace(id))
+		if err != nil {
+			return err
+		}
+		if result.Status != model.ResetNotificationPending || chunkIndex < result.NextChunk {
+			return nil
+		}
+		if len(result.Chunks) == 0 || chunkIndex != result.NextChunk || chunkIndex >= len(result.Chunks) {
+			return errors.New("重置通知分块进度无效")
+		}
+		result.NextChunk++
+		result.LastError = ""
+		result.UpdatedAt = now
+		if result.NextChunk == len(result.Chunks) {
+			if err := tx.Bucket([]byte("reset_notification_due")).Delete(resetDueKey(result.NextAttemptAt, result.ID)); err != nil {
+				return err
+			}
+			result.Status = model.ResetNotificationSent
+			result.SentAt = now
+		}
+		return putResetNotificationTx(tx, result)
+	})
+	return result, err
+}
+
+func (s *Store) MarkResetNotificationSent(id string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		notification, err := getResetNotificationTx(tx, strings.TrimSpace(id))
+		if err != nil {
+			return err
+		}
+		if notification.Status != model.ResetNotificationPending {
+			return nil
+		}
+		if err := tx.Bucket([]byte("reset_notification_due")).Delete(resetDueKey(notification.NextAttemptAt, notification.ID)); err != nil {
+			return err
+		}
+		notification.Status = model.ResetNotificationSent
+		notification.LastError = ""
+		notification.SentAt = now
+		notification.UpdatedAt = now
+		return putResetNotificationTx(tx, notification)
+	})
+}
+
+func (s *Store) MarkResetNotificationSuperseded(id string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		notification, err := getResetNotificationTx(tx, strings.TrimSpace(id))
+		if err != nil {
+			return err
+		}
+		if notification.Status != model.ResetNotificationPending {
+			return nil
+		}
+		if err := tx.Bucket([]byte("reset_notification_due")).Delete(resetDueKey(notification.NextAttemptAt, notification.ID)); err != nil {
+			return err
+		}
+		notification.Status = model.ResetNotificationSuperseded
+		notification.LastError = ""
+		notification.UpdatedAt = now
+		return putResetNotificationTx(tx, notification)
+	})
+}
+
+func (s *Store) MarkResetNotificationFailed(id, lastError string, nextAttemptAt, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if nextAttemptAt.IsZero() || nextAttemptAt.Before(now) {
+		nextAttemptAt = now
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		notification, err := getResetNotificationTx(tx, strings.TrimSpace(id))
+		if err != nil {
+			return err
+		}
+		if notification.Status != model.ResetNotificationPending {
+			return nil
+		}
+		due := tx.Bucket([]byte("reset_notification_due"))
+		if err := due.Delete(resetDueKey(notification.NextAttemptAt, notification.ID)); err != nil {
+			return err
+		}
+		notification.Attempts++
+		notification.LastError = strings.TrimSpace(lastError)
+		notification.NextAttemptAt = nextAttemptAt
+		notification.UpdatedAt = now
+		if err := putResetNotificationTx(tx, notification); err != nil {
+			return err
+		}
+		return due.Put(resetDueKey(notification.NextAttemptAt, notification.ID), []byte(notification.ID))
+	})
+}
+
+func (s *Store) GetHighestResetSignal() (model.ResetSignal, error) {
+	var result model.ResetSignal
+	err := s.db.View(func(tx *bolt.Tx) error {
+		id := tx.Bucket([]byte("reset_runtime")).Get([]byte("highest_signal_id"))
+		if id == nil {
+			return ErrNotFound
+		}
+		data := tx.Bucket([]byte("reset_signals")).Get(id)
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &result)
+	})
+	return result, err
+}
+
+func (s *Store) GetResetGroupState(group string) (model.ResetGroupState, error) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return model.ResetGroupState{}, errors.New("群 OpenID 不能为空")
+	}
+	result := model.ResetGroupState{GroupOpenID: group, Stage: model.ResetStageUnknown}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("reset_group_states")).Get([]byte(group))
+		if data == nil {
+			return nil
+		}
+		return json.Unmarshal(data, &result)
+	})
+	return result, err
+}
+
+func getResetGroupStateTx(tx *bolt.Tx, group string) (model.ResetGroupState, error) {
+	result := model.ResetGroupState{GroupOpenID: group, Stage: model.ResetStageUnknown}
+	data := tx.Bucket([]byte("reset_group_states")).Get([]byte(group))
+	if data == nil {
+		return result, nil
+	}
+	return result, json.Unmarshal(data, &result)
+}
+
+func resetSignalDeliveryKey(group, signalID string) []byte {
+	return []byte(group + "\x00" + signalID)
+}
+
+func getResetSignalDeliveryTx(tx *bolt.Tx, group, signalID string) (model.ResetSignalDelivery, bool, error) {
+	var result model.ResetSignalDelivery
+	data := tx.Bucket([]byte("reset_signal_deliveries")).Get(resetSignalDeliveryKey(group, signalID))
+	if data == nil {
+		return result, false, nil
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return result, false, err
+	}
+	return result, true, nil
+}
+
+func putResetSignalDeliveryTx(tx *bolt.Tx, group string, signal model.ResetSignal, activityID string, now time.Time) (bool, error) {
+	bucket := tx.Bucket([]byte("reset_signal_deliveries"))
+	key := resetSignalDeliveryKey(group, signal.ID)
+	if data := bucket.Get(key); data != nil {
+		var current model.ResetSignalDelivery
+		if err := json.Unmarshal(data, &current); err != nil {
+			return false, err
+		}
+		if resetStageRank(current.Stage) >= resetStageRank(signal.Stage) {
+			return false, nil
+		}
+	}
+	delivery := model.ResetSignalDelivery{
+		GroupOpenID: group,
+		SignalID:    signal.ID,
+		Stage:       signal.Stage,
+		ActivityID:  activityID,
+		ProcessedAt: now,
+	}
+	data, err := json.Marshal(delivery)
+	if err != nil {
+		return false, err
+	}
+	if err := bucket.Put(key, data); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) ApplyResetSignalToGroup(group string, signal model.ResetSignal) (bool, error) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return false, errors.New("群 OpenID 不能为空")
+	}
+	if signal.Stage != model.ResetStagePossible && signal.Stage != model.ResetStageImminent {
+		return false, errors.New("该接口只接受可能重置或即将重置的信号")
+	}
+	if err := validateResetSignal(signal); err != nil {
+		return false, err
+	}
+	signal = normalizeResetSignal(signal, time.Now())
+	var changed bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		if _, err := putResetSignalTx(tx, signal); err != nil {
+			return err
+		}
+		current, err := getResetGroupStateTx(tx, group)
+		if err != nil {
+			return err
+		}
+		shouldApply, err := putResetSignalDeliveryTx(tx, group, signal, current.ActivityID, signal.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		if !shouldApply {
+			return nil
+		}
+		if !current.LastCompletedAt.IsZero() && !signal.OccurredAt.After(current.LastCompletedAt) {
+			return nil
+		}
+		if resetStageRank(signal.Stage) <= resetStageRank(current.Stage) {
+			return nil
+		}
+		current = model.ResetGroupState{
+			GroupOpenID:     group,
+			Stage:           signal.Stage,
+			SignalID:        signal.ID,
+			Summary:         signal.Summary,
+			Source:          signal.Source,
+			SourceURL:       signal.URL,
+			LastCompletedAt: current.LastCompletedAt,
+			UpdatedAt:       signal.UpdatedAt,
+		}
+		data, err := json.Marshal(current)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte("reset_group_states")).Put([]byte(group), data); err != nil {
+			return err
+		}
+		if err := enqueueResetNotificationTx(tx, model.ResetNotificationSignal, group, signal, "", signal.UpdatedAt); err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	return changed, err
+}
+
+func (s *Store) ExpireResetGroupStates(cutoff, now time.Time) (int, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	expired := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("reset_group_states"))
+		updates := make([]model.ResetGroupState, 0)
+		if err := bucket.ForEach(func(_, data []byte) error {
+			var state model.ResetGroupState
+			if err := json.Unmarshal(data, &state); err != nil {
+				return err
+			}
+			if state.Stage != model.ResetStagePossible && state.Stage != model.ResetStageImminent {
+				return nil
+			}
+			if state.UpdatedAt.After(cutoff) {
+				return nil
+			}
+			updates = append(updates, model.ResetGroupState{
+				GroupOpenID:     state.GroupOpenID,
+				Stage:           model.ResetStageUnknown,
+				LastCompletedAt: state.LastCompletedAt,
+				UpdatedAt:       now,
+			})
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, state := range updates {
+			encoded, err := json.Marshal(state)
+			if err != nil {
+				return err
+			}
+			if err := bucket.Put([]byte(state.GroupOpenID), encoded); err != nil {
+				return err
+			}
+			expired++
+		}
+		return nil
+	})
+	return expired, err
+}
+
+func resetActivityID(group, signalID string) string {
+	sum := sha256.Sum256([]byte(group + "\x00" + signalID))
+	return fmt.Sprintf("reset-%x", sum[:12])
+}
+
+func getResetActivityTx(tx *bolt.Tx, id string) (model.ResetActivity, error) {
+	var result model.ResetActivity
+	data := tx.Bucket([]byte("reset_activities")).Get([]byte(id))
+	if data == nil {
+		return result, ErrNotFound
+	}
+	return result, json.Unmarshal(data, &result)
+}
+
+func putResetActivityTx(tx *bolt.Tx, activity model.ResetActivity) error {
+	data, err := json.Marshal(activity)
+	if err != nil {
+		return err
+	}
+	return tx.Bucket([]byte("reset_activities")).Put([]byte(activity.ID), data)
+}
+
+func (s *Store) CreateResetActivityFromSignal(group string, signal model.ResetSignal, now time.Time) (model.ResetActivity, bool, error) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return model.ResetActivity{}, false, errors.New("群 OpenID 不能为空")
+	}
+	if signal.Stage != model.ResetStageConfirmed {
+		return model.ResetActivity{}, false, errors.New("只有确认重置信号可以创建活动")
+	}
+	if err := validateResetSignal(signal); err != nil {
+		return model.ResetActivity{}, false, err
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	signal = normalizeResetSignal(signal, now)
+	var result model.ResetActivity
+	var created bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		if _, err := putResetSignalTx(tx, signal); err != nil {
+			return err
+		}
+		delivery, delivered, err := getResetSignalDeliveryTx(tx, group, signal.ID)
+		if err != nil {
+			return err
+		}
+		if delivered && resetStageRank(delivery.Stage) >= resetStageRank(model.ResetStageConfirmed) {
+			if delivery.ActivityID != "" {
+				if existing, getErr := getResetActivityTx(tx, delivery.ActivityID); getErr == nil {
+					result = existing
+				} else if !errors.Is(getErr, ErrNotFound) {
+					return getErr
+				}
+			}
+			return nil
+		}
+		currentState, err := getResetGroupStateTx(tx, group)
+		if err != nil {
+			return err
+		}
+		if !currentState.LastCompletedAt.IsZero() && !signal.OccurredAt.After(currentState.LastCompletedAt) {
+			_, err := putResetSignalDeliveryTx(tx, group, signal, "", now)
+			return err
+		}
+		activeByGroup := tx.Bucket([]byte("reset_active_by_group"))
+		if activeID := activeByGroup.Get([]byte(group)); activeID != nil {
+			current, err := getResetActivityTx(tx, string(activeID))
+			if err == nil && (current.Status == model.ResetActivityActive || current.Status == model.ResetActivitySettling) {
+				result = current
+				_, err := putResetSignalDeliveryTx(tx, group, signal, current.ID, now)
+				return err
+			}
+			if err != nil && !errors.Is(err, ErrNotFound) {
+				return err
+			}
+			if err := activeByGroup.Delete([]byte(group)); err != nil {
+				return err
+			}
+		}
+
+		id := resetActivityID(group, signal.ID)
+		if existing, err := getResetActivityTx(tx, id); err == nil {
+			result = existing
+			_, err := putResetSignalDeliveryTx(tx, group, signal, existing.ID, now)
+			return err
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+
+		settings := defaultResetSettings(group, now)
+		settingsBucket := tx.Bucket([]byte("reset_settings"))
+		if data := settingsBucket.Get([]byte(group)); data != nil {
+			if err := json.Unmarshal(data, &settings); err != nil {
+				return err
+			}
+		} else {
+			data, err := json.Marshal(settings)
+			if err != nil {
+				return err
+			}
+			if err := settingsBucket.Put([]byte(group), data); err != nil {
+				return err
+			}
+		}
+		if err := validateResetSettings(settings); err != nil {
+			return err
+		}
+		result = model.ResetActivity{
+			ID:          id,
+			GroupOpenID: group,
+			SignalID:    signal.ID,
+			Status:      model.ResetActivityActive,
+			StartedAt:   now,
+			EndsAt:      now.Add(settings.Duration),
+			WinnerCount: settings.WinnerCount,
+			Lookback:    settings.Lookback,
+			UpdatedAt:   now,
+		}
+		if err := putResetActivityTx(tx, result); err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte("reset_due_activities")).Put(resetDueKey(result.EndsAt, result.ID), []byte(result.ID)); err != nil {
+			return err
+		}
+		if err := activeByGroup.Put([]byte(group), []byte(id)); err != nil {
+			return err
+		}
+		if _, err := putResetSignalDeliveryTx(tx, group, signal, id, now); err != nil {
+			return err
+		}
+		state := model.ResetGroupState{
+			GroupOpenID:     group,
+			Stage:           model.ResetStageConfirmed,
+			SignalID:        signal.ID,
+			ActivityID:      id,
+			Summary:         signal.Summary,
+			Source:          signal.Source,
+			SourceURL:       signal.URL,
+			LastCompletedAt: currentState.LastCompletedAt,
+			UpdatedAt:       now,
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte("reset_group_states")).Put([]byte(group), data); err != nil {
+			return err
+		}
+		if err := enqueueResetNotificationTx(tx, model.ResetNotificationActivityStarted, group, signal, id, now); err != nil {
+			return err
+		}
+		created = true
+		return nil
+	})
+	return result, created, err
+}
+
+func (s *Store) GetResetActivity(id string) (model.ResetActivity, error) {
+	var result model.ResetActivity
+	err := s.db.View(func(tx *bolt.Tx) error {
+		var err error
+		result, err = getResetActivityTx(tx, id)
+		return err
+	})
+	return result, err
+}
+
+func (s *Store) GetActiveResetActivity(group string) (model.ResetActivity, error) {
+	var result model.ResetActivity
+	err := s.db.View(func(tx *bolt.Tx) error {
+		id := tx.Bucket([]byte("reset_active_by_group")).Get([]byte(strings.TrimSpace(group)))
+		if id == nil {
+			return ErrNotFound
+		}
+		var err error
+		result, err = getResetActivityTx(tx, string(id))
+		if err != nil {
+			return err
+		}
+		if result.Status != model.ResetActivityActive && result.Status != model.ResetActivitySettling {
+			return ErrNotFound
+		}
+		return nil
+	})
+	return result, err
+}
+
+func resetParticipantKey(activityID string, newAPIID int) []byte {
+	return []byte(activityID + "\x00" + fmt.Sprintf("%020d", newAPIID))
+}
+
+func resetParticipantPrefix(activityID string) []byte {
+	return []byte(activityID + "\x00")
+}
+
+func (s *Store) JoinResetActivity(group string, participant model.ResetParticipant, now time.Time) (model.ResetActivity, bool, error) {
+	group = strings.TrimSpace(group)
+	if group == "" || participant.NewAPIID <= 0 || participant.CanonicalID == "" {
+		return model.ResetActivity{}, false, errors.New("重置活动参与信息不完整")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var result model.ResetActivity
+	var joined bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		id := tx.Bucket([]byte("reset_active_by_group")).Get([]byte(group))
+		if id == nil {
+			return ErrResetActivityInactive
+		}
+		var err error
+		result, err = getResetActivityTx(tx, string(id))
+		if err != nil {
+			return err
+		}
+		if result.Status != model.ResetActivityActive || !now.Before(result.EndsAt) {
+			return ErrResetActivityInactive
+		}
+		participants := tx.Bucket([]byte("reset_participants"))
+		key := resetParticipantKey(result.ID, participant.NewAPIID)
+		if participants.Get(key) != nil {
+			return nil
+		}
+		participant.ActivityID = result.ID
+		participant.GroupOpenID = group
+		participant.JoinedAt = now
+		data, err := json.Marshal(participant)
+		if err != nil {
+			return err
+		}
+		if err := participants.Put(key, data); err != nil {
+			return err
+		}
+		result.ParticipantCount++
+		result.UpdatedAt = now
+		if err := putResetActivityTx(tx, result); err != nil {
+			return err
+		}
+		joined = true
+		return nil
+	})
+	return result, joined, err
+}
+
+func (s *Store) ListResetParticipants(activityID string) ([]model.ResetParticipant, error) {
+	result := make([]model.ResetParticipant, 0)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("reset_participants"))
+		cursor := bucket.Cursor()
+		prefix := resetParticipantPrefix(activityID)
+		for key, data := cursor.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, data = cursor.Next() {
+			var participant model.ResetParticipant
+			if err := json.Unmarshal(data, &participant); err != nil {
+				return err
+			}
+			result = append(result, participant)
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) ListDueResetActivities(now time.Time) ([]model.ResetActivity, error) {
+	result := make([]model.ResetActivity, 0)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	cutoff := resetDueKey(now, "\xff")
+	err := s.db.View(func(tx *bolt.Tx) error {
+		due := tx.Bucket([]byte("reset_due_activities"))
+		cursor := due.Cursor()
+		for key, id := cursor.First(); key != nil && bytes.Compare(key, cutoff) <= 0; key, id = cursor.Next() {
+			activity, err := getResetActivityTx(tx, string(id))
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if activity.Status == model.ResetActivityActive || activity.Status == model.ResetActivitySettling {
+				result = append(result, activity)
+			}
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Store) BeginResetSettlement(activityID string, awards []model.ResetAward, now time.Time) (model.ResetActivity, bool, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var result model.ResetActivity
+	var started bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		result, err = getResetActivityTx(tx, activityID)
+		if err != nil {
+			return err
+		}
+		if result.Status == model.ResetActivitySettling || result.Status == model.ResetActivityCompleted {
+			return nil
+		}
+		if result.Status != model.ResetActivityActive {
+			return ErrResetActivityInactive
+		}
+		if now.Before(result.EndsAt) {
+			return ErrResetActivityNotDue
+		}
+		if len(awards) > result.WinnerCount || len(awards) > result.ParticipantCount {
+			return errors.New("重置活动中奖人数超过允许数量")
+		}
+		seen := make(map[int]struct{}, len(awards))
+		participants := tx.Bucket([]byte("reset_participants"))
+		for index := range awards {
+			award := &awards[index]
+			if award.NewAPIID <= 0 {
+				return errors.New("重置活动奖项用户 ID 无效")
+			}
+			if _, exists := seen[award.NewAPIID]; exists {
+				return errors.New("重置活动中奖用户重复")
+			}
+			seen[award.NewAPIID] = struct{}{}
+			participantData := participants.Get(resetParticipantKey(activityID, award.NewAPIID))
+			if participantData == nil {
+				return errors.New("重置活动中奖用户未参加活动")
+			}
+			var participant model.ResetParticipant
+			if err := json.Unmarshal(participantData, &participant); err != nil {
+				return err
+			}
+			award.CanonicalID = participant.CanonicalID
+			award.MemberOpenID = participant.MemberOpenID
+			if award.RawQuota < 0 {
+				return errors.New("重置活动补偿额度不能为负数")
+			}
+			if award.RawQuota == 0 {
+				award.Status = model.ResetAwardZero
+			} else if award.Status == "" {
+				award.Status = model.ResetAwardPending
+			}
+			award.UpdatedAt = now
+		}
+		result.Status = model.ResetActivitySettling
+		result.Awards = append([]model.ResetAward(nil), awards...)
+		result.SelectedAt = now
+		result.UpdatedAt = now
+		if err := putResetActivityTx(tx, result); err != nil {
+			return err
+		}
+		started = true
+		return nil
+	})
+	return result, started, err
+}
+
+func isResetAwardFinal(status model.ResetAwardStatus) bool {
+	switch status {
+	case model.ResetAwardGranted, model.ResetAwardZero, model.ResetAwardFailed, model.ResetAwardPendingConfirmation:
+		return true
+	default:
+		return false
+	}
+}
+
+func validResetAwardStatus(status model.ResetAwardStatus) bool {
+	switch status {
+	case model.ResetAwardPending, model.ResetAwardGranting, model.ResetAwardGranted, model.ResetAwardZero,
+		model.ResetAwardFailed, model.ResetAwardPendingConfirmation:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Store) UpdateResetAward(activityID string, newAPIID int, status model.ResetAwardStatus, lastError string, now time.Time) (model.ResetActivity, error) {
+	if !validResetAwardStatus(status) {
+		return model.ResetActivity{}, errors.New("重置活动奖项状态无效")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var result model.ResetActivity
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		result, err = getResetActivityTx(tx, activityID)
+		if err != nil {
+			return err
+		}
+		if result.Status != model.ResetActivitySettling {
+			return ErrResetActivityInactive
+		}
+		for index := range result.Awards {
+			award := &result.Awards[index]
+			if award.NewAPIID != newAPIID {
+				continue
+			}
+			if isResetAwardFinal(award.Status) && award.Status != status {
+				return ErrResetAwardFinalized
+			}
+			award.Status = status
+			award.LastError = lastError
+			award.UpdatedAt = now
+			result.UpdatedAt = now
+			return putResetActivityTx(tx, result)
+		}
+		return ErrNotFound
+	})
+	return result, err
+}
+
+func (s *Store) CompleteResetActivity(activityID string, now time.Time) (model.ResetActivity, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var result model.ResetActivity
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		result, err = getResetActivityTx(tx, activityID)
+		if err != nil {
+			return err
+		}
+		if result.Status == model.ResetActivityCompleted {
+			return nil
+		}
+		if result.Status != model.ResetActivitySettling {
+			return ErrResetActivityInactive
+		}
+		for _, award := range result.Awards {
+			if !isResetAwardFinal(award.Status) {
+				return errors.New("重置活动仍有未完成的奖项")
+			}
+		}
+		result.Status = model.ResetActivityCompleted
+		result.CompletedAt = now
+		result.UpdatedAt = now
+		if err := putResetActivityTx(tx, result); err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte("reset_due_activities")).Delete(resetDueKey(result.EndsAt, result.ID)); err != nil {
+			return err
+		}
+		activeByGroup := tx.Bucket([]byte("reset_active_by_group"))
+		if activeID := activeByGroup.Get([]byte(result.GroupOpenID)); string(activeID) == activityID {
+			if err := activeByGroup.Delete([]byte(result.GroupOpenID)); err != nil {
+				return err
+			}
+		}
+		state := model.ResetGroupState{
+			GroupOpenID:     result.GroupOpenID,
+			Stage:           model.ResetStageUnknown,
+			LastCompletedAt: now,
+			UpdatedAt:       now,
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte("reset_group_states")).Put([]byte(result.GroupOpenID), data); err != nil {
+			return err
+		}
+		signal, err := getResetSignalTx(tx, result.SignalID)
+		if err != nil {
+			return err
+		}
+		return enqueueResetNotificationTx(tx, model.ResetNotificationActivityCompleted, result.GroupOpenID, signal, result.ID, now)
+	})
 	return result, err
 }
 
