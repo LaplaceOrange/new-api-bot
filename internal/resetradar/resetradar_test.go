@@ -109,6 +109,18 @@ func TestClassify(t *testing.T) {
 			want: StagePossible,
 		},
 		{
+			name: "tibo shorthand imminent",
+			text: "Old news actually from a bunch of days ago, but crossed that 15M. Enjoy a nice reset everyone. Landing in the next hour or so, go /fast.",
+			kind: "x-tibo",
+			want: StageImminent,
+		},
+		{
+			name: "same shorthand untrusted",
+			text: "Enjoy a nice reset everyone. Landing in the next hour or so.",
+			kind: "x-public",
+			want: StageUnknown,
+		},
+		{
 			name:  "negative",
 			text:  "There will be no Codex usage limit resets today.",
 			kind:  "hint",

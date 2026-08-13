@@ -100,7 +100,11 @@ func parseXTimeline(body []byte, username string) ([]Signal, error) {
 		}
 		createdAt := time.UnixMilli(createdMS).UTC()
 		text := decodeJSONString(textMatch[1])
-		stage := Classify(text, "x-public", 100)
+		kind := "x-public"
+		if strings.EqualFold(username, tiboUsername) {
+			kind = "x-tibo"
+		}
+		stage := Classify(text, kind, 100)
 		result = append(result, Signal{
 			ID:        "x:" + id,
 			Source:    "X @" + username,

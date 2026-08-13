@@ -18,12 +18,13 @@ var (
 	hintTimePattern  = regexp.MustCompile(`(?i)\b(?:today|tonight|tomorrow|monday|soon|later)\b`)
 )
 
-// Classify returns the confidence stage for one public signal. kind and score
-// are optional hints supplied by the aggregator and never bypass context or
-// negation checks.
+// Classify returns the confidence stage for one public signal. The trusted
+// Tibo timeline may supply the product context, but no source bypasses quota
+// wording or negation checks.
 func Classify(text, kind string, score int) Stage {
 	normalized := normalizeText(text)
-	if normalized == "" || !productPattern.MatchString(normalized) || !quotaPattern.MatchString(normalized) {
+	trustedTiboPost := strings.EqualFold(kind, "x-tibo")
+	if normalized == "" || !quotaPattern.MatchString(normalized) || (!trustedTiboPost && !productPattern.MatchString(normalized)) {
 		return StageUnknown
 	}
 	if negativePattern.MatchString(normalized) {

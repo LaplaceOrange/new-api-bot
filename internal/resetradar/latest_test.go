@@ -84,7 +84,7 @@ func TestParseLatestXPostClassifiesEveryStage(t *testing.T) {
 	}{
 		{name: "unknown", text: "A regular product update.", want: StageUnknown},
 		{name: "possible", text: "Thinking about another Codex usage limit reset.", want: StagePossible},
-		{name: "imminent", text: "A Codex usage limit reset is coming tomorrow.", want: StageImminent},
+		{name: "imminent", text: "Enjoy a nice reset everyone. Landing in the next hour or so.", want: StageImminent},
 		{name: "confirmed", text: "We have reset Codex usage limits for paid users.", want: StageConfirmed},
 	}
 	for index, test := range tests {
