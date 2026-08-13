@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -33,11 +34,18 @@ func (s *Service) handleReset(ctx context.Context, event qq.MessageEvent, canoni
 	if len(fields) < 2 {
 		return s.reply(ctx, event, resetUsage())
 	}
+	subcommand := strings.ToLower(fields[1])
+	if subcommand == "last" {
+		if len(fields) != 2 {
+			return s.reply(ctx, event, "格式错误。正确用法：/reset last")
+		}
+		return s.replyLatestTibo(ctx, event, group)
+	}
 	if _, err := s.ensureResetSettings(group); err != nil {
 		return s.reply(ctx, event, "保存当前群的重置监测设置失败，请稍后重试。")
 	}
 
-	switch strings.ToLower(fields[1]) {
+	switch subcommand {
 	case "check", "status":
 		if len(fields) != 2 {
 			return s.reply(ctx, event, "格式错误。正确用法：/reset check")
@@ -67,6 +75,131 @@ func (s *Service) handleReset(ctx context.Context, event qq.MessageEvent, canoni
 	default:
 		return s.reply(ctx, event, resetUsage())
 	}
+}
+
+func (s *Service) replyLatestTibo(ctx context.Context, event qq.MessageEvent, group string) error {
+	queryCtx, cancel := s.backgroundCommandContext(ctx, resetLastCommandTimeout(s.cfg.ResetHTTPTimeout, s.cfg.QQAPITimeout))
+	defer cancel()
+
+	proxyURL, err := s.loadResetProxyURL()
+	if err != nil {
+		s.logger.Error("读取 Tibo 最新推文所需代理配置失败", "group_openid", group, "error", err)
+		return s.replyResetLastResult(ctx, event, "读取重置检测代理配置失败，请联系管理员检查服务日志。")
+	}
+	signal, err := s.resetRadar.LatestTibo(queryCtx, proxyURL)
+	if err != nil {
+		s.logger.Warn("获取 Tibo 最新推文失败",
+			"group_openid", group,
+			"proxy_configured", proxyURL != "",
+			"error", redactResetProxyError(err, proxyURL),
+		)
+		return s.replyResetLastResult(ctx, event, "获取 Tibo 最新推文失败，请稍后重试。")
+	}
+
+	location := s.cfg.CheckinTimezone
+	if location == nil {
+		location = time.Local
+	}
+	text := strings.TrimSpace(signal.Text)
+	if text == "" {
+		text = "（无正文）"
+	}
+	postURL := strings.TrimSpace(signal.URL)
+	if postURL == "" {
+		postURL = latestTiboURL(signal.ID)
+	}
+	lines := []string{
+		"Tibo 最新推文",
+		"发布时间：" + signal.CreatedAt.In(location).Format("2006-01-02 15:04:05 MST"),
+		"归类：" + latestResetStageText(signal.Stage),
+		"内容：" + text,
+	}
+	if postURL != "" {
+		lines = append(lines, postURL)
+	}
+	return s.replyResetLastResult(ctx, event, strings.Join(lines, "\n"))
+}
+
+func (s *Service) replyResetLastResult(ctx context.Context, event qq.MessageEvent, content string) error {
+	replyTimeout := s.cfg.QQAPITimeout
+	if replyTimeout <= 0 {
+		replyTimeout = 10 * time.Second
+	}
+	replyCtx, cancel := s.backgroundCommandContext(ctx, replyTimeout)
+	defer cancel()
+	return s.replyChunked(replyCtx, event, content, 1700)
+}
+
+func (s *Service) loadResetProxyURL() (string, error) {
+	encrypted, err := s.store.GetResetProxy()
+	if errors.Is(err, store.ErrNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return s.secure.Decrypt(encrypted)
+}
+
+func resetLastCommandTimeout(httpTimeout, qqTimeout time.Duration) time.Duration {
+	if httpTimeout <= 0 {
+		httpTimeout = 20 * time.Second
+	}
+	if qqTimeout <= 0 {
+		qqTimeout = 10 * time.Second
+	}
+	return httpTimeout + qqTimeout + 5*time.Second
+}
+
+func latestResetStageText(stage resetradar.Stage) string {
+	switch stage {
+	case resetradar.StagePossible:
+		return "可能重置"
+	case resetradar.StageImminent:
+		return "即将重置"
+	case resetradar.StageConfirmed:
+		return "确认重置"
+	default:
+		return "未知"
+	}
+}
+
+func latestTiboURL(signalID string) string {
+	id := strings.TrimSpace(strings.TrimPrefix(signalID, "x:"))
+	if id == "" {
+		return ""
+	}
+	return "https://x.com/thsottiaux/status/" + id
+}
+
+func redactResetProxyError(err error, proxyURL string) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return message
+	}
+	safeURL := "<configured-proxy>"
+	if parsed, parseErr := url.Parse(proxyURL); parseErr == nil && parsed.Host != "" {
+		parsed.User = nil
+		safeURL = parsed.String()
+	}
+	message = strings.ReplaceAll(message, proxyURL, safeURL)
+	if parsed, parseErr := url.Parse(proxyURL); parseErr == nil && parsed.User != nil {
+		userinfo := parsed.User.String()
+		if userinfo != "" {
+			message = strings.ReplaceAll(message, userinfo+"@", "")
+		}
+		if username := parsed.User.Username(); username != "" {
+			message = strings.ReplaceAll(message, username, "[redacted]")
+		}
+		if password, ok := parsed.User.Password(); ok && password != "" {
+			message = strings.ReplaceAll(message, password, "[redacted]")
+		}
+	}
+	return message
 }
 
 func (s *Service) ensureResetSettings(group string) (model.ResetSettings, error) {
@@ -265,15 +398,9 @@ func (s *Service) pollResetSignals(parent context.Context) {
 	if _, err := s.store.ExpireResetGroupStates(time.Now().Add(-s.cfg.ResetSignalMaxAge), time.Now()); err != nil {
 		s.logger.Warn("清理过期重置信号状态失败", "error", err)
 	}
-	proxyURL := ""
-	if encrypted, proxyErr := s.store.GetResetProxy(); proxyErr == nil {
-		proxyURL, proxyErr = s.secure.Decrypt(encrypted)
-		if proxyErr != nil {
-			s.logger.Error("解密重置检测代理失败", "error", proxyErr)
-			return
-		}
-	} else if !errors.Is(proxyErr, store.ErrNotFound) {
-		s.logger.Error("读取重置检测代理失败", "error", proxyErr)
+	proxyURL, proxyErr := s.loadResetProxyURL()
+	if proxyErr != nil {
+		s.logger.Error("读取或解密重置检测代理失败", "error", proxyErr)
 		return
 	}
 	snapshot, err := s.resetRadar.Fetch(parent, proxyURL)
@@ -755,6 +882,7 @@ func resetUsage() string {
 	return strings.Join([]string{
 		"格式错误。可用指令：",
 		"/reset check - 查看当前重置状态",
+		"/reset last - 查看 Tibo 最新一条推文及归类",
 		"/reset join - 参加正在进行的补偿抽奖",
 		"管理员：/reset set duration <时长>",
 		"管理员：/reset set winners <人数>",

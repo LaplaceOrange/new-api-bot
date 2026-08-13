@@ -83,13 +83,14 @@
 | `/confirm <一次性操作码>` | 管理员 | 确认五分钟内的敏感管理操作 |
 | `/benefit <面额> <数量> <有效期(h)> <违者封禁时间(day)>` | 管理员 | @全体成员并批量发放一人限领一个的福利兑换码；自动检测多领、封禁并到期解封 |
 | `/reset check` | 任意 | 查看当前群状态：未知、可能重置、即将重置或确认重置（抽奖进行中） |
+| `/reset last` | 任意 | 查看 Tibo 最新一条 X 推文及其归类，不改变当前群状态或活动 |
 | `/reset join` | 已绑定用户 | 参加当前群有效期内正在进行的重置补偿抽奖 |
 | `/reset set duration <时长>` | 管理员 | 设置下一轮活动有效期，默认 `5h` |
 | `/reset set winners <人数>` | 管理员 | 设置下一轮抽取人数，默认 `5` |
 | `/reset set lookback <时长>` | 管理员 | 设置获奖者用量补偿回溯时间，默认 `24h` |
 | `/reset proxy <代理链接或off>` | 管理员 | 设置仅用于 X 检测的 HTTP/SOCKS5 代理，凭据加密保存 |
 
-除 `/help`、`/whoami`、`/bind`、`/reset check`、`/enable list`、`/disable list` 以及管理员的 `/enable`、`/disable` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
+除 `/help`、`/whoami`、`/bind`、`/reset check`、`/reset last`、`/enable list`、`/disable list` 以及管理员的 `/enable`、`/disable` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
 
 命令关键词状态持久化保存在 bbolt。示例：管理员执行 `/disable "bind view"` 后，标准化内容中包含 `bind view` 的指令会被静默忽略，`/help` 中匹配该关键词的行也会隐藏；执行 `/enable "bind view"` 即可恢复。匹配不区分英文大小写，并会合并连续空白字符。`/enable` 和 `/disable` 管理指令本身始终可执行，避免规则将管理入口锁死。
 
@@ -236,7 +237,8 @@ $bytes = New-Object byte[] 32
 
 ### Codex 重置监测与补偿
 
-- 首次在某个群执行 `/reset check`、`/reset join` 或管理员设置命令时，该群会自动登记为重置通知群。没有登记群时后台不会发起监测请求。
+- 首次在某个群执行 `/reset check`、`/reset join` 或管理员设置命令时，该群会自动登记为重置通知群。`/reset last` 只查询 Tibo 最新推文，不登记群、不改变状态，也不会创建活动。没有登记群时后台不会发起监测请求。
+- `/reset last` 按推文发布时间选择真正的最新一条，即使页面前方存在旧置顶推文；普通无关推文会显示为“未知”，且该查询不受 `RESET_SIGNAL_MAX_AGE` 限制。
 - 后台默认每 `3m` 顺序检查 `X @thsottiaux`、`X @OpenAI`、`X @OpenAIDevs`、`codexreset.org` 和 OpenAI Status，只处理最近 `24h` 的相关信号。网络响应有严格大小限制，不运行浏览器、Node 或其他常驻进程。
 - 状态分为：未知、可能重置、即将重置、确认重置（抽奖进行中）。可能或即将重置信号过期后恢复未知；确认信号为每群开启一轮活动，活动结算后立即恢复未知。
 - 活动默认持续 `5h`，随机抽取最多 `5` 名参与者。每名获奖者获得该活动结束前近 `24h` 的实际消耗额度；参与人数不足时抽取全部参与者，消耗为零时不调用额度写入接口。

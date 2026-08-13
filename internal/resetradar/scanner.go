@@ -15,6 +15,8 @@ import (
 const (
 	aggregatorURL       = "https://codexreset.org/"
 	statusURL           = "https://status.openai.com/api/v2/incidents.json"
+	tiboUsername        = "thsottiaux"
+	tiboURL             = "https://x.com/thsottiaux"
 	maxXBody            = int64(4 << 20)
 	maxAggregate        = int64(2 << 20)
 	maxStatusBody       = int64(512 << 10)
@@ -28,7 +30,7 @@ var xProfiles = []struct {
 	username string
 	url      string
 }{
-	{username: "thsottiaux", url: "https://x.com/thsottiaux"},
+	{username: tiboUsername, url: tiboURL},
 	{username: "OpenAI", url: "https://x.com/OpenAI"},
 	{username: "OpenAIDevs", url: "https://x.com/OpenAIDevs"},
 }
@@ -43,9 +45,12 @@ type Scanner struct {
 	// Fetch is intentionally serialized: a scan already visits every source,
 	// and overlapping rounds only multiply memory and connection use.
 	fetchMu sync.Mutex
-	mu      sync.Mutex
-	active  sync.WaitGroup
-	closed  bool
+	// LatestTibo is serialized independently so an interactive query is not
+	// blocked behind a full five-source monitoring round.
+	latestSlot chan struct{}
+	mu         sync.Mutex
+	active     sync.WaitGroup
+	closed     bool
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -71,6 +76,7 @@ func NewScanner(timeout time.Duration, maxAge ...time.Duration) *Scanner {
 		maxAge:          signalMaxAge,
 		directTransport: transport,
 		directClient:    &http.Client{Transport: transport, Timeout: timeout},
+		latestSlot:      make(chan struct{}, 1),
 		now:             time.Now,
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
@@ -164,6 +170,40 @@ func (s *Scanner) Fetch(ctx context.Context, proxyURL string) (Snapshot, error) 
 
 	snapshot.Signals = sortedSignals(byID)
 	return snapshot, nil
+}
+
+// LatestTibo returns the newest post in Tibo's public X timeline. Unlike the
+// monitoring scan, this query deliberately keeps unrelated and older posts so
+// callers can always display the actual latest post and its classification.
+func (s *Scanner) LatestTibo(ctx context.Context, proxyURL string) (Signal, error) {
+	if s == nil {
+		return Signal{}, errors.New("reset radar scanner is nil")
+	}
+	parsedProxy, err := parseProxyURL(proxyURL)
+	if err != nil {
+		return Signal{}, err
+	}
+	roundCtx, finish, err := s.beginFetch(ctx)
+	if err != nil {
+		return Signal{}, err
+	}
+	defer finish()
+
+	select {
+	case s.latestSlot <- struct{}{}:
+		defer func() { <-s.latestSlot }()
+	case <-roundCtx.Done():
+		return Signal{}, roundCtx.Err()
+	}
+	xClient, err := s.xClientForProxy(parsedProxy)
+	if err != nil {
+		return Signal{}, err
+	}
+	body, err := fetchBody(roundCtx, xClient, tiboURL, maxXBody, true)
+	if err != nil {
+		return Signal{}, err
+	}
+	return parseLatestXPost(body, tiboUsername)
 }
 
 func (s *Scanner) beginFetch(parent context.Context) (context.Context, func(), error) {

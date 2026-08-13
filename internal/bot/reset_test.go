@@ -1,15 +1,201 @@
 package bot
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/fsykk/new-api-bot/internal/model"
 	"github.com/fsykk/new-api-bot/internal/newapi"
+	"github.com/fsykk/new-api-bot/internal/resetradar"
+	"github.com/fsykk/new-api-bot/internal/store"
 )
+
+type fakeResetRadar struct {
+	signal      resetradar.Signal
+	err         error
+	latestCalls int
+	lastProxy   string
+}
+
+func (f *fakeResetRadar) Fetch(context.Context, string) (resetradar.Snapshot, error) {
+	return resetradar.Snapshot{}, nil
+}
+
+func (f *fakeResetRadar) LatestTibo(_ context.Context, proxyURL string) (resetradar.Signal, error) {
+	f.latestCalls++
+	f.lastProxy = proxyURL
+	return f.signal, f.err
+}
+
+func (f *fakeResetRadar) Close() {}
+
+func TestResetLastIsAvailableWithoutBindingAndHasNoStateSideEffects(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.CheckinTimezone = time.FixedZone("CST", 8*60*60)
+	radar := &fakeResetRadar{signal: resetradar.Signal{
+		ID:        "x:123456789",
+		Source:    "X @thsottiaux",
+		Text:      "A regular unrelated post.",
+		URL:       "https://x.com/thsottiaux/status/123456789",
+		CreatedAt: time.Date(2026, 8, 13, 1, 23, 45, 0, time.UTC),
+		Stage:     resetradar.StageUnknown,
+	}}
+	service.resetRadar = radar
+
+	service.process(context.Background(), groupEvent("g-reset-last", "ordinary", "/reset last"))
+	reply := lastReply(t, qqAPI)
+	for _, want := range []string{
+		"Tibo 最新推文",
+		"发布时间：2026-08-13 09:23:45 CST",
+		"归类：未知",
+		"内容：A regular unrelated post.",
+		"https://x.com/thsottiaux/status/123456789",
+	} {
+		if !strings.Contains(reply, want) {
+			t.Fatalf("latest reply %q does not contain %q", reply, want)
+		}
+	}
+	if radar.latestCalls != 1 || radar.lastProxy != "" {
+		t.Fatalf("latest calls=%d proxy=%q", radar.latestCalls, radar.lastProxy)
+	}
+	if _, err := storage.GetResetSettings("g-reset-last"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("/reset last unexpectedly subscribed group: %v", err)
+	}
+	if _, err := storage.GetActiveResetActivity("g-reset-last"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("/reset last unexpectedly created activity: %v", err)
+	}
+}
+
+func TestResetLastStrictSyntaxAndGroupOnly(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	radar := &fakeResetRadar{}
+	service.resetRadar = radar
+
+	service.process(context.Background(), groupEvent("g-reset-last", "ordinary", "/reset last extra"))
+	if reply := lastReply(t, qqAPI); reply != "格式错误。正确用法：/reset last" {
+		t.Fatalf("unexpected syntax reply: %q", reply)
+	}
+	service.process(context.Background(), c2cEvent("ordinary", "/reset last"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "只能在群聊中使用") {
+		t.Fatalf("unexpected c2c reply: %q", reply)
+	}
+	if radar.latestCalls != 0 {
+		t.Fatalf("invalid /reset last called radar %d times", radar.latestCalls)
+	}
+	if _, err := storage.GetResetSettings("g-reset-last"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("invalid /reset last unexpectedly subscribed group: %v", err)
+	}
+}
+
+func TestResetLastStageLabels(t *testing.T) {
+	tests := []struct {
+		stage resetradar.Stage
+		want  string
+	}{
+		{stage: resetradar.StageUnknown, want: "未知"},
+		{stage: resetradar.StagePossible, want: "可能重置"},
+		{stage: resetradar.StageImminent, want: "即将重置"},
+		{stage: resetradar.StageConfirmed, want: "确认重置"},
+	}
+	for _, test := range tests {
+		if got := latestResetStageText(test.stage); got != test.want {
+			t.Fatalf("latestResetStageText(%v)=%q, want %q", test.stage, got, test.want)
+		}
+	}
+	if got := latestResetStageText(resetradar.StageConfirmed); strings.Contains(got, "抽奖进行中") {
+		t.Fatalf("latest confirmed label used activity wording: %q", got)
+	}
+}
+
+func TestResetLastConfirmedResultDoesNotAdvanceGroupStateOrCreateActivity(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if _, err := service.ensureResetSettings("g-reset-last"); err != nil {
+		t.Fatal(err)
+	}
+	before := model.ResetSignal{
+		ID:         "possible-before-last",
+		Source:     "test",
+		Stage:      model.ResetStagePossible,
+		Summary:    "existing group state",
+		OccurredAt: time.Now(),
+	}
+	if changed, err := storage.ApplyResetSignalToGroup("g-reset-last", before); err != nil || !changed {
+		t.Fatalf("prepare group state: changed=%v err=%v", changed, err)
+	}
+	service.resetRadar = &fakeResetRadar{signal: resetradar.Signal{
+		ID:        "x:confirmed-last",
+		Text:      "confirmed reset post",
+		CreatedAt: time.Now(),
+		Stage:     resetradar.StageConfirmed,
+	}}
+
+	service.process(context.Background(), groupEvent("g-reset-last", "ordinary", "/reset last"))
+	reply := lastReply(t, qqAPI)
+	if !strings.Contains(reply, "归类：确认重置") || strings.Contains(reply, "抽奖进行中") {
+		t.Fatalf("unexpected confirmed latest reply: %q", reply)
+	}
+	state, err := storage.GetResetGroupState("g-reset-last")
+	if err != nil || state.Stage != model.ResetStagePossible || state.SignalID != before.ID {
+		t.Fatalf("latest query changed group state: %#v err=%v", state, err)
+	}
+	if _, err := storage.GetActiveResetActivity("g-reset-last"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("latest query created reset activity: %v", err)
+	}
+}
+
+func TestResetLastUsesEncryptedProxyAndRedactsFailure(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	const proxyURL = "http://proxy-user:proxy-secret@127.0.0.1:8080"
+	encrypted, err := service.secure.Encrypt(proxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.PutResetProxy(encrypted); err != nil {
+		t.Fatal(err)
+	}
+	radar := &fakeResetRadar{err: errors.New("dial " + proxyURL + ": connection refused")}
+	service.resetRadar = radar
+	var logs bytes.Buffer
+	service.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	service.process(context.Background(), groupEvent("g-reset-last", "ordinary", "/reset last"))
+	reply := lastReply(t, qqAPI)
+	if !strings.Contains(reply, "获取 Tibo 最新推文失败") || strings.Contains(reply, "proxy-user") || strings.Contains(reply, "proxy-secret") {
+		t.Fatalf("unexpected failure reply: %q", reply)
+	}
+	if radar.latestCalls != 1 || radar.lastProxy != proxyURL {
+		t.Fatalf("latest calls=%d proxy=%q", radar.latestCalls, radar.lastProxy)
+	}
+	logged := logs.String()
+	if strings.Contains(logged, "proxy-user") || strings.Contains(logged, "proxy-secret") {
+		t.Fatalf("proxy credentials leaked to logs: %q", logged)
+	}
+	if !strings.Contains(logged, "connection refused") || !strings.Contains(logged, "127.0.0.1:8080") {
+		t.Fatalf("redacted log omitted useful error details: %q", logged)
+	}
+}
+
+func TestResetLastDecryptFailureDoesNotCallRadar(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if err := storage.PutResetProxy("not-valid-ciphertext"); err != nil {
+		t.Fatal(err)
+	}
+	radar := &fakeResetRadar{}
+	service.resetRadar = radar
+
+	service.process(context.Background(), groupEvent("g-reset-last", "ordinary", "/reset last"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "读取重置检测代理配置失败") {
+		t.Fatalf("unexpected decrypt failure reply: %q", reply)
+	}
+	if radar.latestCalls != 0 {
+		t.Fatalf("radar called despite proxy decrypt failure: %d", radar.latestCalls)
+	}
+}
 
 func TestResetCheckIsAvailableWithoutBindingAndSubscribesGroup(t *testing.T) {
 	service, storage, _, qqAPI, _ := testService(t)
@@ -297,6 +483,20 @@ func TestDisabledResetJoinDoesNotHideResetCheck(t *testing.T) {
 	}
 	if strings.Contains(reply, "/reset join") {
 		t.Fatalf("disabled reset join remained in help: %q", reply)
+	}
+}
+
+func TestDisabledResetLastOnlyHidesResetLastHelp(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+	service.process(context.Background(), groupEvent("g-reset", "admin", `/disable "reset last"`))
+	service.process(context.Background(), groupEvent("g-reset", "ordinary", "/help"))
+	reply := lastReply(t, qqAPI)
+	if strings.Contains(reply, "/reset last") {
+		t.Fatalf("disabled reset last remained in help: %q", reply)
+	}
+	if !strings.Contains(reply, "/reset check") || !strings.Contains(reply, "/reset join") {
+		t.Fatalf("disabling reset last hid unrelated reset commands: %q", reply)
 	}
 }
 

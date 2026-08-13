@@ -24,6 +24,35 @@ var (
 
 func parseXPublicPage(body []byte, username string, now time.Time, maxAge ...time.Duration) ([]Signal, error) {
 	age := signalMaxAge(maxAge)
+	posts, err := parseXTimeline(body, username)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]Signal, 0, len(posts))
+	for _, post := range posts {
+		if !isRecent(post.CreatedAt, now, age) || post.Stage == StageUnknown {
+			continue
+		}
+		result = append(result, post)
+	}
+	return result, nil
+}
+
+func parseLatestXPost(body []byte, username string) (Signal, error) {
+	posts, err := parseXTimeline(body, username)
+	if err != nil {
+		return Signal{}, err
+	}
+	latest := posts[0]
+	for _, post := range posts[1:] {
+		if post.CreatedAt.After(latest.CreatedAt) {
+			latest = post
+		}
+	}
+	return latest, nil
+}
+
+func parseXTimeline(body []byte, username string) ([]Signal, error) {
 	// A profile timeline is small in normal operation. The cap prevents an
 	// unexpected page from turning regex result slices into a large allocation.
 	timelineMatches := xTimelinePattern.FindAllSubmatch(body, 256)
@@ -36,7 +65,6 @@ func parseXPublicPage(body []byte, username string, now time.Time, maxAge ...tim
 	}
 
 	details := xDetailsPattern.FindAllSubmatchIndex(body, 256)
-	parsed := 0
 	result := make([]Signal, 0, len(details))
 	for index, match := range details {
 		encodedKey := string(body[match[2]:match[3]])
@@ -70,16 +98,9 @@ func parseXPublicPage(body []byte, username string, now time.Time, maxAge ...tim
 		if err != nil {
 			continue
 		}
-		parsed++
 		createdAt := time.UnixMilli(createdMS).UTC()
-		if !isRecent(createdAt, now, age) {
-			continue
-		}
 		text := decodeJSONString(textMatch[1])
 		stage := Classify(text, "x-public", 100)
-		if stage == StageUnknown {
-			continue
-		}
 		result = append(result, Signal{
 			ID:        "x:" + id,
 			Source:    "X @" + username,
@@ -89,7 +110,7 @@ func parseXPublicPage(body []byte, username string, now time.Time, maxAge ...tim
 			Stage:     stage,
 		})
 	}
-	if parsed == 0 {
+	if len(result) == 0 {
 		return nil, errors.New("X 页面结构已变化，未找到帖子正文")
 	}
 	return result, nil
