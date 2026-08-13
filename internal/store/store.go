@@ -131,9 +131,20 @@ func resetDueKey(at time.Time, id string) []byte {
 	return key
 }
 
+func maxTime(left, right time.Time) time.Time {
+	if left.After(right) {
+		return left
+	}
+	return right
+}
+
 func rebuildResetIndexesTx(tx *bolt.Tx) error {
 	dueActivities := tx.Bucket([]byte("reset_due_activities"))
 	if err := clearBucketTx(dueActivities); err != nil {
+		return err
+	}
+	activeByGroup := tx.Bucket([]byte("reset_active_by_group"))
+	if err := clearBucketTx(activeByGroup); err != nil {
 		return err
 	}
 	if err := tx.Bucket([]byte("reset_activities")).ForEach(func(_, data []byte) error {
@@ -143,6 +154,12 @@ func rebuildResetIndexesTx(tx *bolt.Tx) error {
 		}
 		if activity.Status != model.ResetActivityActive && activity.Status != model.ResetActivitySettling {
 			return nil
+		}
+		if existing := activeByGroup.Get([]byte(activity.GroupOpenID)); existing != nil && string(existing) != activity.ID {
+			return fmt.Errorf("群 %s 存在多个未完成的重置活动", activity.GroupOpenID)
+		}
+		if err := activeByGroup.Put([]byte(activity.GroupOpenID), []byte(activity.ID)); err != nil {
+			return err
 		}
 		return dueActivities.Put(resetDueKey(activity.EndsAt, activity.ID), []byte(activity.ID))
 	}); err != nil {
@@ -2269,6 +2286,178 @@ func (s *Store) GetActiveResetActivity(group string) (model.ResetActivity, error
 	return result, err
 }
 
+func getCurrentResetActivityForGroupTx(tx *bolt.Tx, group string) (model.ResetActivity, error) {
+	var result model.ResetActivity
+	id := tx.Bucket([]byte("reset_active_by_group")).Get([]byte(group))
+	if id == nil {
+		return result, ErrResetActivityInactive
+	}
+	activity, err := getResetActivityTx(tx, string(id))
+	if errors.Is(err, ErrNotFound) {
+		return result, ErrResetActivityInactive
+	}
+	return activity, err
+}
+
+func supersedePendingResetActivityStartedNotificationsTx(tx *bolt.Tx, activityID string, now time.Time) error {
+	notifications := tx.Bucket([]byte("reset_notifications"))
+	due := tx.Bucket([]byte("reset_notification_due"))
+	if notifications == nil || due == nil {
+		return errors.New("reset notification buckets are missing")
+	}
+	updates := make([]model.ResetNotification, 0, 1)
+	if err := notifications.ForEach(func(_, data []byte) error {
+		var notification model.ResetNotification
+		if err := json.Unmarshal(data, &notification); err != nil {
+			return err
+		}
+		if notification.Kind != model.ResetNotificationActivityStarted ||
+			notification.ActivityID != activityID ||
+			notification.Status != model.ResetNotificationPending {
+			return nil
+		}
+		updates = append(updates, notification)
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, notification := range updates {
+		if err := due.Delete(resetDueKey(notification.NextAttemptAt, notification.ID)); err != nil {
+			return err
+		}
+		notification.Status = model.ResetNotificationSuperseded
+		notification.LastError = ""
+		notification.UpdatedAt = now
+		if err := putResetNotificationTx(tx, notification); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) StopResetActivity(group string, now time.Time) (model.ResetActivity, bool, error) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return model.ResetActivity{}, false, errors.New("群 OpenID 不能为空")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var result model.ResetActivity
+	var stopped bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		result, err = getCurrentResetActivityForGroupTx(tx, group)
+		if err != nil {
+			return err
+		}
+		if result.Status == model.ResetActivityStopped || result.Status == model.ResetActivitySettling || result.Status == model.ResetActivityCompleted {
+			return nil
+		}
+		if result.Status != model.ResetActivityActive {
+			return ErrResetActivityInactive
+		}
+		if !result.ClosedAt.IsZero() || !now.Before(result.EndsAt) {
+			return ErrResetActivityInactive
+		}
+		result.Status = model.ResetActivityStopped
+		result.StoppedAt = now
+		result.UpdatedAt = now
+		if err := putResetActivityTx(tx, result); err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte("reset_due_activities")).Delete(resetDueKey(result.EndsAt, result.ID)); err != nil {
+			return err
+		}
+		activeByGroup := tx.Bucket([]byte("reset_active_by_group"))
+		if activeID := activeByGroup.Get([]byte(group)); string(activeID) == result.ID {
+			if err := activeByGroup.Delete([]byte(group)); err != nil {
+				return err
+			}
+		}
+		state, err := getResetGroupStateTx(tx, group)
+		if err != nil {
+			return err
+		}
+		state = model.ResetGroupState{
+			GroupOpenID:     group,
+			Stage:           model.ResetStageUnknown,
+			LastCompletedAt: maxTime(state.LastCompletedAt, now),
+			UpdatedAt:       now,
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte("reset_group_states")).Put([]byte(group), data); err != nil {
+			return err
+		}
+		if err := supersedePendingResetActivityStartedNotificationsTx(tx, result.ID, now); err != nil {
+			return err
+		}
+		stopped = true
+		return nil
+	})
+	return result, stopped, err
+}
+
+func (s *Store) EndResetActivity(group string, now time.Time) (model.ResetActivity, bool, error) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return model.ResetActivity{}, false, errors.New("群 OpenID 不能为空")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var result model.ResetActivity
+	var ended bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		result, err = getCurrentResetActivityForGroupTx(tx, group)
+		if err != nil {
+			return err
+		}
+		if result.Status == model.ResetActivityStopped || result.Status == model.ResetActivitySettling || result.Status == model.ResetActivityCompleted {
+			return nil
+		}
+		if result.Status != model.ResetActivityActive {
+			return ErrResetActivityInactive
+		}
+		if !now.Before(result.EndsAt) {
+			if result.ClosedAt.IsZero() {
+				result.ClosedAt = now
+				result.UpdatedAt = now
+				if err := putResetActivityTx(tx, result); err != nil {
+					return err
+				}
+				if err := supersedePendingResetActivityStartedNotificationsTx(tx, result.ID, now); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		due := tx.Bucket([]byte("reset_due_activities"))
+		if err := due.Delete(resetDueKey(result.EndsAt, result.ID)); err != nil {
+			return err
+		}
+		result.EndsAt = now
+		result.ClosedAt = now
+		result.UpdatedAt = now
+		if err := putResetActivityTx(tx, result); err != nil {
+			return err
+		}
+		if err := due.Put(resetDueKey(result.EndsAt, result.ID), []byte(result.ID)); err != nil {
+			return err
+		}
+		if err := supersedePendingResetActivityStartedNotificationsTx(tx, result.ID, now); err != nil {
+			return err
+		}
+		ended = true
+		return nil
+	})
+	return result, ended, err
+}
+
 func resetParticipantKey(activityID string, newAPIID int) []byte {
 	return []byte(activityID + "\x00" + fmt.Sprintf("%020d", newAPIID))
 }
@@ -2297,7 +2486,7 @@ func (s *Store) JoinResetActivity(group string, participant model.ResetParticipa
 		if err != nil {
 			return err
 		}
-		if result.Status != model.ResetActivityActive || !now.Before(result.EndsAt) {
+		if result.Status != model.ResetActivityActive || !result.ClosedAt.IsZero() || !now.Before(result.EndsAt) {
 			return ErrResetActivityInactive
 		}
 		participants := tx.Bucket([]byte("reset_participants"))

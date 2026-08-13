@@ -55,6 +55,18 @@ func (s *Service) handleReset(ctx context.Context, event qq.MessageEvent, canoni
 			return s.reply(ctx, event, "手动开启重置活动失败：当前消息缺少唯一标识，请重新发送指令。")
 		}
 	}
+	if subcommand == "stop" || subcommand == "end" {
+		if !s.isAdmin(identity) {
+			return s.reply(ctx, event, "你没有停止或提前截止重置活动的权限。")
+		}
+		if len(fields) != 2 {
+			return s.reply(ctx, event, "格式错误。正确用法：/reset "+subcommand)
+		}
+		if subcommand == "stop" {
+			return s.stopResetActivity(ctx, event, canonical, identity, group)
+		}
+		return s.endResetActivity(ctx, event, canonical, identity, group)
+	}
 	if _, err := s.ensureResetSettings(group); err != nil {
 		return s.reply(ctx, event, "保存当前群的重置监测设置失败，请稍后重试。")
 	}
@@ -160,6 +172,85 @@ func (s *Service) createManualResetActivity(ctx context.Context, event qq.Messag
 		fmt.Sprintf("抽取人数：最多 %d 人", activity.WinnerCount),
 		"补偿内容：获奖者在活动开始前近 " + formatResetDuration(activity.Lookback) + " 的实际消耗额度",
 		"参加方式：/reset join",
+	}, "\n"))
+}
+
+func (s *Service) stopResetActivity(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, group string) error {
+	unlock := s.resetGroups.Lock(group)
+	now := time.Now()
+	activity, stopped, err := s.store.StopResetActivity(group, now)
+	unlock()
+	actor := nonEmpty(canonical, commandRuleActor(identity))
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrResetActivityInactive) {
+		return s.reply(ctx, event, "当前群没有可以停止的重置补偿活动。")
+	}
+	if err != nil {
+		_ = s.store.AddAudit(model.AuditRecord{At: now, Actor: actor, Action: "reset.activity.stop", Target: group, Success: false, Description: err.Error()})
+		s.logger.Error("停止重置补偿活动失败", "group_openid", group, "actor", actor, "error", err)
+		return s.reply(ctx, event, "停止重置补偿活动失败，请稍后重试。")
+	}
+	if !stopped {
+		if activity.Status == model.ResetActivitySettling {
+			return s.reply(ctx, event, "当前活动已经开始结算，可能已有额度正在发放，无法再停止。")
+		}
+		return s.reply(ctx, event, "当前群没有可以停止的重置补偿活动。")
+	}
+	_ = s.store.AddAudit(model.AuditRecord{
+		At: now, Actor: actor, Action: "reset.activity.stop", Target: activity.ID, Success: true,
+		Metadata: map[string]any{"group_openid": group, "participant_count": activity.ParticipantCount},
+	})
+	return s.reply(ctx, event, strings.Join([]string{
+		"当前重置补偿活动已停止。",
+		"活动编号：" + activity.ID,
+		"本轮不抽取用户，也不发放补偿额度。",
+		"当前重置状态：未知。",
+	}, "\n"))
+}
+
+func (s *Service) endResetActivity(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, group string) error {
+	unlock := s.resetGroups.Lock(group)
+	now := time.Now()
+	activity, ended, err := s.store.EndResetActivity(group, now)
+	unlock()
+	actor := nonEmpty(canonical, commandRuleActor(identity))
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrResetActivityInactive) {
+		return s.reply(ctx, event, "当前群没有可以提前截止的重置补偿活动。")
+	}
+	if err != nil {
+		_ = s.store.AddAudit(model.AuditRecord{At: now, Actor: actor, Action: "reset.activity.end", Target: group, Success: false, Description: err.Error()})
+		s.logger.Error("提前截止重置补偿活动失败", "group_openid", group, "actor", actor, "error", err)
+		return s.reply(ctx, event, "提前截止重置补偿活动失败，请稍后重试。")
+	}
+	if !ended {
+		if activity.Status == model.ResetActivitySettling {
+			return s.reply(ctx, event, "当前活动已经截止并正在结算，无需重复操作。")
+		}
+		if activity.Status == model.ResetActivityActive && !now.Before(activity.EndsAt) {
+			_ = s.store.AddAudit(model.AuditRecord{
+				At: now, Actor: actor, Action: "reset.activity.end", Target: activity.ID, Success: true,
+				Description: "活动已自然截止，管理员手动唤醒立即结算",
+				Metadata:    map[string]any{"group_openid": group, "participant_count": activity.ParticipantCount, "winner_count": activity.WinnerCount},
+			})
+			s.wakeResetSettlement()
+			return s.reply(ctx, event, strings.Join([]string{
+				"当前重置补偿活动已经截止，已重新触发立即结算流程。",
+				"活动编号：" + activity.ID,
+				fmt.Sprintf("将从 %d 名参与者中随机抽取最多 %d 人。", activity.ParticipantCount, activity.WinnerCount),
+				"额度发放结果稍后在群内通知。",
+			}, "\n"))
+		}
+		return s.reply(ctx, event, "当前群没有可以提前截止的重置补偿活动。")
+	}
+	_ = s.store.AddAudit(model.AuditRecord{
+		At: now, Actor: actor, Action: "reset.activity.end", Target: activity.ID, Success: true,
+		Metadata: map[string]any{"group_openid": group, "participant_count": activity.ParticipantCount, "winner_count": activity.WinnerCount},
+	})
+	s.wakeResetSettlement()
+	return s.reply(ctx, event, strings.Join([]string{
+		"当前重置补偿活动已提前截止，并已进入立即结算流程。",
+		"活动编号：" + activity.ID,
+		fmt.Sprintf("将从 %d 名参与者中随机抽取最多 %d 人。", activity.ParticipantCount, activity.WinnerCount),
+		"额度发放结果稍后在群内通知。",
 	}, "\n"))
 }
 
@@ -491,10 +582,20 @@ func (s *Service) runResetSettlementWorker(ctx context.Context) {
 			return
 		case <-s.notifyStop:
 			return
+		case <-s.resetSettleWake:
+			s.processDueResetActivities(ctx)
+			s.processDueResetNotifications(ctx)
 		case <-ticker.C:
 			s.processDueResetActivities(ctx)
 			s.processDueResetNotifications(ctx)
 		}
+	}
+}
+
+func (s *Service) wakeResetSettlement() {
+	select {
+	case s.resetSettleWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -758,6 +859,9 @@ func (s *Service) processDueResetNotificationsAt(ctx context.Context, now time.T
 }
 
 func (s *Service) processResetNotificationAt(ctx context.Context, notification model.ResetNotification, now time.Time) {
+	unlock := s.resetGroups.Lock(notification.GroupOpenID)
+	defer unlock()
+
 	if notification.Kind == model.ResetNotificationActivityStarted && notification.NextChunk == 0 {
 		activity, err := s.store.GetResetActivity(notification.ActivityID)
 		if err != nil {
@@ -814,6 +918,9 @@ func (s *Service) processResetNotificationAt(ctx context.Context, notification m
 			return
 		}
 		notification = updated
+		if notification.Status != model.ResetNotificationPending {
+			return
+		}
 	}
 }
 
@@ -1055,6 +1162,8 @@ func resetUsage() string {
 		"/reset last - 查看 Codex Reset API 最新重置事件及状态",
 		"/reset join - 参加正在进行的补偿抽奖",
 		"管理员：/reset new - 按当前设置手动开启新活动",
+		"管理员：/reset stop - 停止当前活动，不抽奖、不发放额度",
+		"管理员：/reset end - 提前截止当前活动并立即结算",
 		"管理员：/reset set duration <时长>",
 		"管理员：/reset set winners <人数>",
 		"管理员：/reset set lookback <时长>",

@@ -413,6 +413,241 @@ func TestResetNewValidatesSyntaxAndMessageIDBeforeCreating(t *testing.T) {
 	}
 }
 
+func TestResetStopAndEndRequireBoundAdminAndExactSyntax(t *testing.T) {
+	for _, command := range []string{"stop", "end"} {
+		t.Run(command, func(t *testing.T) {
+			service, storage, _, qqAPI, _ := testService(t)
+			service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+
+			service.process(context.Background(), groupEvent("g-reset", "ordinary", "/reset "+command))
+			if reply := lastReply(t, qqAPI); !strings.Contains(reply, "尚未绑定") {
+				t.Fatalf("unbound reply=%q", reply)
+			}
+			createBinding(t, storage, "member:g-reset:ordinary", 42)
+			service.process(context.Background(), groupEvent("g-reset", "ordinary", "/reset "+command))
+			if reply := lastReply(t, qqAPI); !strings.Contains(reply, "没有停止或提前截止") {
+				t.Fatalf("non-admin reply=%q", reply)
+			}
+			createBinding(t, storage, "member:g-reset:admin", 43)
+			service.process(context.Background(), groupEvent("g-reset", "admin", "/reset "+command+" extra"))
+			if reply := lastReply(t, qqAPI); reply != "格式错误。正确用法：/reset "+command {
+				t.Fatalf("syntax reply=%q", reply)
+			}
+			if _, err := storage.GetResetSettings("g-reset"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("invalid command changed reset settings: %v", err)
+			}
+		})
+	}
+}
+
+func TestResetStopCancelsActivityWithoutAwardsOrQuota(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+	createBinding(t, storage, "member:g-reset:admin", 43)
+	now := time.Now()
+	activity, created, err := storage.CreateResetActivityFromSignal("g-reset", model.ResetSignal{
+		ID: "manual-stop", Source: manualResetSource, Stage: model.ResetStageConfirmed, OccurredAt: now,
+	}, now)
+	if err != nil || !created {
+		t.Fatalf("create activity=%#v created=%v err=%v", activity, created, err)
+	}
+	if _, joined, err := storage.JoinResetActivity("g-reset", model.ResetParticipant{
+		NewAPIID: 42, CanonicalID: "member:g-reset:u1", MemberOpenID: "u1",
+	}, now.Add(time.Second)); err != nil || !joined {
+		t.Fatalf("join before stop=%v joined=%v", err, joined)
+	}
+	api.usageByUser = []newapi.UsageRecord{{UserID: 42, Quota: 750000}}
+
+	service.process(context.Background(), groupEvent("g-reset", "admin", "/reset stop"))
+	reply := lastReply(t, qqAPI)
+	if !strings.Contains(reply, "已停止") || !strings.Contains(reply, "不抽取用户") || !strings.Contains(reply, "不发放补偿额度") {
+		t.Fatalf("stop reply=%q", reply)
+	}
+	stopped, err := storage.GetResetActivity(activity.ID)
+	if err != nil || stopped.Status != model.ResetActivityStopped || len(stopped.Awards) != 0 {
+		t.Fatalf("stopped activity=%#v err=%v", stopped, err)
+	}
+	if _, err := storage.GetActiveResetActivity("g-reset"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stopped activity remained active: %v", err)
+	}
+	state, err := storage.GetResetGroupState("g-reset")
+	if err != nil || state.Stage != model.ResetStageUnknown || state.ActivityID != "" {
+		t.Fatalf("state after stop=%#v err=%v", state, err)
+	}
+	if due, err := storage.ListDueResetActivities(now.Add(24 * time.Hour)); err != nil || len(due) != 0 {
+		t.Fatalf("stopped activity remained due: %#v err=%v", due, err)
+	}
+	if due, err := storage.ListDueResetNotifications(now.Add(time.Minute), 10); err != nil || len(due) != 0 {
+		t.Fatalf("stopped activity left notification due: %#v err=%v", due, err)
+	}
+	service.processDueResetActivities(context.Background())
+	service.processDueResetNotifications(context.Background())
+	if len(api.quotaAddCalls) != 0 || api.usageUserCalls != 0 {
+		t.Fatalf("stop reached settlement path: quota=%#v usage_calls=%d", api.quotaAddCalls, api.usageUserCalls)
+	}
+	if _, _, err := storage.JoinResetActivity("g-reset", model.ResetParticipant{NewAPIID: 44, CanonicalID: "member:g-reset:u2"}, time.Now()); !errors.Is(err, store.ErrResetActivityInactive) {
+		t.Fatalf("join after stop error=%v", err)
+	}
+}
+
+func TestResetEndClosesJoiningAndUsesExistingSettlement(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+	createBinding(t, storage, "member:g-reset:admin", 43)
+	setting, err := service.ensureResetSettings("g-reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setting.Duration = 5 * time.Hour
+	setting.WinnerCount = 1
+	setting.Lookback = 24 * time.Hour
+	if err := storage.PutResetSettings(setting); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Add(-time.Minute)
+	activity, created, err := storage.CreateResetActivityFromSignal("g-reset", model.ResetSignal{
+		ID: "manual-end", Source: manualResetSource, Stage: model.ResetStageConfirmed, OccurredAt: now,
+	}, now)
+	if err != nil || !created {
+		t.Fatalf("create activity=%#v created=%v err=%v", activity, created, err)
+	}
+	if _, joined, err := storage.JoinResetActivity("g-reset", model.ResetParticipant{
+		NewAPIID: 42, CanonicalID: "member:g-reset:u1", MemberOpenID: "u1",
+	}, now.Add(time.Second)); err != nil || !joined {
+		t.Fatalf("join before end=%v joined=%v", err, joined)
+	}
+	api.usageByUser = []newapi.UsageRecord{{UserID: 42, Username: "alice", Quota: 750000}}
+
+	service.process(context.Background(), groupEvent("g-reset", "admin", "/reset end"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已提前截止") || !strings.Contains(reply, "立即结算") {
+		t.Fatalf("end reply=%q", reply)
+	}
+	ended, err := storage.GetResetActivity(activity.ID)
+	if err != nil || ended.Status != model.ResetActivityActive || ended.EndsAt.After(time.Now()) {
+		t.Fatalf("ended activity=%#v err=%v", ended, err)
+	}
+	if _, _, err := storage.JoinResetActivity("g-reset", model.ResetParticipant{NewAPIID: 44, CanonicalID: "member:g-reset:u2"}, time.Now()); !errors.Is(err, store.ErrResetActivityInactive) {
+		t.Fatalf("join after end error=%v", err)
+	}
+	select {
+	case <-service.resetSettleWake:
+	default:
+		t.Fatal("/reset end did not wake settlement worker")
+	}
+
+	service.processDueResetActivities(context.Background())
+	if len(api.quotaAddCalls) != 1 || api.quotaAddCalls[0] != (quotaAddCall{UserID: 42, Quota: 750000}) {
+		t.Fatalf("quota calls=%#v", api.quotaAddCalls)
+	}
+	if len(api.usageRanges) != 1 || !api.usageRanges[0].End.Equal(activity.StartedAt) || !api.usageRanges[0].Start.Equal(activity.StartedAt.Add(-activity.Lookback)) {
+		t.Fatalf("usage ranges=%#v activity=%#v", api.usageRanges, activity)
+	}
+	completed, err := storage.GetResetActivity(activity.ID)
+	if err != nil || completed.Status != model.ResetActivityCompleted || len(completed.Awards) != 1 || completed.Awards[0].Status != model.ResetAwardGranted {
+		t.Fatalf("completed activity=%#v err=%v", completed, err)
+	}
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "重置补偿抽奖已结束") || !strings.Contains(reply, "1.5 额度") {
+		t.Fatalf("completion reply=%q", reply)
+	}
+}
+
+func TestResetEndWakesNaturallyExpiredActivityBeforeWorkerRuns(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+	createBinding(t, storage, "member:g-reset:admin", 43)
+	setting, err := service.ensureResetSettings("g-reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setting.Duration = time.Hour
+	setting.WinnerCount = 1
+	setting.Lookback = 24 * time.Hour
+	if err := storage.PutResetSettings(setting); err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now().Add(-2 * time.Hour)
+	activity, created, err := storage.CreateResetActivityFromSignal("g-reset", model.ResetSignal{
+		ID: "naturally-expired-end", Source: manualResetSource, Stage: model.ResetStageConfirmed, OccurredAt: startedAt,
+	}, startedAt)
+	if err != nil || !created || activity.EndsAt.After(time.Now()) {
+		t.Fatalf("create expired activity=%#v created=%v err=%v", activity, created, err)
+	}
+	if _, joined, err := storage.JoinResetActivity("g-reset", model.ResetParticipant{
+		NewAPIID: 42, CanonicalID: "member:g-reset:u1", MemberOpenID: "u1",
+	}, startedAt.Add(time.Minute)); err != nil || !joined {
+		t.Fatalf("join before natural expiry=%v joined=%v", err, joined)
+	}
+	api.usageByUser = []newapi.UsageRecord{{UserID: 42, Username: "alice", Quota: 500000}}
+
+	service.process(context.Background(), groupEvent("g-reset", "admin", "/reset end"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已经截止") || !strings.Contains(reply, "重新触发立即结算") {
+		t.Fatalf("end expired reply=%q", reply)
+	}
+	closed, err := storage.GetResetActivity(activity.ID)
+	if err != nil || closed.ClosedAt.IsZero() || closed.ClosedAt.Before(activity.EndsAt) {
+		t.Fatalf("naturally expired activity was not closed=%#v err=%v", closed, err)
+	}
+	select {
+	case <-service.resetSettleWake:
+	default:
+		t.Fatal("/reset end did not wake settlement for naturally expired activity")
+	}
+
+	service.processDueResetActivities(context.Background())
+	if len(api.quotaAddCalls) != 1 || api.quotaAddCalls[0] != (quotaAddCall{UserID: 42, Quota: 500000}) {
+		t.Fatalf("quota calls=%#v", api.quotaAddCalls)
+	}
+	if len(api.usageRanges) != 1 || !api.usageRanges[0].End.Equal(activity.StartedAt) || !api.usageRanges[0].Start.Equal(activity.StartedAt.Add(-activity.Lookback)) {
+		t.Fatalf("usage ranges=%#v activity=%#v", api.usageRanges, activity)
+	}
+	completed, err := storage.GetResetActivity(activity.ID)
+	if err != nil || completed.Status != model.ResetActivityCompleted {
+		t.Fatalf("completed activity=%#v err=%v", completed, err)
+	}
+}
+
+func TestResetEndRepeatedBeforeWorkerSettlementRemainsIdempotentAndWakes(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+	createBinding(t, storage, "member:g-reset:admin", 43)
+	now := time.Now()
+	activity, created, err := storage.CreateResetActivityFromSignal("g-reset", model.ResetSignal{
+		ID: "repeat-end", Source: manualResetSource, Stage: model.ResetStageConfirmed, OccurredAt: now,
+	}, now)
+	if err != nil || !created {
+		t.Fatalf("create activity=%#v created=%v err=%v", activity, created, err)
+	}
+
+	first := groupEvent("g-reset", "admin", "/reset end")
+	first.Message.ID = "reset-end-first"
+	service.process(context.Background(), first)
+	select {
+	case <-service.resetSettleWake:
+	default:
+		t.Fatal("first /reset end did not wake settlement")
+	}
+	ended, err := storage.GetResetActivity(activity.ID)
+	if err != nil || ended.Status != model.ResetActivityActive || ended.EndsAt.After(time.Now()) {
+		t.Fatalf("first end activity=%#v err=%v", ended, err)
+	}
+
+	second := groupEvent("g-reset", "admin", "/reset end")
+	second.Message.ID = "reset-end-second"
+	service.process(context.Background(), second)
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已经截止") || !strings.Contains(reply, "结算") {
+		t.Fatalf("repeated end reply=%q", reply)
+	}
+	select {
+	case <-service.resetSettleWake:
+	default:
+		t.Fatal("repeated /reset end did not wake settlement")
+	}
+	repeated, err := storage.GetResetActivity(activity.ID)
+	if err != nil || repeated.Status != model.ResetActivityActive || !repeated.EndsAt.Equal(ended.EndsAt) {
+		t.Fatalf("repeated end changed activity=%#v first=%#v err=%v", repeated, ended, err)
+	}
+}
+
 func TestResetCheckShowsPossibleAndImminentStages(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -597,6 +832,48 @@ func TestResetNotificationOutboxResumesAtFailedChunk(t *testing.T) {
 	}
 }
 
+func TestResetNotificationStopsAfterConcurrentSupersede(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	now := time.Now()
+	signal := model.ResetSignal{
+		ID:         "x:outbox-superseded-during-send",
+		Source:     "test",
+		Stage:      model.ResetStagePossible,
+		Summary:    "possible reset",
+		OccurredAt: now,
+		DetectedAt: now,
+		UpdatedAt:  now,
+	}
+	service.processResetSignalForGroup(context.Background(), "g-reset", signal)
+	due, err := storage.ListDueResetNotifications(now, 1)
+	if err != nil || len(due) != 1 {
+		t.Fatalf("due=%#v err=%v", due, err)
+	}
+	chunks := []string{"first frozen chunk", "second frozen chunk"}
+	if _, err := storage.PrepareResetNotification(due[0].ID, chunks, now); err != nil {
+		t.Fatal(err)
+	}
+	var hookErr error
+	qqAPI.groupReplyHook = func(call int) {
+		if call == 1 {
+			hookErr = storage.MarkResetNotificationSuperseded(due[0].ID, now.Add(time.Second))
+		}
+	}
+	service.processDueResetNotificationsAt(context.Background(), now)
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if got := replyCount(qqAPI); got != 1 || lastReply(t, qqAPI) != chunks[0] {
+		t.Fatalf("superseded send replies=%d last=%q", got, lastReply(t, qqAPI))
+	}
+	if qqAPI.groupReplies != 1 {
+		t.Fatalf("superseded notification sent repeatedly: group calls=%d", qqAPI.groupReplies)
+	}
+	if due, err := storage.ListDueResetNotifications(now.Add(time.Hour), 10); err != nil || len(due) != 0 {
+		t.Fatalf("superseded notification remained due=%#v err=%v", due, err)
+	}
+}
+
 func TestResetNotificationRenderFailureIsRetried(t *testing.T) {
 	service, storage, _, _, _ := testService(t)
 	now := time.Now()
@@ -746,6 +1023,30 @@ func TestDisabledResetNewOnlyHidesResetNewHelp(t *testing.T) {
 		if !strings.Contains(reply, command) {
 			t.Fatalf("disabling reset new hid %s: %q", command, reply)
 		}
+	}
+}
+
+func TestDisabledResetStopAndEndOnlyHideMatchingHelp(t *testing.T) {
+	for _, command := range []string{"stop", "end"} {
+		t.Run(command, func(t *testing.T) {
+			service, _, _, qqAPI, _ := testService(t)
+			service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+			service.process(context.Background(), groupEvent("g-reset", "admin", `/disable "reset `+command+`"`))
+			service.process(context.Background(), groupEvent("g-reset", "ordinary", "/help"))
+			reply := lastReply(t, qqAPI)
+			if strings.Contains(reply, "/reset "+command) {
+				t.Fatalf("disabled command remained in help: %q", reply)
+			}
+			other := "end"
+			if command == "end" {
+				other = "stop"
+			}
+			for _, wanted := range []string{"/reset check", "/reset new", "/reset " + other} {
+				if !strings.Contains(reply, wanted) {
+					t.Fatalf("disabling reset %s hid %s: %q", command, wanted, reply)
+				}
+			}
+		})
 	}
 }
 

@@ -158,6 +158,7 @@ const (
 	ResetActivityActive    ResetActivityStatus = "active"
 	ResetActivitySettling  ResetActivityStatus = "settling"
 	ResetActivityCompleted ResetActivityStatus = "completed"
+	ResetActivityStopped   ResetActivityStatus = "stopped"
 )
 
 type ResetAwardStatus string
@@ -263,12 +264,14 @@ type ResetActivity struct {
 	Status           ResetActivityStatus `json:"status"`
 	StartedAt        time.Time           `json:"started_at"`
 	EndsAt           time.Time           `json:"ends_at"`
+	ClosedAt         time.Time           `json:"closed_at,omitempty"`
 	WinnerCount      int                 `json:"winner_count"`
 	Lookback         time.Duration       `json:"lookback"`
 	ParticipantCount int                 `json:"participant_count"`
 	Awards           []ResetAward        `json:"awards,omitempty"`
 	SelectedAt       time.Time           `json:"selected_at,omitempty"`
 	CompletedAt      time.Time           `json:"completed_at,omitempty"`
+	StoppedAt        time.Time           `json:"stopped_at,omitempty"`
 	UpdatedAt        time.Time           `json:"updated_at"`
 }
 

@@ -229,6 +229,7 @@ type fakeQQ struct {
 	groupReplyErr   error
 	groupReplyErrAt int
 	groupReplies    int
+	groupReplyHook  func(int)
 	joinApprovals   []qq.GroupJoinRequest
 	muteState       qq.GroupMuteState
 	muteMember      string
@@ -244,12 +245,18 @@ func (f *fakeQQ) ReplyC2C(_ context.Context, _, _, content string) error {
 }
 func (f *fakeQQ) ReplyGroup(_ context.Context, _, _, content string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.groupReplies++
-	if f.groupReplyErr != nil && (f.groupReplyErrAt == 0 || f.groupReplyErrAt == f.groupReplies) {
+	call := f.groupReplies
+	hook := f.groupReplyHook
+	if f.groupReplyErr != nil && (f.groupReplyErrAt == 0 || f.groupReplyErrAt == call) {
+		f.mu.Unlock()
 		return f.groupReplyErr
 	}
 	f.messages = append(f.messages, content)
+	f.mu.Unlock()
+	if hook != nil {
+		hook(call)
+	}
 	return nil
 }
 func (f *fakeQQ) ReviewGroupJoinRequest(_ context.Context, group, member, requestID, operation, _ string, _ bool) error {

@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -472,6 +473,543 @@ func TestCreateResetActivityConcurrentAndJoinUnique(t *testing.T) {
 	}
 }
 
+func TestStopResetActivityIsAtomicIdempotentAndDoesNotSettle(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	stateBefore := model.ResetGroupState{
+		GroupOpenID:     "group-a",
+		Stage:           model.ResetStageUnknown,
+		LastCompletedAt: now.Add(-24 * time.Hour),
+		UpdatedAt:       now.Add(-24 * time.Hour),
+	}
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		data, err := json.Marshal(stateBefore)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket([]byte("reset_group_states")).Put([]byte("group-a"), data)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("stop-confirmed", model.ResetStageConfirmed, now), now)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	if _, joined, err := s.JoinResetActivity("group-a", model.ResetParticipant{NewAPIID: 7, CanonicalID: "user:seven"}, now.Add(time.Minute)); err != nil || !joined {
+		t.Fatalf("join=%v err=%v", joined, err)
+	}
+
+	const attempts = 8
+	var wg sync.WaitGroup
+	results := make(chan bool, attempts)
+	errs := make(chan error, attempts)
+	stoppedAt := now.Add(2 * time.Minute)
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, stopped, err := s.StopResetActivity("group-a", stoppedAt)
+			results <- stopped
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil && !errors.Is(err, ErrResetActivityInactive) {
+			t.Fatal(err)
+		}
+	}
+	stoppedCount := 0
+	for stopped := range results {
+		if stopped {
+			stoppedCount++
+		}
+	}
+	if stoppedCount != 1 {
+		t.Fatalf("stopped count=%d, want 1", stoppedCount)
+	}
+	stored, err := s.GetResetActivity(activity.ID)
+	if err != nil || stored.Status != model.ResetActivityStopped || !stored.StoppedAt.Equal(stoppedAt) || len(stored.Awards) != 0 {
+		t.Fatalf("stopped activity=%#v err=%v", stored, err)
+	}
+	if _, err := s.GetActiveResetActivity("group-a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("active activity remained: %v", err)
+	}
+	state, err := s.GetResetGroupState("group-a")
+	if err != nil || state.Stage != model.ResetStageUnknown || state.SignalID != "" || state.ActivityID != "" || !state.LastCompletedAt.Equal(stoppedAt) {
+		t.Fatalf("state=%#v err=%v", state, err)
+	}
+	if due, err := s.ListDueResetActivities(activity.EndsAt.Add(time.Hour)); err != nil || len(due) != 0 {
+		t.Fatalf("stopped activity remained due: %#v err=%v", due, err)
+	}
+	if _, _, err := s.BeginResetSettlement(activity.ID, []model.ResetAward{{NewAPIID: 7, RawQuota: 1}}, activity.EndsAt); !errors.Is(err, ErrResetActivityInactive) {
+		t.Fatalf("stopped activity began settlement: %v", err)
+	}
+	if _, err := s.CompleteResetActivity(activity.ID, stoppedAt); !errors.Is(err, ErrResetActivityInactive) {
+		t.Fatalf("stopped activity completed: %v", err)
+	}
+	notifications, err := s.ListDueResetNotifications(activity.EndsAt.Add(time.Hour), 10)
+	if err != nil || len(notifications) != 0 {
+		t.Fatalf("stopped notifications=%#v err=%v", notifications, err)
+	}
+}
+
+func TestStopResetActivitySupersedesPartiallySentStartNotification(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("partial-start", model.ResetStageConfirmed, now), now)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	notifications, err := s.ListDueResetNotifications(now.Add(time.Minute), 10)
+	if err != nil || len(notifications) != 1 || notifications[0].Kind != model.ResetNotificationActivityStarted {
+		t.Fatalf("notifications=%#v err=%v", notifications, err)
+	}
+	prepared, err := s.PrepareResetNotification(notifications[0].ID, []string{"first", "second"}, now)
+	if err != nil || len(prepared.Chunks) != 2 {
+		t.Fatalf("prepared=%#v err=%v", prepared, err)
+	}
+	if _, err := s.MarkResetNotificationChunkSent(notifications[0].ID, 0, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, stopped, err := s.StopResetActivity("group-a", now.Add(2*time.Second)); err != nil || !stopped {
+		t.Fatalf("stopped=%v err=%v", stopped, err)
+	}
+	if due, err := s.ListDueResetNotifications(now.Add(time.Minute), 10); err != nil || len(due) != 0 {
+		t.Fatalf("partially sent notification remained due=%#v err=%v", due, err)
+	}
+	var stoppedNotification model.ResetNotification
+	err = s.db.View(func(tx *bolt.Tx) error {
+		var getErr error
+		stoppedNotification, getErr = getResetNotificationTx(tx, notifications[0].ID)
+		return getErr
+	})
+	if err != nil || stoppedNotification.Status != model.ResetNotificationSuperseded || stoppedNotification.NextChunk != 1 {
+		t.Fatalf("partially sent notification=%#v err=%v", stoppedNotification, err)
+	}
+}
+
+func TestStopResetActivityRollsBackWhenNotificationUpdateFails(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("stop-rollback", model.ResetStageConfirmed, now), now)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		return tx.DeleteBucket([]byte("reset_notification_due"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, stopped, err := s.StopResetActivity("group-a", now.Add(time.Minute)); err == nil || stopped {
+		t.Fatalf("stop changed=%v err=%v, want rollback", stopped, err)
+	}
+	stored, err := s.GetResetActivity(activity.ID)
+	if err != nil || stored.Status != model.ResetActivityActive || !stored.StoppedAt.IsZero() {
+		t.Fatalf("activity after rollback=%#v err=%v", stored, err)
+	}
+	active, err := s.GetActiveResetActivity("group-a")
+	if err != nil || active.ID != activity.ID {
+		t.Fatalf("active after rollback=%#v err=%v", active, err)
+	}
+	state, err := s.GetResetGroupState("group-a")
+	if err != nil || state.Stage != model.ResetStageConfirmed || state.ActivityID != activity.ID {
+		t.Fatalf("state after rollback=%#v err=%v", state, err)
+	}
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucket([]byte("reset_notification_due"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, stopped, err := s.StopResetActivity("group-a", now.Add(2*time.Minute)); err != nil || !stopped {
+		t.Fatalf("stop after repair changed=%v err=%v", stopped, err)
+	}
+}
+
+func TestEndResetActivityMakesItImmediatelyDueAndSettlementStartsOnce(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	setting, err := s.GetOrCreateResetSettings("group-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setting.Duration = time.Hour
+	setting.WinnerCount = 1
+	if err := s.PutResetSettings(setting); err != nil {
+		t.Fatal(err)
+	}
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("end-confirmed", model.ResetStageConfirmed, now), now)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	if _, joined, err := s.JoinResetActivity("group-a", model.ResetParticipant{NewAPIID: 9, CanonicalID: "user:nine"}, now.Add(time.Minute)); err != nil || !joined {
+		t.Fatalf("join=%v err=%v", joined, err)
+	}
+	endedAt := now.Add(2 * time.Minute)
+	if ended, changed, err := s.EndResetActivity("group-a", endedAt); err != nil || !changed || !ended.EndsAt.Equal(endedAt) || ended.Status != model.ResetActivityActive {
+		t.Fatalf("ended=%#v changed=%v err=%v", ended, changed, err)
+	}
+	if ended, changed, err := s.EndResetActivity("group-a", endedAt.Add(time.Minute)); err != nil || changed || !ended.EndsAt.Equal(endedAt) {
+		t.Fatalf("second end=%#v changed=%v err=%v", ended, changed, err)
+	}
+	if due, err := s.ListDueResetActivities(endedAt.Add(-time.Nanosecond)); err != nil || len(due) != 0 {
+		t.Fatalf("early due=%#v err=%v", due, err)
+	}
+	due, err := s.ListDueResetActivities(endedAt)
+	if err != nil || len(due) != 1 || due[0].ID != activity.ID {
+		t.Fatalf("due=%#v err=%v", due, err)
+	}
+
+	const attempts = 8
+	var wg sync.WaitGroup
+	starts := make(chan bool, attempts)
+	errs := make(chan error, attempts)
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, started, err := s.BeginResetSettlement(activity.ID, []model.ResetAward{{NewAPIID: 9, RawQuota: 10}}, endedAt)
+			starts <- started
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(starts)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	startedCount := 0
+	for started := range starts {
+		if started {
+			startedCount++
+		}
+	}
+	if startedCount != 1 {
+		t.Fatalf("settlement start count=%d, want 1", startedCount)
+	}
+	settling, err := s.GetResetActivity(activity.ID)
+	if err != nil || settling.Status != model.ResetActivitySettling || len(settling.Awards) != 1 {
+		t.Fatalf("settling=%#v err=%v", settling, err)
+	}
+	state, err := s.GetResetGroupState("group-a")
+	if err != nil || state.Stage != model.ResetStageConfirmed || state.ActivityID != activity.ID {
+		t.Fatalf("state before completion=%#v err=%v", state, err)
+	}
+	notifications, err := s.ListDueResetNotifications(endedAt.Add(time.Minute), 10)
+	if err != nil || len(notifications) != 0 {
+		t.Fatalf("end left obsolete start notification due=%#v err=%v", notifications, err)
+	}
+}
+
+func TestEndResetActivityRejectsJoinUsingStaleNow(t *testing.T) {
+	s := openTestStore(t)
+	startedAt := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("end-stale-join", model.ResetStageConfirmed, startedAt), startedAt)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+
+	staleJoinNow := startedAt.Add(time.Minute)
+	endedAt := startedAt.Add(2 * time.Minute)
+	ended, changed, err := s.EndResetActivity("group-a", endedAt)
+	if err != nil || !changed || !ended.ClosedAt.Equal(endedAt) {
+		t.Fatalf("ended=%#v changed=%v err=%v", ended, changed, err)
+	}
+	if !staleJoinNow.Before(ended.EndsAt) {
+		t.Fatalf("test setup invalid: stale now=%v ends_at=%v", staleJoinNow, ended.EndsAt)
+	}
+
+	participant := model.ResetParticipant{NewAPIID: 17, CanonicalID: "user:seventeen"}
+	joinedActivity, joined, err := s.JoinResetActivity("group-a", participant, staleJoinNow)
+	if !errors.Is(err, ErrResetActivityInactive) || joined {
+		t.Fatalf("stale join activity=%#v joined=%v err=%v", joinedActivity, joined, err)
+	}
+	stored, err := s.GetResetActivity(activity.ID)
+	if err != nil || !stored.ClosedAt.Equal(endedAt) || stored.ParticipantCount != 0 {
+		t.Fatalf("stored activity=%#v err=%v", stored, err)
+	}
+	if participants, err := s.ListResetParticipants(activity.ID); err != nil || len(participants) != 0 {
+		t.Fatalf("participants=%#v err=%v", participants, err)
+	}
+}
+
+func TestEndNaturallyExpiredActivityRejectsJoinUsingStaleNow(t *testing.T) {
+	s := openTestStore(t)
+	startedAt := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("natural-end-stale-join", model.ResetStageConfirmed, startedAt), startedAt)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	staleJoinNow := activity.EndsAt.Add(-time.Second)
+	commandAt := activity.EndsAt.Add(time.Second)
+	ended, changed, err := s.EndResetActivity("group-a", commandAt)
+	if err != nil || changed || !ended.ClosedAt.Equal(commandAt) {
+		t.Fatalf("ended=%#v changed=%v err=%v", ended, changed, err)
+	}
+	if _, joined, err := s.JoinResetActivity("group-a", model.ResetParticipant{NewAPIID: 18, CanonicalID: "user:eighteen"}, staleJoinNow); !errors.Is(err, ErrResetActivityInactive) || joined {
+		t.Fatalf("stale natural-expiry join joined=%v err=%v", joined, err)
+	}
+	if participants, err := s.ListResetParticipants(activity.ID); err != nil || len(participants) != 0 {
+		t.Fatalf("participants=%#v err=%v", participants, err)
+	}
+}
+
+func TestStopRejectsEndedOrNaturallyExpiredActivity(t *testing.T) {
+	tests := []struct {
+		name       string
+		endFirst   bool
+		stopOffset time.Duration
+	}{
+		{name: "ended", endFirst: true, stopOffset: 2 * time.Minute},
+		{name: "naturally_expired", stopOffset: model.DefaultResetDuration + time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := openTestStore(t)
+			startedAt := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+			activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("stop-after-"+test.name, model.ResetStageConfirmed, startedAt), startedAt)
+			if err != nil || !created {
+				t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+			}
+			if test.endFirst {
+				if _, ended, err := s.EndResetActivity("group-a", startedAt.Add(time.Minute)); err != nil || !ended {
+					t.Fatalf("end changed=%v err=%v", ended, err)
+				}
+			}
+			if _, stopped, err := s.StopResetActivity("group-a", startedAt.Add(test.stopOffset)); !errors.Is(err, ErrResetActivityInactive) || stopped {
+				t.Fatalf("stop changed=%v err=%v", stopped, err)
+			}
+			stored, err := s.GetResetActivity(activity.ID)
+			if err != nil || stored.Status != model.ResetActivityActive || !stored.StoppedAt.IsZero() {
+				t.Fatalf("stored activity=%#v err=%v", stored, err)
+			}
+		})
+	}
+}
+
+func TestStopResetActivityAdvancesSignalWatermark(t *testing.T) {
+	s := openTestStore(t)
+	startedAt := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("stop-watermark-initial", model.ResetStageConfirmed, startedAt), startedAt)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+
+	stoppedAt := startedAt.Add(2 * time.Minute)
+	if _, stopped, err := s.StopResetActivity("group-a", stoppedAt); err != nil || !stopped {
+		t.Fatalf("stopped=%v err=%v", stopped, err)
+	}
+	state, err := s.GetResetGroupState("group-a")
+	if err != nil || !state.LastCompletedAt.Equal(stoppedAt) {
+		t.Fatalf("state=%#v err=%v", state, err)
+	}
+
+	oldSignal := resetTestSignal("stop-watermark-old", model.ResetStageConfirmed, stoppedAt)
+	if got, created, err := s.CreateResetActivityFromSignal("group-a", oldSignal, stoppedAt.Add(time.Minute)); err != nil || created || got.ID != "" {
+		t.Fatalf("old signal activity=%#v created=%v err=%v", got, created, err)
+	}
+	if _, err := s.GetActiveResetActivity("group-a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old signal opened an activity: %v", err)
+	}
+
+	newSignal := resetTestSignal("stop-watermark-new", model.ResetStageConfirmed, stoppedAt.Add(time.Nanosecond))
+	newActivity, created, err := s.CreateResetActivityFromSignal("group-a", newSignal, stoppedAt.Add(2*time.Minute))
+	if err != nil || !created || newActivity.SignalID != newSignal.ID {
+		t.Fatalf("new signal activity=%#v created=%v err=%v", newActivity, created, err)
+	}
+}
+
+func TestEndResetActivitySupersedesPartiallySentStartNotification(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("partial-end-start", model.ResetStageConfirmed, now), now)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	notifications, err := s.ListDueResetNotifications(now.Add(time.Minute), 10)
+	if err != nil || len(notifications) != 1 || notifications[0].Kind != model.ResetNotificationActivityStarted {
+		t.Fatalf("notifications=%#v err=%v", notifications, err)
+	}
+	prepared, err := s.PrepareResetNotification(notifications[0].ID, []string{"first", "second"}, now)
+	if err != nil || len(prepared.Chunks) != 2 {
+		t.Fatalf("prepared=%#v err=%v", prepared, err)
+	}
+	if _, err := s.MarkResetNotificationChunkSent(notifications[0].ID, 0, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ended, err := s.EndResetActivity("group-a", now.Add(2*time.Second)); err != nil || !ended {
+		t.Fatalf("ended=%v err=%v", ended, err)
+	}
+	if due, err := s.ListDueResetNotifications(now.Add(time.Minute), 10); err != nil || len(due) != 0 {
+		t.Fatalf("partially sent notification remained due=%#v err=%v", due, err)
+	}
+	var endedNotification model.ResetNotification
+	err = s.db.View(func(tx *bolt.Tx) error {
+		var getErr error
+		endedNotification, getErr = getResetNotificationTx(tx, notifications[0].ID)
+		return getErr
+	})
+	if err != nil || endedNotification.Status != model.ResetNotificationSuperseded || endedNotification.NextChunk != 1 {
+		t.Fatalf("partially sent notification=%#v err=%v", endedNotification, err)
+	}
+}
+
+func TestEndResetActivityDueIndexRecoversAfterReopen(t *testing.T) {
+	path := t.TempDir() + "/end-reopen.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("end-reopen", model.ResetStageConfirmed, now), now)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	endedAt := now.Add(time.Minute)
+	if _, ended, err := s.EndResetActivity("group-a", endedAt); err != nil || !ended {
+		t.Fatalf("end changed=%v err=%v", ended, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	due, err := s.ListDueResetActivities(endedAt)
+	if err != nil || len(due) != 1 || due[0].ID != activity.ID || !due[0].EndsAt.Equal(endedAt) {
+		t.Fatalf("recovered due=%#v err=%v", due, err)
+	}
+}
+
+func TestStopAndEndResetActivityTerminalStatusesAreNoOps(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	activity, _, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("terminal-confirmed", model.ResetStageConfirmed, now), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endedAt := now.Add(time.Minute)
+	if _, changed, err := s.EndResetActivity("group-a", endedAt); err != nil || !changed {
+		t.Fatalf("end changed=%v err=%v", changed, err)
+	}
+	if _, started, err := s.BeginResetSettlement(activity.ID, nil, endedAt); err != nil || !started {
+		t.Fatalf("settlement started=%v err=%v", started, err)
+	}
+	if current, changed, err := s.StopResetActivity("group-a", endedAt); err != nil || changed || current.Status != model.ResetActivitySettling {
+		t.Fatalf("stop settling current=%#v changed=%v err=%v", current, changed, err)
+	}
+	if current, changed, err := s.EndResetActivity("group-a", endedAt); err != nil || changed || current.Status != model.ResetActivitySettling {
+		t.Fatalf("end settling current=%#v changed=%v err=%v", current, changed, err)
+	}
+	completed, err := s.CompleteResetActivity(activity.ID, endedAt.Add(time.Minute))
+	if err != nil || completed.Status != model.ResetActivityCompleted {
+		t.Fatalf("completed=%#v err=%v", completed, err)
+	}
+	if current, changed, err := s.StopResetActivity("group-a", endedAt.Add(2*time.Minute)); !errors.Is(err, ErrResetActivityInactive) || changed || current.ID != "" {
+		t.Fatalf("stop completed current=%#v changed=%v err=%v", current, changed, err)
+	}
+	if current, changed, err := s.EndResetActivity("group-a", endedAt.Add(2*time.Minute)); !errors.Is(err, ErrResetActivityInactive) || changed || current.ID != "" {
+		t.Fatalf("end completed current=%#v changed=%v err=%v", current, changed, err)
+	}
+	if _, changed, err := s.StopResetActivity("missing", endedAt); !errors.Is(err, ErrResetActivityInactive) || changed {
+		t.Fatalf("stop missing changed=%v err=%v", changed, err)
+	}
+	if _, changed, err := s.EndResetActivity("missing", endedAt); !errors.Is(err, ErrResetActivityInactive) || changed {
+		t.Fatalf("end missing changed=%v err=%v", changed, err)
+	}
+}
+
+func TestStopResetActivityAndBeginSettlementRaceHasSingleWinner(t *testing.T) {
+	s := openTestStore(t)
+	base := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for attempt := 0; attempt < 16; attempt++ {
+		group := fmt.Sprintf("race-group-%d", attempt)
+		setting, err := s.GetOrCreateResetSettings(group)
+		if err != nil {
+			t.Fatal(err)
+		}
+		setting.Duration = time.Minute
+		setting.WinnerCount = 1
+		if err := s.PutResetSettings(setting); err != nil {
+			t.Fatal(err)
+		}
+		startedAt := base.Add(time.Duration(attempt) * time.Hour)
+		activity, created, err := s.CreateResetActivityFromSignal(group, resetTestSignal(fmt.Sprintf("race-%d", attempt), model.ResetStageConfirmed, startedAt), startedAt)
+		if err != nil || !created {
+			t.Fatalf("attempt %d activity=%#v created=%v err=%v", attempt, activity, created, err)
+		}
+		if _, joined, err := s.JoinResetActivity(group, model.ResetParticipant{NewAPIID: attempt + 1, CanonicalID: fmt.Sprintf("user:%d", attempt+1)}, startedAt.Add(time.Second)); err != nil || !joined {
+			t.Fatalf("attempt %d join=%v err=%v", attempt, joined, err)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var stopResult model.ResetActivity
+		var stopChanged bool
+		var stopErr error
+		var settleResult model.ResetActivity
+		var settlementStarted bool
+		var settlementErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			stopResult, stopChanged, stopErr = s.StopResetActivity(group, activity.EndsAt.Add(-time.Nanosecond))
+		}()
+		go func(userID int) {
+			defer wg.Done()
+			<-start
+			settleResult, settlementStarted, settlementErr = s.BeginResetSettlement(activity.ID, []model.ResetAward{{NewAPIID: userID, RawQuota: 10}}, activity.EndsAt)
+		}(attempt + 1)
+		close(start)
+		wg.Wait()
+
+		if stopErr != nil {
+			t.Fatalf("attempt %d stop err=%v", attempt, stopErr)
+		}
+		if stopChanged == settlementStarted {
+			t.Fatalf("attempt %d stop_changed=%v settlement_started=%v stop=%#v settlement=%#v settlement_err=%v", attempt, stopChanged, settlementStarted, stopResult, settleResult, settlementErr)
+		}
+		stored, err := s.GetResetActivity(activity.ID)
+		if err != nil {
+			t.Fatalf("attempt %d get activity: %v", attempt, err)
+		}
+		if stopChanged {
+			if !errors.Is(settlementErr, ErrResetActivityInactive) || stored.Status != model.ResetActivityStopped || len(stored.Awards) != 0 {
+				t.Fatalf("attempt %d stop won: activity=%#v settlement=%#v settlement_err=%v", attempt, stored, settleResult, settlementErr)
+			}
+			if _, err := s.GetActiveResetActivity(group); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("attempt %d stopped activity remained active: %v", attempt, err)
+			}
+			if due, err := s.ListDueResetActivities(activity.EndsAt); err != nil {
+				t.Fatalf("attempt %d list due activities: %v", attempt, err)
+			} else {
+				for _, candidate := range due {
+					if candidate.ID == activity.ID {
+						t.Fatalf("attempt %d stopped activity remained due=%#v", attempt, due)
+					}
+				}
+			}
+			continue
+		}
+		if settlementErr != nil || stopResult.Status != model.ResetActivitySettling || stored.Status != model.ResetActivitySettling || len(stored.Awards) != 1 {
+			t.Fatalf("attempt %d settlement won: stop=%#v settlement=%#v stored=%#v settlement_err=%v", attempt, stopResult, settleResult, stored, settlementErr)
+		}
+		active, err := s.GetActiveResetActivity(group)
+		if err != nil || active.ID != activity.ID {
+			t.Fatalf("attempt %d settling activity missing active index=%#v err=%v", attempt, active, err)
+		}
+	}
+}
+
 func TestResetSettlementPersistsAwardsAndCompletesToUnknown(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
@@ -823,6 +1361,9 @@ func TestResetIndexesRecoverAfterReopen(t *testing.T) {
 		if err := clearBucketTx(tx.Bucket([]byte("reset_due_activities"))); err != nil {
 			return err
 		}
+		if err := clearBucketTx(tx.Bucket([]byte("reset_active_by_group"))); err != nil {
+			return err
+		}
 		return clearBucketTx(tx.Bucket([]byte("reset_notification_due")))
 	}); err != nil {
 		t.Fatal(err)
@@ -846,6 +1387,27 @@ func TestResetIndexesRecoverAfterReopen(t *testing.T) {
 	}
 	if due, err := s.ListDueResetActivities(activity.EndsAt); err != nil || len(due) != 1 || due[0].ID != activity.ID {
 		t.Fatalf("recovered activities=%#v err=%v", due, err)
+	}
+	if active, err := s.GetActiveResetActivity("group-a"); err != nil || active.ID != activity.ID {
+		t.Fatalf("recovered active activity=%#v err=%v", active, err)
+	}
+}
+
+func TestStopAndEndIgnoreHistoricalActivitiesWithoutActiveIndex(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("historical-stop-end", model.ResetStageConfirmed, now), now)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	if _, stopped, err := s.StopResetActivity("group-a", now.Add(time.Minute)); err != nil || !stopped {
+		t.Fatalf("stop changed=%v err=%v", stopped, err)
+	}
+	if current, changed, err := s.StopResetActivity("group-a", now.Add(2*time.Minute)); !errors.Is(err, ErrResetActivityInactive) || changed || current.ID != "" {
+		t.Fatalf("second stop current=%#v changed=%v err=%v", current, changed, err)
+	}
+	if current, changed, err := s.EndResetActivity("group-a", now.Add(2*time.Minute)); !errors.Is(err, ErrResetActivityInactive) || changed || current.ID != "" {
+		t.Fatalf("end historical current=%#v changed=%v err=%v", current, changed, err)
 	}
 }
 

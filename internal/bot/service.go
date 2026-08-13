@@ -105,6 +105,8 @@ type Service struct {
 	resetRadar       resetRadarClient
 	resetMu          sync.Mutex
 	resetNotifyMu    sync.Mutex
+	resetGroups      keyedLocker[string]
+	resetSettleWake  chan struct{}
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
@@ -116,7 +118,7 @@ func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI
 	}
 	service := &Service{
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
-		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1),
+		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1), resetSettleWake: make(chan struct{}, 1),
 	}
 	if cfg.ResetEnabled {
 		service.resetRadar = resetradar.NewScanner(cfg.ResetHTTPTimeout, cfg.ResetSignalMaxAge)
@@ -1539,6 +1541,8 @@ func helpText(cfg config.Config) string {
 			"/reset last - 查看 Codex Reset API 最新重置事件及状态",
 			"/reset join - 参加当前群正在进行的重置补偿抽奖",
 			"管理员：/reset new - 按当前群设置手动开启新活动",
+			"管理员：/reset stop - 停止当前活动，不抽奖、不发放额度",
+			"管理员：/reset end - 提前截止当前活动并立即结算",
 			"管理员：/reset set duration <时长> - 设置下一轮活动有效期",
 			"管理员：/reset set winners <人数> - 设置下一轮抽取人数",
 			"管理员：/reset set lookback <时长> - 设置下一轮补偿回溯时间",
