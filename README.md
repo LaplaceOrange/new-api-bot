@@ -83,12 +83,13 @@
 | `/confirm <一次性操作码>` | 管理员 | 确认五分钟内的敏感管理操作 |
 | `/benefit <面额> <数量> <有效期(h)> <违者封禁时间(day)>` | 管理员 | @全体成员并批量发放一人限领一个的福利兑换码；自动检测多领、封禁并到期解封 |
 | `/reset check` | 任意 | 查看当前群状态：未知、可能重置、即将重置或确认重置（抽奖进行中） |
-| `/reset last` | 任意 | 查看 Tibo 最新一条 X 推文及其归类，不改变当前群状态或活动 |
+| `/reset last` | 任意 | 查看 Codex Reset timeline API 最新重置事件、验证状态和时间窗口，不改变当前群状态或活动 |
 | `/reset join` | 已绑定用户 | 参加当前群有效期内正在进行的重置补偿抽奖 |
+| `/reset new` | 管理员 | 按当前群 `/reset set` 配置手动开启一轮新的重置补偿活动 |
 | `/reset set duration <时长>` | 管理员 | 设置下一轮活动有效期，默认 `5h` |
 | `/reset set winners <人数>` | 管理员 | 设置下一轮抽取人数，默认 `5` |
-| `/reset set lookback <时长>` | 管理员 | 设置获奖者用量补偿回溯时间，默认 `24h` |
-| `/reset proxy <代理链接或off>` | 管理员 | 设置仅用于 X 检测的 HTTP/SOCKS5 代理，凭据加密保存 |
+| `/reset set lookback <时长>` | 管理员 | 设置获奖者在活动开始前的用量补偿回溯时间，默认 `24h` |
+| `/reset proxy <代理链接或off>` | 管理员 | 设置仅用于访问 Codex Reset timeline API 的 HTTP/SOCKS5 代理，凭据加密保存 |
 
 除 `/help`、`/whoami`、`/bind`、`/reset check`、`/reset last`、`/enable list`、`/disable list` 以及管理员的 `/enable`、`/disable` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
 
@@ -237,15 +238,17 @@ $bytes = New-Object byte[] 32
 
 ### Codex 重置监测与补偿
 
-- 首次在某个群执行 `/reset check`、`/reset join` 或管理员设置命令时，该群会自动登记为重置通知群。`/reset last` 只查询 Tibo 最新推文，不登记群、不改变状态，也不会创建活动。没有登记群时后台不会发起监测请求。
-- `/reset last` 按推文发布时间选择真正的最新一条，即使页面前方存在旧置顶推文；普通无关推文会显示为“未知”，且该查询不受 `RESET_SIGNAL_MAX_AGE` 限制。
-- 后台默认每 `3m` 顺序检查 `X @thsottiaux`、`X @OpenAI`、`X @OpenAIDevs`、`codexreset.org` 和 OpenAI Status，只处理最近 `24h` 的相关信号。网络响应有严格大小限制，不运行浏览器、Node 或其他常驻进程。
-- 状态分为：未知、可能重置、即将重置、确认重置（抽奖进行中）。可能或即将重置信号过期后恢复未知；确认信号为每群开启一轮活动，活动结算后立即恢复未知。
-- 活动默认持续 `5h`，随机抽取最多 `5` 名参与者。每名获奖者获得该活动结束前近 `24h` 的实际消耗额度；参与人数不足时抽取全部参与者，消耗为零时不调用额度写入接口。
+- 首次在某个群执行 `/reset check`、`/reset join` 或管理员设置命令时，该群会自动登记为重置通知群。`/reset last` 只查询 `https://codex-reset.com/api/timeline` 的最新重置事件，不登记群、不改变状态，也不会创建活动。没有登记群时后台不会发起监测请求。
+- `/reset last` 展示 API 最新重置事件的公告时间、机器人状态、API 验证状态、摘要和官方时间窗口；该查询不受 `RESET_SIGNAL_MAX_AGE` 限制。
+- 后台默认每 `3m` 请求一次 Codex Reset timeline API，只处理最近 `24h` 的全局 reset 事件。单次响应限制为 `512 KiB`，使用一个受限 HTTP 连接池，不运行浏览器、Node 或其他常驻进程。
+- 状态分为：未知、可能重置、即将重置、确认重置（抽奖进行中）。API 的 pending、hinted 和仍有效的官方时间窗口映射为候选状态；只有 `confirmed` 或 `reset_observed` 才会启动活动。`rejected`、`unchanged`、`unverified` 或 `expired` 会将对应候选恢复为未知并发送更正通知，已经开始或正在结算的活动不会被自动取消。
+- timeline 事件以稳定事件 ID 去重；同一事件从可能重置升级为即将重置或确认重置时只通知一次对应变化。部署或重启后不会把超出 `RESET_SIGNAL_MAX_AGE` 的历史确认事件补建为新活动。
+- 活动默认持续 `5h`，随机抽取最多 `5` 名参与者。每名获奖者获得从活动开始前 `24h` 到活动开始时刻的实际消耗额度，活动进行期间产生的用量不计入补偿；参与人数不足时抽取全部参与者，消耗为零时不调用额度写入接口。
+- 管理员执行 `/reset new` 可立即手动开启活动；活动会读取执行时该群通过 `/reset set duration`、`winners` 和 `lookback` 保存的配置。已有活动正在进行或结算时不会重复创建。
 - 中奖名单、补偿额度和逐人发放状态会先写入 bbolt。服务重启不会重新抽取；额度写入超时等结果不确定的情况会标记待确认，不会自动重复加额。
 - 重置信号、活动开始和活动结束通知使用持久化 outbox；正文与分块边界会冻结保存，每发送一块就持久化游标，QQ 暂时发送失败或服务重启后会从未完成分块继续退避重试。
 - QQ 主动群消息接口没有可查询的幂等键，因此若消息已被 QQ 接收、但进程在写入发送游标前异常退出，该分块存在极小概率重复。服务采用至少一次投递以避免通知静默丢失。
-- `/reset proxy http://user:password@host:port` 与 `/reset proxy socks5://user:password@host:port` 均受支持；用户名或密码中的特殊字符需使用 URL 编码。代理只用于访问 X，OpenAI Status、聚合站、QQ 和 New API 始终直连。代理完整地址使用 `BOT_DATA_KEY` 加密保存，回复与日志不显示密码。
+- `/reset proxy http://user:password@host:port` 与 `/reset proxy socks5://user:password@host:port` 均受支持；用户名或密码中的特殊字符需使用 URL 编码。代理只用于访问 Codex Reset timeline API，QQ 和 New API 始终使用各自现有连接。代理完整地址使用 `BOT_DATA_KEY` 加密保存，回复与日志不显示密码。
 - 可通过 `RESET_ENABLED`、`RESET_POLL_INTERVAL`、`RESET_HTTP_TIMEOUT`、`RESET_SIGNAL_MAX_AGE`、`RESET_DEFAULT_DURATION`、`RESET_DEFAULT_WINNERS` 和 `RESET_DEFAULT_LOOKBACK` 调整全局默认值。管理员的群内设置只影响后续新活动。
 
 ## Docker Compose 部署

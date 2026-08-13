@@ -40,6 +40,7 @@ type fakeNewAPI struct {
 	nextSubID      int
 	usageByUser    []newapi.UsageRecord
 	usageUserCalls int
+	usageRanges    []usageRange
 	usageByModel   []newapi.UsageRecord
 	logs           []newapi.LogRecord
 	models         []string
@@ -55,6 +56,11 @@ type fakeNewAPI struct {
 type quotaAddCall struct {
 	UserID int
 	Quota  int64
+}
+
+type usageRange struct {
+	Start time.Time
+	End   time.Time
 }
 
 func (f *fakeNewAPI) GetStatus(context.Context, bool) (newapi.Status, error) {
@@ -101,8 +107,9 @@ func (f *fakeNewAPI) SubtractQuota(_ context.Context, userID int, quota int64) e
 	f.lastQuota = quota
 	return nil
 }
-func (f *fakeNewAPI) ListUsageByUser(context.Context, time.Time, time.Time) ([]newapi.UsageRecord, error) {
+func (f *fakeNewAPI) ListUsageByUser(_ context.Context, start, end time.Time) ([]newapi.UsageRecord, error) {
 	f.usageUserCalls++
+	f.usageRanges = append(f.usageRanges, usageRange{Start: start, End: end})
 	return append([]newapi.UsageRecord(nil), f.usageByUser...), nil
 }
 func (f *fakeNewAPI) ListUsageByModel(_ context.Context, _ time.Time, _ time.Time, username string) ([]newapi.UsageRecord, error) {

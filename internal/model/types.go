@@ -207,6 +207,7 @@ type ResetSignal struct {
 	Source     string     `json:"source"`
 	ExternalID string     `json:"external_id,omitempty"`
 	Stage      ResetStage `json:"stage"`
+	Status     string     `json:"status,omitempty"`
 	Title      string     `json:"title,omitempty"`
 	Summary    string     `json:"summary,omitempty"`
 	URL        string     `json:"url,omitempty"`
@@ -231,6 +232,7 @@ type ResetSignalDelivery struct {
 	GroupOpenID string     `json:"group_openid"`
 	SignalID    string     `json:"signal_id"`
 	Stage       ResetStage `json:"stage"`
+	Status      string     `json:"status,omitempty"`
 	ActivityID  string     `json:"activity_id,omitempty"`
 	ProcessedAt time.Time  `json:"processed_at"`
 }
@@ -277,6 +279,7 @@ type ResetNotification struct {
 	GroupOpenID   string                  `json:"group_openid"`
 	SignalID      string                  `json:"signal_id,omitempty"`
 	SignalStage   ResetStage              `json:"signal_stage,omitempty"`
+	SignalStatus  string                  `json:"signal_status,omitempty"`
 	SignalSource  string                  `json:"signal_source,omitempty"`
 	SignalSummary string                  `json:"signal_summary,omitempty"`
 	SignalURL     string                  `json:"signal_url,omitempty"`

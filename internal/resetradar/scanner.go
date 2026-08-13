@@ -13,52 +13,34 @@ import (
 )
 
 const (
-	aggregatorURL       = "https://codexreset.org/"
-	statusURL           = "https://status.openai.com/api/v2/incidents.json"
-	tiboUsername        = "thsottiaux"
-	tiboURL             = "https://x.com/thsottiaux"
-	maxXBody            = int64(4 << 20)
-	maxAggregate        = int64(2 << 20)
-	maxStatusBody       = int64(512 << 10)
+	timelineURL         = "https://codex-reset.com/api/timeline"
+	maxTimelineBody     = int64(512 << 10)
 	errorBodyDrainLimit = int64(4 << 10)
-	minimumRoundTimeout = 30 * time.Second
 )
 
 var errScannerClosed = errors.New("reset radar scanner is closed")
 
-var xProfiles = []struct {
-	username string
-	url      string
-}{
-	{username: tiboUsername, url: tiboURL},
-	{username: "OpenAI", url: "https://x.com/OpenAI"},
-	{username: "OpenAIDevs", url: "https://x.com/OpenAIDevs"},
-}
-
 type Scanner struct {
-	timeout         time.Duration
-	maxAge          time.Duration
+	timeout  time.Duration
+	maxAge   time.Duration
+	endpoint string
+	now      func() time.Time
+
 	directTransport *http.Transport
 	directClient    *http.Client
-	now             func() time.Time
+	fetchSlot       chan struct{}
+	latestSlot      chan struct{}
 
-	// Fetch is intentionally serialized: a scan already visits every source,
-	// and overlapping rounds only multiply memory and connection use.
-	fetchMu sync.Mutex
-	// LatestTibo is serialized independently so an interactive query is not
-	// blocked behind a full five-source monitoring round.
-	latestSlot chan struct{}
-	mu         sync.Mutex
-	active     sync.WaitGroup
-	closed     bool
+	mu             sync.Mutex
+	active         sync.WaitGroup
+	closed         bool
+	proxyKey       string
+	proxyTransport *http.Transport
+	proxyClient    *http.Client
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
 	closeOnce       sync.Once
-
-	xProxyKey  string
-	xTransport *http.Transport
-	xClient    *http.Client
 }
 
 func NewScanner(timeout time.Duration, maxAge ...time.Duration) *Scanner {
@@ -74,10 +56,12 @@ func NewScanner(timeout time.Duration, maxAge ...time.Duration) *Scanner {
 	return &Scanner{
 		timeout:         timeout,
 		maxAge:          signalMaxAge,
+		endpoint:        timelineURL,
+		now:             time.Now,
 		directTransport: transport,
 		directClient:    &http.Client{Transport: transport, Timeout: timeout},
+		fetchSlot:       make(chan struct{}, 1),
 		latestSlot:      make(chan struct{}, 1),
-		now:             time.Now,
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
 	}
@@ -92,14 +76,12 @@ func (s *Scanner) Close() {
 		s.closed = true
 		s.lifecycleCancel()
 		directTransport := s.directTransport
-		xTransport := s.xTransport
+		proxyTransport := s.proxyTransport
 		s.mu.Unlock()
 
-		closeIdleConnections(directTransport, xTransport)
+		closeIdleConnections(directTransport, proxyTransport)
 		s.active.Wait()
-		// A canceled in-flight request may return its connection after the
-		// first close, so sweep both pools again once all scans have stopped.
-		closeIdleConnections(directTransport, xTransport)
+		closeIdleConnections(directTransport, proxyTransport)
 	})
 }
 
@@ -111,71 +93,44 @@ func (s *Scanner) Fetch(ctx context.Context, proxyURL string) (Snapshot, error) 
 	if err != nil {
 		return Snapshot{}, err
 	}
-	roundCtx, finish, err := s.beginFetch(ctx)
+	requestCtx, finish, err := s.beginRequest(ctx)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	defer finish()
-
-	s.fetchMu.Lock()
-	defer s.fetchMu.Unlock()
-	xClient, err := s.xClientForProxy(parsedProxy)
-	if err != nil {
+	if err := acquireSlot(requestCtx, s.fetchSlot); err != nil {
 		return Snapshot{}, err
 	}
+	defer releaseSlot(s.fetchSlot)
 
 	now := s.now().UTC()
 	snapshot := Snapshot{CheckedAt: now}
-	byID := make(map[string]Signal, 8)
-
-	for _, profile := range xProfiles {
-		body, fetchErr := fetchBody(roundCtx, xClient, profile.url, maxXBody, true)
-		if fetchErr != nil {
-			snapshot.SourceErrors = append(snapshot.SourceErrors, SourceError{Source: "X @" + profile.username, Err: fetchErr})
-			continue
-		}
-		signals, parseErr := parseXPublicPage(body, profile.username, now, s.maxAge)
-		if parseErr != nil {
-			snapshot.SourceErrors = append(snapshot.SourceErrors, SourceError{Source: "X @" + profile.username, Err: parseErr})
-			continue
-		}
-		mergeSignals(byID, signals)
+	client, err := s.clientForProxy(parsedProxy)
+	if err != nil {
+		return Snapshot{}, err
 	}
-
-	body, fetchErr := fetchBody(roundCtx, s.directClient, aggregatorURL, maxAggregate, false)
-	if fetchErr != nil {
-		snapshot.SourceErrors = append(snapshot.SourceErrors, SourceError{Source: "codexreset.org", Err: fetchErr})
-	} else {
-		aggregate, parseErr := parseAggregator(body, now, s.maxAge)
-		if parseErr != nil {
-			snapshot.SourceErrors = append(snapshot.SourceErrors, SourceError{Source: "codexreset.org", Err: parseErr})
-		} else {
-			snapshot.AggregatorStatus = aggregate.status
-			snapshot.AggregatorScore = aggregate.score
-			mergeSignals(byID, aggregate.signals)
-		}
+	requestURL, err := timelineRequestURL(s.endpoint, now, s.maxAge)
+	if err != nil {
+		return Snapshot{}, err
 	}
-
-	body, fetchErr = fetchBody(roundCtx, s.directClient, statusURL, maxStatusBody, false)
-	if fetchErr != nil {
-		snapshot.SourceErrors = append(snapshot.SourceErrors, SourceError{Source: "OpenAI status", Err: fetchErr})
-	} else {
-		signals, parseErr := parseStatusJSON(body, now, s.maxAge)
-		if parseErr != nil {
-			snapshot.SourceErrors = append(snapshot.SourceErrors, SourceError{Source: "OpenAI status", Err: parseErr})
-		} else {
-			mergeSignals(byID, signals)
-		}
+	body, err := fetchBody(requestCtx, client, requestURL, maxTimelineBody)
+	if err != nil {
+		snapshot.SourceErrors = append(snapshot.SourceErrors, SourceError{Source: "codex-reset.com timeline", Err: err})
+		return snapshot, nil
 	}
-
-	snapshot.Signals = sortedSignals(byID)
+	timeline, err := parseTimeline(body, now, s.maxAge)
+	if err != nil {
+		snapshot.SourceErrors = append(snapshot.SourceErrors, SourceError{Source: "codex-reset.com timeline", Err: err})
+		return snapshot, nil
+	}
+	snapshot.UpdatedAt = timeline.updatedAt
+	snapshot.Signals = timeline.signals
 	return snapshot, nil
 }
 
-// LatestTibo returns the newest post in Tibo's public X timeline. Unlike the
-// monitoring scan, this query deliberately keeps unrelated and older posts so
-// callers can always display the actual latest post and its classification.
-func (s *Scanner) LatestTibo(ctx context.Context, proxyURL string) (Signal, error) {
+// Latest returns the newest global reset event in the timeline. It does not
+// apply maxAge so an interactive query can still show the latest known event.
+func (s *Scanner) Latest(ctx context.Context, proxyURL string) (Signal, error) {
 	if s == nil {
 		return Signal{}, errors.New("reset radar scanner is nil")
 	}
@@ -183,30 +138,39 @@ func (s *Scanner) LatestTibo(ctx context.Context, proxyURL string) (Signal, erro
 	if err != nil {
 		return Signal{}, err
 	}
-	roundCtx, finish, err := s.beginFetch(ctx)
+	requestCtx, finish, err := s.beginRequest(ctx)
 	if err != nil {
 		return Signal{}, err
 	}
 	defer finish()
+	if err := acquireSlot(requestCtx, s.latestSlot); err != nil {
+		return Signal{}, err
+	}
+	defer releaseSlot(s.latestSlot)
 
-	select {
-	case s.latestSlot <- struct{}{}:
-		defer func() { <-s.latestSlot }()
-	case <-roundCtx.Done():
-		return Signal{}, roundCtx.Err()
-	}
-	xClient, err := s.xClientForProxy(parsedProxy)
+	client, err := s.clientForProxy(parsedProxy)
 	if err != nil {
 		return Signal{}, err
 	}
-	body, err := fetchBody(roundCtx, xClient, tiboURL, maxXBody, true)
+	requestURL, err := timelineRequestURL(s.endpoint, time.Time{}, 0)
 	if err != nil {
 		return Signal{}, err
 	}
-	return parseLatestXPost(body, tiboUsername)
+	body, err := fetchBody(requestCtx, client, requestURL, maxTimelineBody)
+	if err != nil {
+		return Signal{}, err
+	}
+	timeline, err := parseTimeline(body, s.now().UTC(), 0)
+	if err != nil {
+		return Signal{}, err
+	}
+	if len(timeline.signals) == 0 {
+		return Signal{}, errors.New("timeline API 未包含全局重置事件")
+	}
+	return timeline.signals[len(timeline.signals)-1], nil
 }
 
-func (s *Scanner) beginFetch(parent context.Context) (context.Context, func(), error) {
+func (s *Scanner) beginRequest(parent context.Context) (context.Context, func(), error) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -217,7 +181,7 @@ func (s *Scanner) beginFetch(parent context.Context) (context.Context, func(), e
 	}
 	s.active.Add(1)
 	lifecycleCtx := s.lifecycleCtx
-	timeout := resetRoundTimeout(s.timeout)
+	timeout := s.timeout
 	s.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(parent, timeout)
@@ -229,7 +193,7 @@ func (s *Scanner) beginFetch(parent context.Context) (context.Context, func(), e
 	}, nil
 }
 
-func (s *Scanner) xClientForProxy(proxyURL *url.URL) (*http.Client, error) {
+func (s *Scanner) clientForProxy(proxyURL *url.URL) (*http.Client, error) {
 	proxyKey := ""
 	if proxyURL != nil {
 		proxyKey = proxyURL.String()
@@ -240,8 +204,13 @@ func (s *Scanner) xClientForProxy(proxyURL *url.URL) (*http.Client, error) {
 		s.mu.Unlock()
 		return nil, errScannerClosed
 	}
-	if s.xClient != nil && s.xProxyKey == proxyKey {
-		client := s.xClient
+	if proxyURL == nil {
+		client := s.directClient
+		s.mu.Unlock()
+		return client, nil
+	}
+	if s.proxyClient != nil && s.proxyKey == proxyKey {
+		client := s.proxyClient
 		s.mu.Unlock()
 		return client, nil
 	}
@@ -249,10 +218,10 @@ func (s *Scanner) xClientForProxy(proxyURL *url.URL) (*http.Client, error) {
 	transport := newTransport(s.timeout)
 	configureProxyTransport(transport, proxyURL, s.timeout)
 	client := &http.Client{Transport: transport, Timeout: s.timeout}
-	previousTransport := s.xTransport
-	s.xProxyKey = proxyKey
-	s.xTransport = transport
-	s.xClient = client
+	previousTransport := s.proxyTransport
+	s.proxyKey = proxyKey
+	s.proxyTransport = transport
+	s.proxyClient = client
 	s.mu.Unlock()
 
 	if previousTransport != nil {
@@ -260,6 +229,17 @@ func (s *Scanner) xClientForProxy(proxyURL *url.URL) (*http.Client, error) {
 	}
 	return client, nil
 }
+
+func acquireSlot(ctx context.Context, slot chan struct{}) error {
+	select {
+	case slot <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseSlot(slot chan struct{}) { <-slot }
 
 func configureProxyTransport(transport *http.Transport, proxyURL *url.URL, timeout time.Duration) {
 	if proxyURL == nil {
@@ -284,24 +264,6 @@ func configureProxyTransport(transport *http.Transport, proxyURL *url.URL, timeo
 	}
 }
 
-func resetRoundTimeout(perSource time.Duration) time.Duration {
-	if perSource <= 0 {
-		return minimumRoundTimeout
-	}
-	sourceCount := time.Duration(len(xProfiles) + 2)
-	// Every source has its own client timeout. The outer deadline only bounds
-	// the whole serial round and must leave later direct sources a chance to run
-	// when X is unavailable or blocked.
-	if perSource > time.Duration(1<<63-1)/sourceCount {
-		return time.Duration(1<<63 - 1)
-	}
-	roundTimeout := perSource * sourceCount
-	if roundTimeout < minimumRoundTimeout {
-		return minimumRoundTimeout
-	}
-	return roundTimeout
-}
-
 func closeIdleConnections(transports ...*http.Transport) {
 	for _, transport := range transports {
 		if transport != nil {
@@ -314,7 +276,7 @@ func newTransport(timeout time.Duration) *http.Transport {
 	return &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          2,
+		MaxIdleConns:          1,
 		MaxIdleConnsPerHost:   1,
 		MaxConnsPerHost:       2,
 		IdleConnTimeout:       60 * time.Second,
@@ -323,18 +285,13 @@ func newTransport(timeout time.Duration) *http.Transport {
 	}
 }
 
-func fetchBody(ctx context.Context, client *http.Client, rawURL string, limit int64, browserUA bool) ([]byte, error) {
+func fetchBody(ctx context.Context, client *http.Client, rawURL string, limit int64) ([]byte, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Accept", "application/json,text/html;q=0.9,*/*;q=0.7")
-	request.Header.Set("Accept-Language", "en-US,en;q=0.8")
-	if browserUA {
-		request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-	} else {
-		request.Header.Set("User-Agent", "new-api-bot-reset-radar/1.0")
-	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "new-api-bot-reset-radar/2.0")
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
@@ -357,9 +314,28 @@ func fetchBody(ctx context.Context, client *http.Client, rawURL string, limit in
 	return body, nil
 }
 
+func timelineRequestURL(rawURL string, now time.Time, maxAge time.Duration) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("解析 timeline API 地址失败: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("group", "reset")
+	if maxAge > 0 && !now.IsZero() {
+		query.Set("from", now.UTC().Add(-maxAge).Format("2006-01-02"))
+	} else {
+		query.Del("from")
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
 func formatBytes(value int64) string {
 	if value%(1<<20) == 0 {
 		return fmt.Sprintf("%d MiB", value>>20)
+	}
+	if value%(1<<10) == 0 {
+		return fmt.Sprintf("%d KiB", value>>10)
 	}
 	return fmt.Sprintf("%d bytes", value)
 }

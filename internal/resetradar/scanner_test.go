@@ -5,86 +5,167 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestScannerReusesXClientUntilProxyChanges(t *testing.T) {
-	scanner := NewScanner(time.Second)
+func TestScannerFetchUsesSingleTimelineRequest(t *testing.T) {
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	var calls atomic.Int32
+	var accept string
+	var group string
+	var from string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		accept = request.Header.Get("Accept")
+		group = request.URL.Query().Get("group")
+		from = request.URL.Query().Get("from")
+		_, _ = io.WriteString(response, `{"updated_at":"2026-08-13T12:00:00Z","events":[{"id":"10","type":"reset","group":"reset","summary":"observed","announced_at":"2026-08-13T11:00:00Z","scope":"global","source":"live","observation_result":"reset_observed"}]}`)
+	}))
+	defer server.Close()
+
+	scanner := NewScanner(time.Second, 24*time.Hour)
+	scanner.endpoint = server.URL
+	scanner.now = func() time.Time { return now }
 	t.Cleanup(scanner.Close)
-
-	directClient, err := scanner.xClientForProxy(nil)
+	snapshot, err := scanner.Fetch(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	reusedDirectClient, err := scanner.xClientForProxy(nil)
-	if err != nil {
-		t.Fatal(err)
+	if calls.Load() != 1 || accept != "application/json" || group != "reset" || from != "2026-08-12" {
+		t.Fatalf("calls=%d accept=%q group=%q from=%q", calls.Load(), accept, group, from)
 	}
-	if reusedDirectClient != directClient {
-		t.Fatal("same proxy configuration did not reuse X client")
-	}
-
-	proxyOne, err := url.Parse("http://alice:secret@127.0.0.1:3128")
-	if err != nil {
-		t.Fatal(err)
-	}
-	proxiedClient, err := scanner.xClientForProxy(proxyOne)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if proxiedClient == directClient {
-		t.Fatal("proxy change did not replace X client")
-	}
-	reusedProxiedClient, err := scanner.xClientForProxy(proxyOne)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reusedProxiedClient != proxiedClient {
-		t.Fatal("same authenticated proxy did not reuse X client")
-	}
-
-	proxyTwo, err := url.Parse("socks5://bob:other@127.0.0.1:1080")
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondProxiedClient, err := scanner.xClientForProxy(proxyTwo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if secondProxiedClient == proxiedClient {
-		t.Fatal("different proxy did not replace X client")
+	if len(snapshot.SourceErrors) != 0 || len(snapshot.Signals) != 1 || snapshot.Signals[0].ID != "x:10" || snapshot.Signals[0].Stage != StageConfirmed {
+		t.Fatalf("snapshot=%#v", snapshot)
 	}
 }
 
-func TestScannerProxyClientCacheConcurrentAccess(t *testing.T) {
+func TestScannerFetchReportsHTTPAndParseErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+		body string
+		want string
+	}{
+		{name: "http", code: http.StatusBadGateway, body: "upstream detail", want: "HTTP 502"},
+		{name: "parse", code: http.StatusOK, body: `{"events":[]} trailing`, want: "尾随内容"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.WriteHeader(test.code)
+				_, _ = io.WriteString(response, test.body)
+			}))
+			defer server.Close()
+			scanner := NewScanner(time.Second)
+			scanner.endpoint = server.URL
+			defer scanner.Close()
+			snapshot, err := scanner.Fetch(context.Background(), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.SourceErrors) != 1 || !strings.Contains(snapshot.SourceErrors[0].Error(), test.want) {
+				t.Fatalf("source errors=%#v", snapshot.SourceErrors)
+			}
+		})
+	}
+}
+
+func TestScannerLatestReturnsNewestWithoutMaxAge(t *testing.T) {
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	var group string
+	var from string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		group = request.URL.Query().Get("group")
+		from = request.URL.Query().Get("from")
+		_, _ = io.WriteString(response, `{"events":[
+			{"id":"2","type":"reset","group":"reset","summary":"new","announced_at":"2026-07-01T11:00:00Z","scope":"global","source":"archive"},
+			{"id":"1","type":"reset","group":"reset","summary":"old","announced_at":"2026-06-01T11:00:00Z","scope":"global","source":"archive"}
+		]}`)
+	}))
+	defer server.Close()
+	scanner := NewScanner(time.Second, time.Hour)
+	scanner.endpoint = server.URL
+	scanner.now = func() time.Time { return now }
+	defer scanner.Close()
+	latest, err := scanner.Latest(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.ID != "x:2" || latest.Text != "new" {
+		t.Fatalf("latest=%#v", latest)
+	}
+	if group != "reset" || from != "" {
+		t.Fatalf("latest query group=%q from=%q", group, from)
+	}
+}
+
+func TestScannerProxyRoutesTimelineAPI(t *testing.T) {
+	var requests atomic.Int32
+	var requestedURL string
+	proxy := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		requestedURL = request.URL.String()
+		_, _ = io.WriteString(response, `{"events":[]}`)
+	}))
+	defer proxy.Close()
+
 	scanner := NewScanner(time.Second)
-	t.Cleanup(scanner.Close)
+	scanner.endpoint = "http://timeline.invalid/api/timeline"
+	scanner.now = func() time.Time { return time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC) }
+	defer scanner.Close()
+	snapshot, err := scanner.Fetch(context.Background(), proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.SourceErrors) != 0 || requests.Load() != 1 || requestedURL != scanner.endpoint+"?from=2026-08-12&group=reset" {
+		t.Fatalf("requests=%d URL=%q snapshot=%#v", requests.Load(), requestedURL, snapshot)
+	}
+}
+
+func TestTimelineRequestURLPreservesExistingQuery(t *testing.T) {
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	raw, err := timelineRequestURL("https://example.test/api/timeline?preview=true&group=all", now, 36*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	if query.Get("preview") != "true" || query.Get("group") != "reset" || query.Get("from") != "2026-08-12" {
+		t.Fatalf("query=%v", query)
+	}
+}
+
+func TestScannerClientCacheConcurrentAccess(t *testing.T) {
+	scanner := NewScanner(time.Second)
+	defer scanner.Close()
 	proxies := []*url.URL{
 		nil,
 		mustParseURL(t, "http://127.0.0.1:3128"),
 		mustParseURL(t, "socks5://user:pass@127.0.0.1:1080"),
 	}
-
 	var workers sync.WaitGroup
 	for worker := 0; worker < 8; worker++ {
 		workers.Add(1)
 		go func(offset int) {
 			defer workers.Done()
 			for index := 0; index < 100; index++ {
-				client, err := scanner.xClientForProxy(proxies[(offset+index)%len(proxies)])
+				client, err := scanner.clientForProxy(proxies[(offset+index)%len(proxies)])
 				if err != nil {
-					t.Errorf("xClientForProxy: %v", err)
+					t.Errorf("clientForProxy: %v", err)
 					return
 				}
 				if client == nil {
-					t.Error("xClientForProxy returned nil client")
+					t.Error("clientForProxy returned nil")
 					return
 				}
 			}
@@ -93,66 +174,55 @@ func TestScannerProxyClientCacheConcurrentAccess(t *testing.T) {
 	workers.Wait()
 }
 
-func TestScannerCloseClosesIdlePoolsAndRejectsWork(t *testing.T) {
-	var opened atomic.Int32
-	var closed atomic.Int32
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(response, "ok")
-	}))
-	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-		switch state {
-		case http.StateNew:
-			opened.Add(1)
-		case http.StateClosed:
-			closed.Add(1)
+func TestScannerLatestDoesNotWaitForFetch(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			select {
+			case <-releaseFirst:
+			case <-request.Context().Done():
+				return
+			}
 		}
-	}
-	server.Start()
+		_, _ = io.WriteString(response, `{"events":[{"id":"10","type":"reset","group":"reset","summary":"latest","announced_at":"2026-08-13T11:00:00Z","scope":"global","source":"archive"}]}`)
+	}))
 	defer server.Close()
-
 	scanner := NewScanner(time.Second)
-	xClient, err := scanner.xClientForProxy(nil)
-	if err != nil {
-		t.Fatal(err)
+	scanner.endpoint = server.URL
+	scanner.now = func() time.Time { return time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC) }
+	defer scanner.Close()
+
+	fetchDone := make(chan error, 1)
+	go func() {
+		_, err := scanner.Fetch(context.Background(), "")
+		fetchDone <- err
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Fetch did not start")
 	}
-	for _, client := range []*http.Client{scanner.directClient, xClient} {
-		response, err := client.Get(server.URL)
+	latest, err := scanner.Latest(context.Background(), "")
+	if err != nil || latest.ID != "x:10" {
+		t.Fatalf("Latest=%#v err=%v", latest, err)
+	}
+	close(releaseFirst)
+	select {
+	case err := <-fetchDone:
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := io.Copy(io.Discard, response.Body); err != nil {
-			_ = response.Body.Close()
-			t.Fatal(err)
-		}
-		if err := response.Body.Close(); err != nil {
-			t.Fatal(err)
-		}
+	case <-time.After(time.Second):
+		t.Fatal("Fetch did not finish")
 	}
-	if got := opened.Load(); got != 2 {
-		t.Fatalf("opened connections=%d, want 2 independent pools", got)
-	}
-
-	scanner.Close()
-	deadline := time.Now().Add(2 * time.Second)
-	for closed.Load() < 2 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := closed.Load(); got != 2 {
-		t.Fatalf("closed connections=%d, want 2", got)
-	}
-	if _, err := scanner.Fetch(context.Background(), ""); !errors.Is(err, errScannerClosed) {
-		t.Fatalf("Fetch after Close error=%v, want %v", err, errScannerClosed)
-	}
-	if _, err := scanner.xClientForProxy(nil); !errors.Is(err, errScannerClosed) {
-		t.Fatalf("xClientForProxy after Close error=%v, want %v", err, errScannerClosed)
-	}
-	// Close is idempotent and must not block after all pools are gone.
-	scanner.Close()
 }
 
-func TestScannerCloseCancelsAndWaitsForActiveFetch(t *testing.T) {
+func TestScannerCloseCancelsAndWaitsForActiveRequest(t *testing.T) {
 	scanner := NewScanner(time.Second)
-	ctx, finish, err := scanner.beginFetch(context.Background())
+	ctx, finish, err := scanner.beginRequest(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,60 +231,48 @@ func TestScannerCloseCancelsAndWaitsForActiveFetch(t *testing.T) {
 		scanner.Close()
 		close(closed)
 	}()
-
 	select {
 	case <-ctx.Done():
 	case <-time.After(time.Second):
-		t.Fatal("Close did not cancel active fetch context")
+		t.Fatal("Close did not cancel request")
 	}
 	select {
 	case <-closed:
-		t.Fatal("Close returned before active fetch finished")
+		t.Fatal("Close returned before request finished")
 	default:
 	}
 	finish()
 	select {
 	case <-closed:
 	case <-time.After(time.Second):
-		t.Fatal("Close did not return after active fetch finished")
+		t.Fatal("Close did not wait for request")
 	}
+	if _, err := scanner.Fetch(context.Background(), ""); !errors.Is(err, errScannerClosed) {
+		t.Fatalf("Fetch after Close error=%v", err)
+	}
+	if _, err := scanner.Latest(context.Background(), ""); !errors.Is(err, errScannerClosed) {
+		t.Fatalf("Latest after Close error=%v", err)
+	}
+	scanner.Close()
 }
 
-func TestFetchBodyDrainsOnlySmallPrefixOnHTTPError(t *testing.T) {
-	body := &trackingReadCloser{Reader: bytes.NewReader(make([]byte, errorBodyDrainLimit*2))}
+func TestFetchBodyEnforcesLimitAndDrainsSmallErrorPrefix(t *testing.T) {
+	oversize := &trackingReadCloser{Reader: bytes.NewReader(make([]byte, maxTimelineBody+1))}
 	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusBadGateway,
-			Body:       body,
-			Header:     make(http.Header),
-		}, nil
+		return &http.Response{StatusCode: http.StatusOK, Body: oversize, Header: make(http.Header), ContentLength: -1}, nil
 	})}
+	_, err := fetchBody(context.Background(), client, "http://example.test", maxTimelineBody)
+	if err == nil || !strings.Contains(err.Error(), "512 KiB") || !oversize.closed {
+		t.Fatalf("oversize error=%v closed=%v", err, oversize.closed)
+	}
 
-	_, err := fetchBody(context.Background(), client, "http://example.test", 1<<20, false)
-	if err == nil {
-		t.Fatal("fetchBody expected HTTP status error")
-	}
-	if body.read != errorBodyDrainLimit {
-		t.Fatalf("drained bytes=%d, want %d", body.read, errorBodyDrainLimit)
-	}
-	if !body.closed {
-		t.Fatal("response body was not closed")
-	}
-}
-
-func TestResetRoundTimeout(t *testing.T) {
-	tests := []struct {
-		perSource time.Duration
-		want      time.Duration
-	}{
-		{perSource: 0, want: 30 * time.Second},
-		{perSource: 5 * time.Second, want: 30 * time.Second},
-		{perSource: 20 * time.Second, want: 100 * time.Second},
-	}
-	for _, test := range tests {
-		if got := resetRoundTimeout(test.perSource); got != test.want {
-			t.Errorf("resetRoundTimeout(%s)=%s, want %s", test.perSource, got, test.want)
-		}
+	errorBody := &trackingReadCloser{Reader: bytes.NewReader(make([]byte, errorBodyDrainLimit*2))}
+	client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusBadGateway, Body: errorBody, Header: make(http.Header)}, nil
+	})
+	_, err = fetchBody(context.Background(), client, "http://example.test", maxTimelineBody)
+	if err == nil || errorBody.read != errorBodyDrainLimit || !errorBody.closed {
+		t.Fatalf("HTTP error=%v read=%d closed=%v", err, errorBody.read, errorBody.closed)
 	}
 }
 

@@ -30,12 +30,30 @@ func (s Stage) String() string {
 }
 
 type Signal struct {
-	ID        string
-	Source    string
-	Text      string
-	URL       string
-	CreatedAt time.Time
-	Stage     Stage
+	ID                 string
+	Source             string
+	Text               string
+	URL                string
+	CreatedAt          time.Time
+	Stage              Stage
+	EventID            string
+	Group              string
+	Type               string
+	Scope              string
+	Preview            bool
+	TimelineSource     string
+	SourceLabel        string
+	AnnouncementState  string
+	ObservationResult  string
+	VerificationStatus string
+	OfficialWindow     *OfficialWindow
+}
+
+type OfficialWindow struct {
+	Label    string
+	StartAt  time.Time
+	EndAt    time.Time
+	TimeZone string
 }
 
 type SourceError struct {
@@ -53,11 +71,10 @@ func (e SourceError) Error() string {
 func (e SourceError) Unwrap() error { return e.Err }
 
 type Snapshot struct {
-	CheckedAt        time.Time
-	Signals          []Signal
-	AggregatorStatus string
-	AggregatorScore  int
-	SourceErrors     []SourceError
+	CheckedAt    time.Time
+	UpdatedAt    time.Time
+	Signals      []Signal
+	SourceErrors []SourceError
 }
 
 func (s Snapshot) HighestStage() Stage {
@@ -73,11 +90,11 @@ func (s Snapshot) HighestStage() Stage {
 func mergeSignals(dst map[string]Signal, signals []Signal) {
 	for _, signal := range signals {
 		signal.ID = strings.TrimSpace(signal.ID)
-		if signal.ID == "" || signal.Stage == StageUnknown {
+		if signal.ID == "" {
 			continue
 		}
 		current, exists := dst[signal.ID]
-		if !exists || signal.Stage > current.Stage || (signal.Stage == current.Stage && signal.CreatedAt.After(current.CreatedAt)) {
+		if !exists || !signal.CreatedAt.Before(current.CreatedAt) {
 			dst[signal.ID] = signal
 		}
 	}
@@ -89,11 +106,8 @@ func sortedSignals(byID map[string]Signal) []Signal {
 		result = append(result, signal)
 	}
 	sort.Slice(result, func(i, j int) bool {
-		if result[i].Stage != result[j].Stage {
-			return result[i].Stage > result[j].Stage
-		}
 		if !result[i].CreatedAt.Equal(result[j].CreatedAt) {
-			return result[i].CreatedAt.After(result[j].CreatedAt)
+			return result[i].CreatedAt.Before(result[j].CreatedAt)
 		}
 		return result[i].ID < result[j].ID
 	})

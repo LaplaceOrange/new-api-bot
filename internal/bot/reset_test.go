@@ -17,16 +17,22 @@ import (
 
 type fakeResetRadar struct {
 	signal      resetradar.Signal
+	snapshot    resetradar.Snapshot
+	fetchErr    error
 	err         error
 	latestCalls int
+	fetchCalls  int
 	lastProxy   string
+	fetchProxy  string
 }
 
-func (f *fakeResetRadar) Fetch(context.Context, string) (resetradar.Snapshot, error) {
-	return resetradar.Snapshot{}, nil
+func (f *fakeResetRadar) Fetch(_ context.Context, proxyURL string) (resetradar.Snapshot, error) {
+	f.fetchCalls++
+	f.fetchProxy = proxyURL
+	return f.snapshot, f.fetchErr
 }
 
-func (f *fakeResetRadar) LatestTibo(_ context.Context, proxyURL string) (resetradar.Signal, error) {
+func (f *fakeResetRadar) Latest(_ context.Context, proxyURL string) (resetradar.Signal, error) {
 	f.latestCalls++
 	f.lastProxy = proxyURL
 	return f.signal, f.err
@@ -39,7 +45,7 @@ func TestResetLastIsAvailableWithoutBindingAndHasNoStateSideEffects(t *testing.T
 	service.cfg.CheckinTimezone = time.FixedZone("CST", 8*60*60)
 	radar := &fakeResetRadar{signal: resetradar.Signal{
 		ID:        "x:123456789",
-		Source:    "X @thsottiaux",
+		Source:    "codex-reset.com",
 		Text:      "A regular unrelated post.",
 		URL:       "https://x.com/thsottiaux/status/123456789",
 		CreatedAt: time.Date(2026, 8, 13, 1, 23, 45, 0, time.UTC),
@@ -50,10 +56,11 @@ func TestResetLastIsAvailableWithoutBindingAndHasNoStateSideEffects(t *testing.T
 	service.process(context.Background(), groupEvent("g-reset-last", "ordinary", "/reset last"))
 	reply := lastReply(t, qqAPI)
 	for _, want := range []string{
-		"Tibo 最新推文",
-		"发布时间：2026-08-13 09:23:45 CST",
-		"归类：未知",
-		"内容：A regular unrelated post.",
+		"Codex Reset API 最新重置事件",
+		"公告时间：2026-08-13 09:23:45 CST",
+		"机器人状态：未知",
+		"API 判定：未知",
+		"摘要：A regular unrelated post.",
 		"https://x.com/thsottiaux/status/123456789",
 	} {
 		if !strings.Contains(reply, want) {
@@ -112,6 +119,27 @@ func TestResetLastStageLabels(t *testing.T) {
 	}
 }
 
+func TestResetRadarStatusTextUsesAPIVerification(t *testing.T) {
+	tests := []struct {
+		name   string
+		signal resetradar.Signal
+		want   string
+	}{
+		{name: "confirmed observation", signal: resetradar.Signal{ObservationResult: "reset_observed"}, want: "confirmed"},
+		{name: "rejected observation wins", signal: resetradar.Signal{ObservationResult: "unchanged", VerificationStatus: "confirmed", Stage: resetradar.StageConfirmed}, want: "rejected"},
+		{name: "pending", signal: resetradar.Signal{VerificationStatus: "pending", Stage: resetradar.StagePossible}, want: "pending"},
+		{name: "archive confirmed", signal: resetradar.Signal{Stage: resetradar.StageConfirmed}, want: "confirmed"},
+		{name: "hinted", signal: resetradar.Signal{AnnouncementState: "hinted", Stage: resetradar.StagePossible}, want: "hinted"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := normalizedResetRadarStatus(test.signal); got != test.want {
+				t.Fatalf("status=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestResetLastConfirmedResultDoesNotAdvanceGroupStateOrCreateActivity(t *testing.T) {
 	service, storage, _, qqAPI, _ := testService(t)
 	if _, err := service.ensureResetSettings("g-reset-last"); err != nil {
@@ -136,7 +164,7 @@ func TestResetLastConfirmedResultDoesNotAdvanceGroupStateOrCreateActivity(t *tes
 
 	service.process(context.Background(), groupEvent("g-reset-last", "ordinary", "/reset last"))
 	reply := lastReply(t, qqAPI)
-	if !strings.Contains(reply, "归类：确认重置") || strings.Contains(reply, "抽奖进行中") {
+	if !strings.Contains(reply, "机器人状态：确认重置") || strings.Contains(reply, "抽奖进行中") {
 		t.Fatalf("unexpected confirmed latest reply: %q", reply)
 	}
 	state, err := storage.GetResetGroupState("g-reset-last")
@@ -165,7 +193,7 @@ func TestResetLastUsesEncryptedProxyAndRedactsFailure(t *testing.T) {
 
 	service.process(context.Background(), groupEvent("g-reset-last", "ordinary", "/reset last"))
 	reply := lastReply(t, qqAPI)
-	if !strings.Contains(reply, "获取 Tibo 最新推文失败") || strings.Contains(reply, "proxy-user") || strings.Contains(reply, "proxy-secret") {
+	if !strings.Contains(reply, "获取 Codex Reset API 最新事件失败") || strings.Contains(reply, "proxy-user") || strings.Contains(reply, "proxy-secret") {
 		t.Fatalf("unexpected failure reply: %q", reply)
 	}
 	if radar.latestCalls != 1 || radar.lastProxy != proxyURL {
@@ -257,6 +285,134 @@ func TestResetJoinAndCheckConfirmedActivity(t *testing.T) {
 	}
 }
 
+func TestResetNewRequiresBoundAdminWithoutSideEffects(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+
+	service.process(context.Background(), groupEvent("g-reset", "ordinary", "/reset new"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "尚未绑定") {
+		t.Fatalf("unexpected unbound non-admin reply: %q", reply)
+	}
+	if _, err := storage.GetResetSettings("g-reset"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unbound reset new changed group settings: %v", err)
+	}
+
+	createBinding(t, storage, "member:g-reset:ordinary", 42)
+	service.process(context.Background(), groupEvent("g-reset", "ordinary", "/reset new"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "没有手动开启") {
+		t.Fatalf("unexpected non-admin reply: %q", reply)
+	}
+	if _, err := storage.GetResetSettings("g-reset"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("non-admin reset new subscribed group: %v", err)
+	}
+
+	service.process(context.Background(), groupEvent("g-reset", "admin", "/reset new"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "尚未绑定") {
+		t.Fatalf("unexpected unbound admin reply: %q", reply)
+	}
+}
+
+func TestResetNewUsesCurrentSettingsAndEnqueuesManualAnnouncement(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+	createBinding(t, storage, "member:g-reset:admin", 43)
+	setting, err := service.ensureResetSettings("g-reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setting.Duration = 90 * time.Minute
+	setting.WinnerCount = 7
+	setting.Lookback = 36 * time.Hour
+	if err := storage.PutResetSettings(setting); err != nil {
+		t.Fatal(err)
+	}
+
+	event := groupEvent("g-reset", "admin", "/reset new")
+	event.Message.ID = "manual-new-1"
+	service.process(context.Background(), event)
+	reply := lastReply(t, qqAPI)
+	for _, want := range []string{"已手动开启", "活动有效期：1h30m0s", "抽取人数：最多 7 人", "近 36h"} {
+		if !strings.Contains(reply, want) {
+			t.Fatalf("manual create reply %q does not contain %q", reply, want)
+		}
+	}
+	activity, err := storage.GetActiveResetActivity("g-reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activity.SignalID != manualResetSignalID("g-reset", event.Message.ID) || activity.WinnerCount != 7 || activity.Lookback != 36*time.Hour || activity.EndsAt.Sub(activity.StartedAt) != 90*time.Minute {
+		t.Fatalf("manual activity did not freeze settings: %#v", activity)
+	}
+	state, err := storage.GetResetGroupState("g-reset")
+	if err != nil || state.Stage != model.ResetStageConfirmed || state.ActivityID != activity.ID || state.Source != manualResetSource {
+		t.Fatalf("manual group state=%#v err=%v", state, err)
+	}
+	due, err := storage.ListDueResetNotifications(time.Now().Add(time.Minute), 10)
+	if err != nil || len(due) != 1 || due[0].Kind != model.ResetNotificationActivityStarted || due[0].ActivityID != activity.ID {
+		t.Fatalf("manual notification=%#v err=%v", due, err)
+	}
+	message, err := service.renderResetNotification(context.Background(), due[0])
+	if err != nil || !strings.Contains(message, "管理员已手动开启") || strings.Contains(message, "已确认 Codex") {
+		t.Fatalf("manual announcement=%q err=%v", message, err)
+	}
+}
+
+func TestResetNewIsIdempotentAndRejectsConcurrentActivity(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+	createBinding(t, storage, "member:g-reset:admin", 43)
+
+	first := groupEvent("g-reset", "admin", "/reset new")
+	first.Message.ID = "manual-new-replayed"
+	service.process(context.Background(), first)
+	activity, err := storage.GetActiveResetActivity("g-reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.process(context.Background(), first)
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "未重复开启") || !strings.Contains(reply, activity.ID) {
+		t.Fatalf("unexpected replay reply: %q", reply)
+	}
+
+	second := groupEvent("g-reset", "admin", "/reset new")
+	second.Message.ID = "manual-new-concurrent"
+	service.process(context.Background(), second)
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "未重复开启") || !strings.Contains(reply, activity.ID) {
+		t.Fatalf("unexpected active activity reply: %q", reply)
+	}
+	current, err := storage.GetActiveResetActivity("g-reset")
+	if err != nil || current.ID != activity.ID {
+		t.Fatalf("duplicate reset new changed activity: %#v err=%v", current, err)
+	}
+	due, err := storage.ListDueResetNotifications(time.Now().Add(time.Minute), 10)
+	if err != nil || len(due) != 1 {
+		t.Fatalf("duplicate reset new enqueued notifications: %#v err=%v", due, err)
+	}
+}
+
+func TestResetNewValidatesSyntaxAndMessageIDBeforeCreating(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+	createBinding(t, storage, "member:g-reset:admin", 43)
+
+	service.process(context.Background(), groupEvent("g-reset", "admin", "/reset new extra"))
+	if reply := lastReply(t, qqAPI); reply != "格式错误。正确用法：/reset new" {
+		t.Fatalf("unexpected reset new syntax reply: %q", reply)
+	}
+	missingID := groupEvent("g-reset", "admin", "/reset new")
+	missingID.Message.ID = ""
+	service.process(context.Background(), missingID)
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "消息缺少唯一标识") {
+		t.Fatalf("unexpected missing message ID reply: %q", reply)
+	}
+	if _, err := storage.GetActiveResetActivity("g-reset"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("invalid reset new created activity: %v", err)
+	}
+	if _, err := storage.GetResetSettings("g-reset"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("invalid reset new changed group settings: %v", err)
+	}
+}
+
 func TestResetCheckShowsPossibleAndImminentStages(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -288,6 +444,82 @@ func TestResetCheckShowsPossibleAndImminentStages(t *testing.T) {
 				t.Fatalf("unexpected reset status reply: %q", reply)
 			}
 		})
+	}
+}
+
+func TestPollResetTimelineAppliesLatestRejectedStateWithoutActivity(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if _, err := service.ensureResetSettings("g-reset"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	service.resetRadar = &fakeResetRadar{snapshot: resetradar.Snapshot{
+		CheckedAt: now,
+		Signals: []resetradar.Signal{
+			{
+				ID:                 "x:pending-event",
+				Source:             "codex-reset.com",
+				Text:               "A possible reset tomorrow.",
+				CreatedAt:          now.Add(-2 * time.Hour),
+				Stage:              resetradar.StagePossible,
+				VerificationStatus: "pending",
+			},
+			{
+				ID:                 "x:rejected-event",
+				Source:             "codex-reset.com",
+				Text:               "Reset announcement was not observed.",
+				CreatedAt:          now.Add(-time.Hour),
+				Stage:              resetradar.StageUnknown,
+				ObservationResult:  "unchanged",
+				VerificationStatus: "rejected",
+			},
+		},
+	}}
+
+	service.pollResetSignals(context.Background())
+	state, err := storage.GetResetGroupState("g-reset")
+	if err != nil || state.Stage != model.ResetStageUnknown || state.SignalID != "x:rejected-event" {
+		t.Fatalf("latest rejected state=%#v err=%v", state, err)
+	}
+	if _, err := storage.GetActiveResetActivity("g-reset"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("rejected timeline event created activity: %v", err)
+	}
+	service.processDueResetNotificationsAt(context.Background(), time.Now().Add(time.Minute))
+	if len(qqAPI.messages) != 2 || !strings.Contains(qqAPI.messages[0], "可能重置") || !strings.Contains(qqAPI.messages[1], "标记为未确认") {
+		t.Fatalf("timeline notifications=%#v", qqAPI.messages)
+	}
+}
+
+func TestConfirmedTimelineEventCreatesOneActivity(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	if _, err := service.ensureResetSettings("g-reset"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	radar := &fakeResetRadar{snapshot: resetradar.Snapshot{CheckedAt: now, Signals: []resetradar.Signal{{
+		ID:                 "x:confirmed-event",
+		Source:             "codex-reset.com",
+		Text:               "Reset observed.",
+		CreatedAt:          now.Add(-time.Minute),
+		Stage:              resetradar.StageConfirmed,
+		ObservationResult:  "reset_observed",
+		VerificationStatus: "confirmed",
+	}}}}
+	service.resetRadar = radar
+
+	service.pollResetSignals(context.Background())
+	activity, err := storage.GetActiveResetActivity("g-reset")
+	if err != nil || activity.SignalID != "x:confirmed-event" {
+		t.Fatalf("activity=%#v err=%v", activity, err)
+	}
+	service.pollResetSignals(context.Background())
+	current, err := storage.GetActiveResetActivity("g-reset")
+	if err != nil || current.ID != activity.ID {
+		t.Fatalf("replayed API response changed activity: %#v err=%v", current, err)
+	}
+	due, err := storage.ListDueResetNotifications(time.Now().Add(time.Minute), 10)
+	if err != nil || len(due) != 1 || due[0].Kind != model.ResetNotificationActivityStarted {
+		t.Fatalf("confirmed notifications=%#v err=%v", due, err)
 	}
 }
 
@@ -500,6 +732,23 @@ func TestDisabledResetLastOnlyHidesResetLastHelp(t *testing.T) {
 	}
 }
 
+func TestDisabledResetNewOnlyHidesResetNewHelp(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
+	createBinding(t, storage, "member:g-reset:admin", 43)
+	service.process(context.Background(), groupEvent("g-reset", "admin", `/disable "reset new"`))
+	service.process(context.Background(), groupEvent("g-reset", "ordinary", "/help"))
+	reply := lastReply(t, qqAPI)
+	if strings.Contains(reply, "/reset new") {
+		t.Fatalf("disabled reset new remained in help: %q", reply)
+	}
+	for _, command := range []string{"/reset check", "/reset last", "/reset join", "/reset set"} {
+		if !strings.Contains(reply, command) {
+			t.Fatalf("disabling reset new hid %s: %q", command, reply)
+		}
+	}
+}
+
 func TestResetHelpHiddenWhenFeatureDisabled(t *testing.T) {
 	service, _, _, qqAPI, _ := testService(t)
 	service.cfg.ResetEnabled = false
@@ -542,6 +791,17 @@ func TestResetSettlementGrantsExactRecentUsage(t *testing.T) {
 	api.usageByUser = []newapi.UsageRecord{{UserID: 42, Username: "alice", Quota: 750000, Count: 3, TokenUsed: 100}}
 
 	service.processDueResetActivities(context.Background())
+	if len(api.usageRanges) != 1 {
+		t.Fatalf("usage ranges=%#v", api.usageRanges)
+	}
+	wantUsageEnd := activity.StartedAt
+	wantUsageStart := wantUsageEnd.Add(-activity.Lookback)
+	if !api.usageRanges[0].Start.Equal(wantUsageStart) || !api.usageRanges[0].End.Equal(wantUsageEnd) {
+		t.Fatalf("usage range=%s..%s, want %s..%s", api.usageRanges[0].Start, api.usageRanges[0].End, wantUsageStart, wantUsageEnd)
+	}
+	if api.usageRanges[0].End.Equal(activity.EndsAt) {
+		t.Fatalf("usage range incorrectly includes activity period: end=%s", api.usageRanges[0].End)
+	}
 	if len(api.quotaAddCalls) != 1 || api.quotaAddCalls[0] != (quotaAddCall{UserID: 42, Quota: 750000}) {
 		t.Fatalf("quota calls=%#v", api.quotaAddCalls)
 	}

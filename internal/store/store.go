@@ -1475,13 +1475,14 @@ func validateResetSignal(signal model.ResetSignal) error {
 	if signal.ID == "" {
 		return errors.New("重置信号 ID 不能为空")
 	}
-	if resetStageRank(signal.Stage) == 0 {
+	if signal.Stage != model.ResetStageUnknown && resetStageRank(signal.Stage) == 0 {
 		return errors.New("重置信号状态无效")
 	}
 	return nil
 }
 
 func normalizeResetSignal(signal model.ResetSignal, now time.Time) model.ResetSignal {
+	signal.Status = strings.TrimSpace(signal.Status)
 	if signal.DetectedAt.IsZero() {
 		signal.DetectedAt = now
 	}
@@ -1492,6 +1493,48 @@ func normalizeResetSignal(signal model.ResetSignal, now time.Time) model.ResetSi
 	return signal
 }
 
+func resetSignalsEqual(left, right model.ResetSignal) bool {
+	return left.ID == right.ID &&
+		left.Source == right.Source &&
+		left.ExternalID == right.ExternalID &&
+		left.Stage == right.Stage &&
+		left.Status == right.Status &&
+		left.Title == right.Title &&
+		left.Summary == right.Summary &&
+		left.URL == right.URL &&
+		left.OccurredAt.Equal(right.OccurredAt)
+}
+
+func resetSignalHigher(left, right model.ResetSignal) bool {
+	leftRank := resetStageRank(left.Stage)
+	rightRank := resetStageRank(right.Stage)
+	return leftRank > rightRank || (leftRank == rightRank && left.OccurredAt.After(right.OccurredAt))
+}
+
+func rebuildHighestResetSignalTx(tx *bolt.Tx) error {
+	bucket := tx.Bucket([]byte("reset_signals"))
+	var highest model.ResetSignal
+	hasHighest := false
+	if err := bucket.ForEach(func(_, data []byte) error {
+		var signal model.ResetSignal
+		if err := json.Unmarshal(data, &signal); err != nil {
+			return err
+		}
+		if !hasHighest || resetSignalHigher(signal, highest) {
+			highest = signal
+			hasHighest = true
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	runtime := tx.Bucket([]byte("reset_runtime"))
+	if !hasHighest {
+		return runtime.Delete([]byte("highest_signal_id"))
+	}
+	return runtime.Put([]byte("highest_signal_id"), []byte(highest.ID))
+}
+
 func putResetSignalTx(tx *bolt.Tx, signal model.ResetSignal) (bool, error) {
 	bucket := tx.Bucket([]byte("reset_signals"))
 	if data := bucket.Get([]byte(signal.ID)); data != nil {
@@ -1499,7 +1542,7 @@ func putResetSignalTx(tx *bolt.Tx, signal model.ResetSignal) (bool, error) {
 		if err := json.Unmarshal(data, &current); err != nil {
 			return false, err
 		}
-		if resetStageRank(signal.Stage) <= resetStageRank(current.Stage) {
+		if resetSignalsEqual(signal, current) {
 			return false, nil
 		}
 	}
@@ -1511,22 +1554,8 @@ func putResetSignalTx(tx *bolt.Tx, signal model.ResetSignal) (bool, error) {
 		return false, err
 	}
 
-	runtime := tx.Bucket([]byte("reset_runtime"))
-	shouldReplaceHighest := true
-	if highestID := runtime.Get([]byte("highest_signal_id")); highestID != nil {
-		if currentData := bucket.Get(highestID); currentData != nil {
-			var current model.ResetSignal
-			if err := json.Unmarshal(currentData, &current); err != nil {
-				return false, err
-			}
-			shouldReplaceHighest = resetStageRank(signal.Stage) > resetStageRank(current.Stage) ||
-				(resetStageRank(signal.Stage) == resetStageRank(current.Stage) && signal.OccurredAt.After(current.OccurredAt))
-		}
-	}
-	if shouldReplaceHighest {
-		if err := runtime.Put([]byte("highest_signal_id"), []byte(signal.ID)); err != nil {
-			return false, err
-		}
+	if err := rebuildHighestResetSignalTx(tx); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -1564,13 +1593,13 @@ func getResetSignalTx(tx *bolt.Tx, id string) (model.ResetSignal, error) {
 	return result, json.Unmarshal(data, &result)
 }
 
-func resetNotificationID(kind model.ResetNotificationKind, group, signalID string, stage model.ResetStage, activityID string) string {
-	sum := sha256.Sum256([]byte(string(kind) + "\x00" + group + "\x00" + signalID + "\x00" + string(stage) + "\x00" + activityID))
+func resetNotificationID(kind model.ResetNotificationKind, group, signalID string, stage model.ResetStage, status, activityID string) string {
+	sum := sha256.Sum256([]byte(string(kind) + "\x00" + group + "\x00" + signalID + "\x00" + string(stage) + "\x00" + status + "\x00" + activityID))
 	return fmt.Sprintf("reset-notification-%x", sum[:12])
 }
 
 func enqueueResetNotificationTx(tx *bolt.Tx, kind model.ResetNotificationKind, group string, signal model.ResetSignal, activityID string, now time.Time) error {
-	id := resetNotificationID(kind, group, signal.ID, signal.Stage, activityID)
+	id := resetNotificationID(kind, group, signal.ID, signal.Stage, signal.Status, activityID)
 	notifications := tx.Bucket([]byte("reset_notifications"))
 	due := tx.Bucket([]byte("reset_notification_due"))
 	if notifications == nil || due == nil {
@@ -1586,6 +1615,7 @@ func enqueueResetNotificationTx(tx *bolt.Tx, kind model.ResetNotificationKind, g
 		GroupOpenID:   group,
 		SignalID:      signal.ID,
 		SignalStage:   signal.Stage,
+		SignalStatus:  signal.Status,
 		SignalSource:  signal.Source,
 		SignalSummary: signal.Summary,
 		SignalURL:     signal.URL,
@@ -1852,14 +1882,38 @@ func putResetSignalDeliveryTx(tx *bolt.Tx, group string, signal model.ResetSigna
 		if err := json.Unmarshal(data, &current); err != nil {
 			return false, err
 		}
-		if resetStageRank(current.Stage) >= resetStageRank(signal.Stage) {
+		if current.Stage == signal.Stage && current.Status == signal.Status {
 			return false, nil
+		}
+		if current.Stage == signal.Stage && current.Status == "" {
+			current.Status = signal.Status
+			if current.GroupOpenID == "" {
+				current.GroupOpenID = group
+			}
+			if current.SignalID == "" {
+				current.SignalID = signal.ID
+			}
+			if current.ActivityID == "" {
+				current.ActivityID = activityID
+			}
+			migrated, err := json.Marshal(current)
+			if err != nil {
+				return false, err
+			}
+			if err := bucket.Put(key, migrated); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		if activityID == "" {
+			activityID = current.ActivityID
 		}
 	}
 	delivery := model.ResetSignalDelivery{
 		GroupOpenID: group,
 		SignalID:    signal.ID,
 		Stage:       signal.Stage,
+		Status:      signal.Status,
 		ActivityID:  activityID,
 		ProcessedAt: now,
 	}
@@ -1878,8 +1932,8 @@ func (s *Store) ApplyResetSignalToGroup(group string, signal model.ResetSignal) 
 	if group == "" {
 		return false, errors.New("群 OpenID 不能为空")
 	}
-	if signal.Stage != model.ResetStagePossible && signal.Stage != model.ResetStageImminent {
-		return false, errors.New("该接口只接受可能重置或即将重置的信号")
+	if signal.Stage != model.ResetStageUnknown && signal.Stage != model.ResetStagePossible && signal.Stage != model.ResetStageImminent {
+		return false, errors.New("该接口只接受待确认、即将重置或已撤销的信号")
 	}
 	if err := validateResetSignal(signal); err != nil {
 		return false, err
@@ -1894,18 +1948,45 @@ func (s *Store) ApplyResetSignalToGroup(group string, signal model.ResetSignal) 
 		if err != nil {
 			return err
 		}
-		shouldApply, err := putResetSignalDeliveryTx(tx, group, signal, current.ActivityID, signal.UpdatedAt)
+		activeActivityID := current.ActivityID
+		hasActiveActivity := false
+		if activeID := tx.Bucket([]byte("reset_active_by_group")).Get([]byte(group)); activeID != nil {
+			activity, getErr := getResetActivityTx(tx, string(activeID))
+			if getErr != nil && !errors.Is(getErr, ErrNotFound) {
+				return getErr
+			}
+			if getErr == nil && (activity.Status == model.ResetActivityActive || activity.Status == model.ResetActivitySettling) {
+				activeActivityID = activity.ID
+				hasActiveActivity = true
+			}
+		}
+		shouldApply, err := putResetSignalDeliveryTx(tx, group, signal, activeActivityID, signal.UpdatedAt)
 		if err != nil {
 			return err
 		}
 		if !shouldApply {
 			return nil
 		}
+		if hasActiveActivity {
+			return nil
+		}
 		if !current.LastCompletedAt.IsZero() && !signal.OccurredAt.After(current.LastCompletedAt) {
 			return nil
 		}
-		if resetStageRank(signal.Stage) <= resetStageRank(current.Stage) {
-			return nil
+		sameEvent := current.SignalID != "" && current.SignalID == signal.ID
+		if !sameEvent && current.SignalID != "" {
+			currentSignal, getErr := getResetSignalTx(tx, current.SignalID)
+			if getErr != nil && !errors.Is(getErr, ErrNotFound) {
+				return getErr
+			}
+			if getErr == nil {
+				if signal.OccurredAt.Before(currentSignal.OccurredAt) {
+					return nil
+				}
+				if signal.OccurredAt.Equal(currentSignal.OccurredAt) && resetStageRank(signal.Stage) <= resetStageRank(current.Stage) {
+					return nil
+				}
+			}
 		}
 		current = model.ResetGroupState{
 			GroupOpenID:     group,
@@ -2024,7 +2105,12 @@ func (s *Store) CreateResetActivityFromSignal(group string, signal model.ResetSi
 		if err != nil {
 			return err
 		}
-		if delivered && resetStageRank(delivery.Stage) >= resetStageRank(model.ResetStageConfirmed) {
+		if delivered && delivery.Stage == model.ResetStageConfirmed {
+			if delivery.Status != signal.Status {
+				if _, err := putResetSignalDeliveryTx(tx, group, signal, delivery.ActivityID, now); err != nil {
+					return err
+				}
+			}
 			if delivery.ActivityID != "" {
 				if existing, getErr := getResetActivityTx(tx, delivery.ActivityID); getErr == nil {
 					result = existing
@@ -2038,7 +2124,25 @@ func (s *Store) CreateResetActivityFromSignal(group string, signal model.ResetSi
 		if err != nil {
 			return err
 		}
+		if currentState.SignalID != "" && currentState.SignalID != signal.ID {
+			currentSignal, getErr := getResetSignalTx(tx, currentState.SignalID)
+			if getErr != nil && !errors.Is(getErr, ErrNotFound) {
+				return getErr
+			}
+			if getErr == nil && (signal.OccurredAt.Before(currentSignal.OccurredAt) ||
+				(signal.OccurredAt.Equal(currentSignal.OccurredAt) && resetStageRank(signal.Stage) <= resetStageRank(currentState.Stage))) {
+				_, err := putResetSignalDeliveryTx(tx, group, signal, "", now)
+				return err
+			}
+		}
 		if !currentState.LastCompletedAt.IsZero() && !signal.OccurredAt.After(currentState.LastCompletedAt) {
+			if delivered && delivery.ActivityID != "" {
+				if existing, getErr := getResetActivityTx(tx, delivery.ActivityID); getErr == nil {
+					result = existing
+				} else if !errors.Is(getErr, ErrNotFound) {
+					return getErr
+				}
+			}
 			_, err := putResetSignalDeliveryTx(tx, group, signal, "", now)
 			return err
 		}

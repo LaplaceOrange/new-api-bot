@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/big"
@@ -21,6 +22,7 @@ import (
 const (
 	resetSettlementInterval    = 30 * time.Second
 	resetNotificationBatchSize = 16
+	manualResetSource          = "管理员手动开启"
 )
 
 func (s *Service) handleReset(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
@@ -39,7 +41,19 @@ func (s *Service) handleReset(ctx context.Context, event qq.MessageEvent, canoni
 		if len(fields) != 2 {
 			return s.reply(ctx, event, "格式错误。正确用法：/reset last")
 		}
-		return s.replyLatestTibo(ctx, event, group)
+		return s.replyLatestResetEvent(ctx, event, group)
+	}
+	if subcommand == "new" {
+		if !s.isAdmin(identity) {
+			return s.reply(ctx, event, "你没有手动开启重置活动的权限。")
+		}
+		if len(fields) != 2 {
+			return s.reply(ctx, event, "格式错误。正确用法：/reset new")
+		}
+		if strings.TrimSpace(event.Message.ID) == "" {
+			s.logger.Error("管理员手动开启重置活动失败：QQ 消息 ID 为空", "group_openid", group, "actor", commandRuleActor(identity))
+			return s.reply(ctx, event, "手动开启重置活动失败：当前消息缺少唯一标识，请重新发送指令。")
+		}
 	}
 	if _, err := s.ensureResetSettings(group); err != nil {
 		return s.reply(ctx, event, "保存当前群的重置监测设置失败，请稍后重试。")
@@ -62,6 +76,8 @@ func (s *Service) handleReset(ctx context.Context, event qq.MessageEvent, canoni
 			return s.reply(ctx, event, "你尚未绑定 New API 账户，请先使用 /bind <邮箱或用户ID> 完成绑定。")
 		}
 		return s.joinResetActivity(ctx, event, canonical, identity, group)
+	case "new":
+		return s.createManualResetActivity(ctx, event, canonical, identity, group)
 	case "set":
 		if !s.isAdmin(identity) {
 			return s.reply(ctx, event, "你没有修改重置活动设置的权限。")
@@ -77,23 +93,105 @@ func (s *Service) handleReset(ctx context.Context, event qq.MessageEvent, canoni
 	}
 }
 
-func (s *Service) replyLatestTibo(ctx context.Context, event qq.MessageEvent, group string) error {
+func (s *Service) createManualResetActivity(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, group string) error {
+	now := time.Now()
+	signal := model.ResetSignal{
+		ID:         manualResetSignalID(group, event.Message.ID),
+		Source:     manualResetSource,
+		Stage:      model.ResetStageConfirmed,
+		Summary:    "管理员已手动开启重置补偿活动。",
+		OccurredAt: now,
+		DetectedAt: now,
+	}
+	activity, created, err := s.store.CreateResetActivityFromSignal(group, signal, now)
+	actor := nonEmpty(canonical, commandRuleActor(identity))
+	if err != nil {
+		_ = s.store.AddAudit(model.AuditRecord{At: now, Actor: actor, Action: "reset.activity.manual_create", Target: group, Success: false, Description: err.Error()})
+		s.logger.Error("管理员手动开启重置活动失败", "group_openid", group, "actor", actor, "error", err)
+		return s.reply(ctx, event, "手动开启重置活动失败，请稍后重试。")
+	}
+	if !created {
+		description := "该手动开启请求已处理，未重复创建活动"
+		if activity.ID != "" {
+			description = "当前群已有活动，未重复创建"
+		}
+		_ = s.store.AddAudit(model.AuditRecord{
+			At:          now,
+			Actor:       actor,
+			Action:      "reset.activity.manual_create",
+			Target:      nonEmpty(activity.ID, group),
+			Success:     false,
+			Description: description,
+			Metadata:    map[string]any{"group_openid": group},
+		})
+		switch activity.Status {
+		case model.ResetActivityActive:
+			return s.reply(ctx, event, strings.Join([]string{
+				"当前群已有重置补偿活动正在进行，本次未重复开启。",
+				"活动编号：" + activity.ID,
+				"结束时间：" + activity.EndsAt.In(resetLocation(s.cfg.CheckinTimezone)).Format("2006-01-02 15:04:05 MST"),
+				fmt.Sprintf("已参加：%d 人", activity.ParticipantCount),
+			}, "\n"))
+		case model.ResetActivitySettling:
+			return s.reply(ctx, event, "当前群上一轮重置补偿活动正在结算，请等待结算完成后再使用 /reset new。")
+		default:
+			return s.reply(ctx, event, "该手动开启请求已处理，本次未重复创建活动。")
+		}
+	}
+	_ = s.store.AddAudit(model.AuditRecord{
+		At:      now,
+		Actor:   actor,
+		Action:  "reset.activity.manual_create",
+		Target:  activity.ID,
+		Success: true,
+		Metadata: map[string]any{
+			"group_openid": group,
+			"activity_id":  activity.ID,
+			"duration":     activity.EndsAt.Sub(activity.StartedAt).String(),
+			"winner_count": activity.WinnerCount,
+			"lookback":     activity.Lookback.String(),
+		},
+	})
+	return s.reply(ctx, event, strings.Join([]string{
+		"新的重置补偿活动已手动开启。",
+		"活动编号：" + activity.ID,
+		"活动有效期：" + formatResetDuration(activity.EndsAt.Sub(activity.StartedAt)),
+		"结束时间：" + activity.EndsAt.In(resetLocation(s.cfg.CheckinTimezone)).Format("2006-01-02 15:04:05 MST"),
+		fmt.Sprintf("抽取人数：最多 %d 人", activity.WinnerCount),
+		"补偿内容：获奖者在活动开始前近 " + formatResetDuration(activity.Lookback) + " 的实际消耗额度",
+		"参加方式：/reset join",
+	}, "\n"))
+}
+
+func manualResetSignalID(group, messageID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(group) + "\x00" + strings.TrimSpace(messageID)))
+	return fmt.Sprintf("manual:%x", sum[:12])
+}
+
+func resetLocation(location *time.Location) *time.Location {
+	if location == nil {
+		return time.Local
+	}
+	return location
+}
+
+func (s *Service) replyLatestResetEvent(ctx context.Context, event qq.MessageEvent, group string) error {
 	queryCtx, cancel := s.backgroundCommandContext(ctx, resetLastCommandTimeout(s.cfg.ResetHTTPTimeout, s.cfg.QQAPITimeout))
 	defer cancel()
 
 	proxyURL, err := s.loadResetProxyURL()
 	if err != nil {
-		s.logger.Error("读取 Tibo 最新推文所需代理配置失败", "group_openid", group, "error", err)
+		s.logger.Error("读取 Codex Reset API 所需代理配置失败", "group_openid", group, "error", err)
 		return s.replyResetLastResult(ctx, event, "读取重置检测代理配置失败，请联系管理员检查服务日志。")
 	}
-	signal, err := s.resetRadar.LatestTibo(queryCtx, proxyURL)
+	signal, err := s.resetRadar.Latest(queryCtx, proxyURL)
 	if err != nil {
-		s.logger.Warn("获取 Tibo 最新推文失败",
+		s.logger.Warn("获取 Codex Reset API 最新事件失败",
 			"group_openid", group,
 			"proxy_configured", proxyURL != "",
 			"error", redactResetProxyError(err, proxyURL),
 		)
-		return s.replyResetLastResult(ctx, event, "获取 Tibo 最新推文失败，请稍后重试。")
+		return s.replyResetLastResult(ctx, event, "获取 Codex Reset API 最新事件失败，请稍后重试。")
 	}
 
 	location := s.cfg.CheckinTimezone
@@ -105,14 +203,16 @@ func (s *Service) replyLatestTibo(ctx context.Context, event qq.MessageEvent, gr
 		text = "（无正文）"
 	}
 	postURL := strings.TrimSpace(signal.URL)
-	if postURL == "" {
-		postURL = latestTiboURL(signal.ID)
-	}
 	lines := []string{
-		"Tibo 最新推文",
-		"发布时间：" + signal.CreatedAt.In(location).Format("2006-01-02 15:04:05 MST"),
-		"归类：" + latestResetStageText(signal.Stage),
-		"内容：" + text,
+		"Codex Reset API 最新重置事件",
+		"公告时间：" + signal.CreatedAt.In(location).Format("2006-01-02 15:04:05 MST"),
+		"机器人状态：" + latestResetStageText(signal.Stage),
+		"API 判定：" + resetRadarStatusText(signal),
+		"摘要：" + text,
+	}
+	if signal.OfficialWindow != nil {
+		window := signal.OfficialWindow
+		lines = append(lines, "官方时间窗口："+window.StartAt.In(location).Format("2006-01-02 15:04 MST")+" 至 "+window.EndAt.In(location).Format("2006-01-02 15:04 MST"))
 	}
 	if postURL != "" {
 		lines = append(lines, postURL)
@@ -164,12 +264,24 @@ func latestResetStageText(stage resetradar.Stage) string {
 	}
 }
 
-func latestTiboURL(signalID string) string {
-	id := strings.TrimSpace(strings.TrimPrefix(signalID, "x:"))
-	if id == "" {
-		return ""
+func resetRadarStatusText(signal resetradar.Signal) string {
+	status := normalizedResetRadarStatus(signal)
+	switch status {
+	case "confirmed":
+		return "已确认"
+	case "rejected":
+		return "未观察到重置（已否决）"
+	case "unverified":
+		return "未验证或已过期"
+	case "pending":
+		return "等待验证"
+	case "announced":
+		return "已公告，等待验证"
+	case "hinted":
+		return "官方预告"
+	default:
+		return "未知"
 	}
-	return "https://x.com/thsottiaux/status/" + id
 }
 
 func redactResetProxyError(err error, proxyURL string) string {
@@ -246,7 +358,7 @@ func (s *Service) replyResetStatus(ctx context.Context, event qq.MessageEvent, g
 				"活动结束时间："+activity.EndsAt.In(s.cfg.CheckinTimezone).Format("2006-01-02 15:04:05 MST"),
 				fmt.Sprintf("已参加：%d 人", activity.ParticipantCount),
 				fmt.Sprintf("抽取人数：%d 人", activity.WinnerCount),
-				"补偿范围：获奖者结束前近 "+formatResetDuration(activity.Lookback)+" 的消耗额度",
+				"补偿范围：获奖者在活动开始前近 "+formatResetDuration(activity.Lookback)+" 的消耗额度",
 			)
 		}
 	}
@@ -319,7 +431,7 @@ func (s *Service) setResetOption(ctx context.Context, event qq.MessageEvent, gro
 		return s.reply(ctx, event, "保存重置活动设置失败，请稍后重试。")
 	}
 	_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: commandRuleActor(identityFromEvent(event)), Action: "reset.settings.update", Target: group, Success: true, Metadata: map[string]any{"setting": key, "value": fields[3]}})
-	return s.reply(ctx, event, fmt.Sprintf("重置活动设置已更新：有效期 %s，抽取 %d 人，补偿近 %s 的消耗额度。新设置将在下一轮活动生效。", formatResetDuration(setting.Duration), setting.WinnerCount, formatResetDuration(setting.Lookback)))
+	return s.reply(ctx, event, fmt.Sprintf("重置活动设置已更新：有效期 %s，抽取 %d 人，补偿活动开始前近 %s 的消耗额度。新设置将在下一轮活动生效。", formatResetDuration(setting.Duration), setting.WinnerCount, formatResetDuration(setting.Lookback)))
 }
 
 func (s *Service) setResetProxy(ctx context.Context, event qq.MessageEvent, fields []string) error {
@@ -331,7 +443,7 @@ func (s *Service) setResetProxy(ctx context.Context, event qq.MessageEvent, fiel
 		if err := s.store.PutResetProxy(""); err != nil {
 			return s.reply(ctx, event, "关闭重置检测代理失败，请稍后重试。")
 		}
-		return s.reply(ctx, event, "重置检测代理已关闭，后续 X 检测将直接连接。")
+		return s.reply(ctx, event, "重置检测代理已关闭，后续 Codex Reset API 检测将直接连接。")
 	}
 	if err := resetradar.ValidateProxyURL(raw); err != nil {
 		return s.reply(ctx, event, "代理链接无效，请检查协议、主机、端口和 URL 编码。仅支持 http:// 与 socks5://。")
@@ -344,7 +456,7 @@ func (s *Service) setResetProxy(ctx context.Context, event qq.MessageEvent, fiel
 		return s.reply(ctx, event, "保存重置检测代理失败，请稍后重试。")
 	}
 	_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: commandRuleActor(identityFromEvent(event)), Action: "reset.proxy.update", Success: true, Metadata: map[string]any{"proxy": resetradar.MaskedProxy(raw)}})
-	return s.reply(ctx, event, "重置检测代理已更新："+resetradar.MaskedProxy(raw)+"。该代理仅用于访问 X。")
+	return s.reply(ctx, event, "重置检测代理已更新："+resetradar.MaskedProxy(raw)+"。该代理仅用于访问 Codex Reset API。")
 }
 
 func (s *Service) runResetPollWorker(ctx context.Context) {
@@ -409,7 +521,7 @@ func (s *Service) pollResetSignals(parent context.Context) {
 		return
 	}
 	for _, sourceErr := range snapshot.SourceErrors {
-		s.logger.Debug("部分重置信号来源检测失败", "source", sourceErr.Source, "error", sourceErr.Err)
+		s.logger.Warn("Codex Reset API 检测失败", "source", sourceErr.Source, "error", sourceErr.Err)
 	}
 	for _, signal := range snapshot.Signals {
 		stored := resetSignalFromRadar(signal, snapshot.CheckedAt)
@@ -425,7 +537,7 @@ func (s *Service) pollResetSignals(parent context.Context) {
 
 func (s *Service) processResetSignalForGroup(ctx context.Context, group string, signal model.ResetSignal) {
 	switch signal.Stage {
-	case model.ResetStagePossible, model.ResetStageImminent:
+	case model.ResetStageUnknown, model.ResetStagePossible, model.ResetStageImminent:
 		changed, err := s.store.ApplyResetSignalToGroup(group, signal)
 		if err != nil {
 			s.logger.Error("更新群重置状态失败", "group_openid", group, "signal_id", signal.ID, "error", err)
@@ -536,7 +648,7 @@ func (s *Service) calculateResetAwards(ctx context.Context, activity model.Reset
 	if len(winners) == 0 {
 		return []model.ResetAward{}, nil
 	}
-	end := activity.EndsAt
+	end := activity.StartedAt
 	start := end.Add(-activity.Lookback)
 	requestCtx, cancel := context.WithTimeout(ctx, s.cfg.NewAPITimeout)
 	rows, err := s.newAPI.ListUsageByUser(requestCtx, start, end)
@@ -607,7 +719,7 @@ func (s *Service) resetCompletionMessage(ctx context.Context, activity model.Res
 			result := "已发放"
 			switch award.Status {
 			case model.ResetAwardZero:
-				result = "近回溯期消耗为 0，无需加额"
+				result = "活动开始前回溯期消耗为 0，无需加额"
 			case model.ResetAwardFailed:
 				result = "发放失败"
 			case model.ResetAwardPendingConfirmation:
@@ -720,7 +832,20 @@ func (s *Service) renderResetNotification(ctx context.Context, notification mode
 		if err != nil {
 			return "", err
 		}
-		lines := []string{"检测到" + resetStageText(signal.Stage) + "信号。", "来源：" + signal.Source}
+		var lines []string
+		if signal.Stage == model.ResetStageUnknown {
+			switch signal.Status {
+			case "rejected":
+				lines = []string{"Codex Reset API 已将此前的重置信号标记为未确认，当前群状态已恢复为未知。"}
+			case "unverified":
+				lines = []string{"Codex Reset API 未验证此前的重置信号，当前群状态已恢复为未知。"}
+			default:
+				lines = []string{"Codex Reset API 的重置状态已更新，当前群状态已恢复为未知。"}
+			}
+		} else {
+			lines = []string{"检测到" + resetStageText(signal.Stage) + "信号。"}
+		}
+		lines = append(lines, "来源："+signal.Source)
 		if signal.Summary != "" {
 			lines = append(lines, "摘要："+truncateResetText(signal.Summary, 240))
 		}
@@ -737,12 +862,16 @@ func (s *Service) renderResetNotification(ctx context.Context, notification mode
 		if err != nil {
 			return "", err
 		}
+		title := "已确认 Codex 用量额度重置，重置补偿抽奖现已开始。"
+		if signal.Source == manualResetSource {
+			title = "管理员已手动开启重置补偿抽奖。"
+		}
 		lines := []string{
-			"已确认 Codex 用量额度重置，重置补偿抽奖现已开始。",
+			title,
 			"活动有效期：" + formatResetDuration(activity.EndsAt.Sub(activity.StartedAt)),
 			"结束时间：" + activity.EndsAt.In(s.cfg.CheckinTimezone).Format("2006-01-02 15:04:05 MST"),
 			fmt.Sprintf("抽取人数：最多 %d 人", activity.WinnerCount),
-			"补偿内容：获奖者结束前近 " + formatResetDuration(activity.Lookback) + " 的实际消耗额度",
+			"补偿内容：获奖者在活动开始前近 " + formatResetDuration(activity.Lookback) + " 的实际消耗额度",
 			"参加方式：/reset join",
 			"来源：" + signal.Source,
 		}
@@ -768,6 +897,7 @@ func (s *Service) resetNotificationSignal(notification model.ResetNotification) 
 	signal := model.ResetSignal{
 		ID:      notification.SignalID,
 		Stage:   notification.SignalStage,
+		Status:  notification.SignalStatus,
 		Source:  notification.SignalSource,
 		Summary: notification.SignalSummary,
 		URL:     notification.SignalURL,
@@ -781,6 +911,9 @@ func (s *Service) resetNotificationSignal(notification model.ResetNotification) 
 	}
 	if signal.Stage == "" {
 		signal.Stage = stored.Stage
+	}
+	if signal.Status == "" {
+		signal.Status = stored.Status
 	}
 	if signal.Source == "" {
 		signal.Source = stored.Source
@@ -829,11 +962,48 @@ func resetSignalFromRadar(signal resetradar.Signal, detectedAt time.Time) model.
 		ExternalID: strings.TrimPrefix(strings.TrimPrefix(signal.ID, "x:"), "status:"),
 		Source:     signal.Source,
 		Stage:      resetStageFromRadar(signal.Stage),
+		Status:     normalizedResetRadarStatus(signal),
 		Summary:    strings.TrimSpace(signal.Text),
 		URL:        signal.URL,
 		OccurredAt: signal.CreatedAt,
 		DetectedAt: detectedAt,
 	}
+}
+
+func normalizedResetRadarStatus(signal resetradar.Signal) string {
+	observation := strings.ToLower(strings.TrimSpace(signal.ObservationResult))
+	switch observation {
+	case "reset_observed", "confirmed":
+		return "confirmed"
+	case "unchanged", "rejected":
+		return "rejected"
+	case "unverified", "expired":
+		return "unverified"
+	case "unknown":
+		return "pending"
+	}
+	verification := strings.ToLower(strings.TrimSpace(signal.VerificationStatus))
+	switch verification {
+	case "confirmed", "reset_observed":
+		return "confirmed"
+	case "rejected", "unchanged":
+		return "rejected"
+	case "unverified", "expired":
+		return "unverified"
+	case "pending":
+		return "pending"
+	}
+	if signal.Stage == resetradar.StageConfirmed {
+		return "confirmed"
+	}
+	announcement := strings.ToLower(strings.TrimSpace(signal.AnnouncementState))
+	if announcement == "announced" || announcement == "hinted" {
+		return announcement
+	}
+	if signal.Stage == resetradar.StagePossible || signal.Stage == resetradar.StageImminent {
+		return "pending"
+	}
+	return "unknown"
 }
 
 func resetStageFromRadar(stage resetradar.Stage) model.ResetStage {
@@ -882,11 +1052,12 @@ func resetUsage() string {
 	return strings.Join([]string{
 		"格式错误。可用指令：",
 		"/reset check - 查看当前重置状态",
-		"/reset last - 查看 Tibo 最新一条推文及归类",
+		"/reset last - 查看 Codex Reset API 最新重置事件及状态",
 		"/reset join - 参加正在进行的补偿抽奖",
+		"管理员：/reset new - 按当前设置手动开启新活动",
 		"管理员：/reset set duration <时长>",
 		"管理员：/reset set winners <人数>",
 		"管理员：/reset set lookback <时长>",
-		"管理员：/reset proxy <http://或socks5://代理链接|off>",
+		"管理员：/reset proxy <http://或socks5://代理链接|off> - 设置 API 检测代理",
 	}, "\n")
 }

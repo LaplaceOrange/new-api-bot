@@ -56,35 +56,40 @@ func TestResetSettingsDefaultsAndProxy(t *testing.T) {
 	}
 }
 
-func TestApplyResetSignalToGroupOnlyUpgradesStage(t *testing.T) {
+func TestApplyResetSignalToGroupUsesEventTimeAndStageChanges(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
 	changed, err := s.ApplyResetSignalToGroup("group-a", resetTestSignal("possible", model.ResetStagePossible, now))
 	if err != nil || !changed {
 		t.Fatalf("possible changed=%v err=%v", changed, err)
 	}
-	changed, err = s.ApplyResetSignalToGroup("group-a", resetTestSignal("older-possible", model.ResetStagePossible, now.Add(time.Minute)))
+	changed, err = s.ApplyResetSignalToGroup("group-a", resetTestSignal("newer-possible", model.ResetStagePossible, now.Add(time.Minute)))
+	if err != nil || !changed {
+		t.Fatalf("newer same severity changed=%v err=%v", changed, err)
+	}
+	changed, err = s.ApplyResetSignalToGroup("group-a", resetTestSignal("older-imminent", model.ResetStageImminent, now.Add(-time.Minute)))
 	if err != nil || changed {
-		t.Fatalf("same severity changed=%v err=%v", changed, err)
+		t.Fatalf("older higher severity changed=%v err=%v", changed, err)
 	}
 	changed, err = s.ApplyResetSignalToGroup("group-a", resetTestSignal("imminent", model.ResetStageImminent, now.Add(2*time.Minute)))
 	if err != nil || !changed {
 		t.Fatalf("imminent changed=%v err=%v", changed, err)
 	}
 	changed, err = s.ApplyResetSignalToGroup("group-a", resetTestSignal("late-possible", model.ResetStagePossible, now.Add(3*time.Minute)))
-	if err != nil || changed {
-		t.Fatalf("downgrade changed=%v err=%v", changed, err)
+	if err != nil || !changed {
+		t.Fatalf("newer event downgrade changed=%v err=%v", changed, err)
 	}
 	state, err := s.GetResetGroupState("group-a")
-	if err != nil || state.Stage != model.ResetStageImminent || state.SignalID != "imminent" {
+	if err != nil || state.Stage != model.ResetStagePossible || state.SignalID != "late-possible" {
 		t.Fatalf("unexpected state: %#v err=%v", state, err)
 	}
 }
 
-func TestApplyResetSignalDeliveryAllowsSameSignalUpgrade(t *testing.T) {
+func TestApplyResetSignalDeliveryTracksPendingImminentRejected(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
 	signal := resetTestSignal("same-id", model.ResetStagePossible, now)
+	signal.Status = "pending"
 	changed, err := s.ApplyResetSignalToGroup("group-a", signal)
 	if err != nil || !changed {
 		t.Fatalf("possible changed=%v err=%v", changed, err)
@@ -93,14 +98,267 @@ func TestApplyResetSignalDeliveryAllowsSameSignalUpgrade(t *testing.T) {
 		t.Fatalf("duplicate possible changed=%v err=%v", changed, err)
 	}
 	signal.Stage = model.ResetStageImminent
+	signal.Status = "imminent"
 	signal.UpdatedAt = time.Time{}
 	changed, err = s.ApplyResetSignalToGroup("group-a", signal)
 	if err != nil || !changed {
 		t.Fatalf("imminent upgrade changed=%v err=%v", changed, err)
 	}
+	signal.Stage = model.ResetStageUnknown
+	signal.Status = "rejected"
+	signal.UpdatedAt = time.Time{}
+	changed, err = s.ApplyResetSignalToGroup("group-a", signal)
+	if err != nil || !changed {
+		t.Fatalf("rejected changed=%v err=%v", changed, err)
+	}
+	if changed, err = s.ApplyResetSignalToGroup("group-a", signal); err != nil || changed {
+		t.Fatalf("duplicate rejected changed=%v err=%v", changed, err)
+	}
+	state, err := s.GetResetGroupState("group-a")
+	if err != nil || state.Stage != model.ResetStageUnknown || state.SignalID != signal.ID || state.ActivityID != "" {
+		t.Fatalf("rejected state=%#v err=%v", state, err)
+	}
 	activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("same-id", model.ResetStageConfirmed, now.Add(time.Minute)), now.Add(time.Minute))
 	if err != nil || !created || activity.Status != model.ResetActivityActive {
 		t.Fatalf("confirmed upgrade activity=%#v created=%v err=%v", activity, created, err)
+	}
+}
+
+func TestApplyResetSignalSameStageStatusChangesNotifySeparately(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	signal := resetTestSignal("same-stage-status", model.ResetStagePossible, now)
+	signal.Status = "pending"
+	if changed, err := s.ApplyResetSignalToGroup("group-a", signal); err != nil || !changed {
+		t.Fatalf("pending changed=%v err=%v", changed, err)
+	}
+	signal.Status = "under_review"
+	if changed, err := s.ApplyResetSignalToGroup("group-a", signal); err != nil || !changed {
+		t.Fatalf("under review changed=%v err=%v", changed, err)
+	}
+	if changed, err := s.ApplyResetSignalToGroup("group-a", signal); err != nil || changed {
+		t.Fatalf("duplicate under review changed=%v err=%v", changed, err)
+	}
+	notifications, err := s.ListDueResetNotifications(time.Now().Add(time.Minute), 10)
+	if err != nil || len(notifications) != 2 {
+		t.Fatalf("notifications=%#v err=%v", notifications, err)
+	}
+	statuses := map[string]bool{}
+	ids := map[string]bool{}
+	for _, notification := range notifications {
+		statuses[notification.SignalStatus] = true
+		ids[notification.ID] = true
+	}
+	if !statuses["pending"] || !statuses["under_review"] || len(ids) != 2 {
+		t.Fatalf("statuses=%#v ids=%#v", statuses, ids)
+	}
+}
+
+func TestLegacyResetSignalDeliveryStatusMigratesWithoutNotification(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	signal := resetTestSignal("legacy-delivery", model.ResetStagePossible, now)
+	if changed, err := s.ApplyResetSignalToGroup("group-a", signal); err != nil || !changed {
+		t.Fatalf("legacy apply changed=%v err=%v", changed, err)
+	}
+	notifications, err := s.ListDueResetNotifications(time.Now().Add(time.Minute), 10)
+	if err != nil || len(notifications) != 1 {
+		t.Fatalf("legacy notifications=%#v err=%v", notifications, err)
+	}
+	if err := s.MarkResetNotificationSent(notifications[0].ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	signal.Status = "pending"
+	signal.DetectedAt = signal.DetectedAt.Add(time.Minute)
+	if changed, err := s.ApplyResetSignalToGroup("group-a", signal); err != nil || changed {
+		t.Fatalf("migration changed=%v err=%v", changed, err)
+	}
+	if notifications, err := s.ListDueResetNotifications(time.Now().Add(time.Minute), 10); err != nil || len(notifications) != 0 {
+		t.Fatalf("migration notifications=%#v err=%v", notifications, err)
+	}
+	var delivery model.ResetSignalDelivery
+	err = s.db.View(func(tx *bolt.Tx) error {
+		var found bool
+		var getErr error
+		delivery, found, getErr = getResetSignalDeliveryTx(tx, "group-a", signal.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if !found {
+			return ErrNotFound
+		}
+		return nil
+	})
+	if err != nil || delivery.Stage != signal.Stage || delivery.Status != signal.Status {
+		t.Fatalf("delivery=%#v err=%v", delivery, err)
+	}
+}
+
+func TestLegacyConfirmedDeliveryDoesNotCreateActivityOrNotification(t *testing.T) {
+	path := t.TempDir() + "/legacy-confirmed.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	signal := resetTestSignal("legacy-confirmed", model.ResetStageConfirmed, now)
+	signal.Status = "confirmed"
+	legacy, err := json.Marshal(struct {
+		GroupOpenID string           `json:"group_openid"`
+		SignalID    string           `json:"signal_id"`
+		Stage       model.ResetStage `json:"stage"`
+		ProcessedAt time.Time        `json:"processed_at"`
+	}{
+		GroupOpenID: "group-a",
+		SignalID:    signal.ID,
+		Stage:       model.ResetStageConfirmed,
+		ProcessedAt: now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("reset_signal_deliveries")).Put(resetSignalDeliveryKey("group-a", signal.ID), legacy)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", signal, now)
+	if err != nil || created || activity.ID != "" {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	if notifications, err := s.ListDueResetNotifications(time.Now().Add(time.Minute), 10); err != nil || len(notifications) != 0 {
+		t.Fatalf("notifications=%#v err=%v", notifications, err)
+	}
+	if _, err := s.GetActiveResetActivity("group-a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unexpected active activity: %v", err)
+	}
+	var delivery model.ResetSignalDelivery
+	err = s.db.View(func(tx *bolt.Tx) error {
+		var found bool
+		var getErr error
+		delivery, found, getErr = getResetSignalDeliveryTx(tx, "group-a", signal.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if !found {
+			return ErrNotFound
+		}
+		return nil
+	})
+	if err != nil || delivery.Stage != model.ResetStageConfirmed || delivery.Status != signal.Status || !delivery.ProcessedAt.Equal(now.Add(-time.Minute)) {
+		t.Fatalf("delivery=%#v err=%v", delivery, err)
+	}
+}
+
+func TestRejectedOldSignalDoesNotClearNewerGroupState(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	oldSignal := resetTestSignal("old-event", model.ResetStagePossible, now)
+	oldSignal.Status = "pending"
+	newSignal := resetTestSignal("new-event", model.ResetStageImminent, now.Add(time.Minute))
+	newSignal.Status = "imminent"
+	for _, signal := range []model.ResetSignal{oldSignal, newSignal} {
+		if changed, err := s.ApplyResetSignalToGroup("group-a", signal); err != nil || !changed {
+			t.Fatalf("apply %s changed=%v err=%v", signal.ID, changed, err)
+		}
+	}
+	oldSignal.Stage = model.ResetStageUnknown
+	oldSignal.Status = "rejected"
+	if changed, err := s.ApplyResetSignalToGroup("group-a", oldSignal); err != nil || changed {
+		t.Fatalf("old rejected changed=%v err=%v", changed, err)
+	}
+	state, err := s.GetResetGroupState("group-a")
+	if err != nil || state.Stage != model.ResetStageImminent || state.SignalID != newSignal.ID {
+		t.Fatalf("state=%#v err=%v", state, err)
+	}
+	newRejected := resetTestSignal("new-rejected-event", model.ResetStageUnknown, now.Add(2*time.Minute))
+	newRejected.Status = "rejected"
+	if changed, err := s.ApplyResetSignalToGroup("group-a", newRejected); err != nil || !changed {
+		t.Fatalf("new rejected changed=%v err=%v", changed, err)
+	}
+	state, err = s.GetResetGroupState("group-a")
+	if err != nil || state.Stage != model.ResetStageUnknown || state.SignalID != newRejected.ID {
+		t.Fatalf("new rejected state=%#v err=%v", state, err)
+	}
+	if activity, created, err := s.CreateResetActivityFromSignal("group-a", resetTestSignal("late-old-confirmed", model.ResetStageConfirmed, now.Add(time.Minute)), now.Add(3*time.Minute)); err != nil || created || activity.ID != "" {
+		t.Fatalf("late old confirmed activity=%#v created=%v err=%v", activity, created, err)
+	}
+}
+
+func TestRejectedSignalDoesNotCancelActiveOrSettlingActivity(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	confirmed := resetTestSignal("confirmed-then-rejected", model.ResetStageConfirmed, now)
+	confirmed.Status = "confirmed"
+	activity, created, err := s.CreateResetActivityFromSignal("group-a", confirmed, now)
+	if err != nil || !created {
+		t.Fatalf("activity=%#v created=%v err=%v", activity, created, err)
+	}
+	rejected := confirmed
+	rejected.Stage = model.ResetStageUnknown
+	rejected.Status = "rejected"
+	if changed, err := s.ApplyResetSignalToGroup("group-a", rejected); err != nil || changed {
+		t.Fatalf("active rejected changed=%v err=%v", changed, err)
+	}
+	state, err := s.GetResetGroupState("group-a")
+	if err != nil || state.Stage != model.ResetStageConfirmed || state.ActivityID != activity.ID {
+		t.Fatalf("active state=%#v err=%v", state, err)
+	}
+	if _, started, err := s.BeginResetSettlement(activity.ID, nil, activity.EndsAt); err != nil || !started {
+		t.Fatalf("begin settlement started=%v err=%v", started, err)
+	}
+	rejected.Status = "rejected_final"
+	if changed, err := s.ApplyResetSignalToGroup("group-a", rejected); err != nil || changed {
+		t.Fatalf("settling rejected changed=%v err=%v", changed, err)
+	}
+	state, err = s.GetResetGroupState("group-a")
+	if err != nil || state.Stage != model.ResetStageConfirmed || state.ActivityID != activity.ID {
+		t.Fatalf("settling state=%#v err=%v", state, err)
+	}
+}
+
+func TestRecordResetSignalAllowsDowngradeAndReject(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	signal := resetTestSignal("record-transition", model.ResetStageImminent, now)
+	signal.Status = "imminent"
+	if changed, err := s.RecordResetSignal(signal); err != nil || !changed {
+		t.Fatalf("record imminent changed=%v err=%v", changed, err)
+	}
+	signal.DetectedAt = signal.DetectedAt.Add(time.Minute)
+	if changed, err := s.RecordResetSignal(signal); err != nil || changed {
+		t.Fatalf("same API state with new detection time changed=%v err=%v", changed, err)
+	}
+	signal.Stage = model.ResetStagePossible
+	signal.Status = "pending"
+	if changed, err := s.RecordResetSignal(signal); err != nil || !changed {
+		t.Fatalf("record downgrade changed=%v err=%v", changed, err)
+	}
+	stored, err := s.GetResetSignal(signal.ID)
+	if err != nil || stored.Stage != model.ResetStagePossible || stored.Status != "pending" {
+		t.Fatalf("downgraded signal=%#v err=%v", stored, err)
+	}
+	signal.Stage = model.ResetStageUnknown
+	signal.Status = "rejected"
+	if changed, err := s.RecordResetSignal(signal); err != nil || !changed {
+		t.Fatalf("record rejected changed=%v err=%v", changed, err)
+	}
+	if changed, err := s.RecordResetSignal(signal); err != nil || changed {
+		t.Fatalf("duplicate rejected changed=%v err=%v", changed, err)
+	}
+	stored, err = s.GetResetSignal(signal.ID)
+	if err != nil || stored.Stage != model.ResetStageUnknown || stored.Status != "rejected" {
+		t.Fatalf("rejected signal=%#v err=%v", stored, err)
 	}
 }
 

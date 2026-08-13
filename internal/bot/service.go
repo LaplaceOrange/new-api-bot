@@ -55,7 +55,7 @@ type QQAPI interface {
 
 type resetRadarClient interface {
 	Fetch(context.Context, string) (resetradar.Snapshot, error)
-	LatestTibo(context.Context, string) (resetradar.Signal, error)
+	Latest(context.Context, string) (resetradar.Signal, error)
 	Close()
 }
 
@@ -1536,12 +1536,13 @@ func helpText(cfg config.Config) string {
 	if cfg.ResetEnabled {
 		lines = append(lines,
 			"/reset check - 查看当前群的重置状态",
-			"/reset last - 查看 Tibo 最新一条推文及归类",
+			"/reset last - 查看 Codex Reset API 最新重置事件及状态",
 			"/reset join - 参加当前群正在进行的重置补偿抽奖",
+			"管理员：/reset new - 按当前群设置手动开启新活动",
 			"管理员：/reset set duration <时长> - 设置下一轮活动有效期",
 			"管理员：/reset set winners <人数> - 设置下一轮抽取人数",
 			"管理员：/reset set lookback <时长> - 设置下一轮补偿回溯时间",
-			"管理员：/reset proxy <代理链接|off> - 设置 X 检测代理",
+			"管理员：/reset proxy <代理链接|off> - 设置 Codex Reset API 检测代理",
 		)
 	}
 	return strings.Join(lines, "\n")
