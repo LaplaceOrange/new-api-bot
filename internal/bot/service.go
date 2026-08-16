@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"math/big"
 	"net/http"
 	"sort"
 	"strconv"
@@ -107,6 +108,8 @@ type Service struct {
 	resetNotifyMu    sync.Mutex
 	resetGroups      keyedLocker[string]
 	resetSettleWake  chan struct{}
+	now              func() time.Time
+	randomCheckinCap func() (int64, error)
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
@@ -118,7 +121,7 @@ func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI
 	}
 	service := &Service{
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
-		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1), resetSettleWake: make(chan struct{}, 1),
+		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1), resetSettleWake: make(chan struct{}, 1), now: time.Now, randomCheckinCap: randomCheckinCreditCap,
 	}
 	if cfg.ResetEnabled {
 		service.resetRadar = resetradar.NewScanner(cfg.ResetHTTPTimeout, cfg.ResetSignalMaxAge)
@@ -176,6 +179,11 @@ func (s *Service) Start(ctx context.Context) {
 		}()
 	}
 	go s.runInboxDispatcher(ctx)
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		s.runUpgradeCompletionWorker(ctx)
+	}()
 	go func() {
 		s.workers.Wait()
 		close(s.workersDone)
@@ -221,6 +229,12 @@ func (s *Service) backgroundCommandContext(parent context.Context, timeout time.
 }
 
 func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) bool {
+	group := firstNonEmpty(event.Message.GroupOpenID, event.Member.GroupOpenID, event.JoinRequest.GroupOpenID)
+	if group != "" {
+		if err := s.store.ObserveGroup(group); err != nil {
+			s.logger.Warn("记录已知 QQ 群失败", "group_openid", group, "error", err)
+		}
+	}
 	if event.Message.ID != "" {
 		content := strings.TrimSpace(event.Message.Content)
 		if content == "" || !strings.HasPrefix(content, "/") {
@@ -507,8 +521,8 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	}
 }
 
-// commandTimeout leaves room for one New API request, a QQ reply, and an
-// additional New API request for commands such as /checkin on a cold cache.
+// commandTimeout leaves room for the three sequential New API requests used
+// by /checkin (status, yesterday usage, quota update) and the QQ reply.
 func commandTimeout(newAPITimeout, qqAPITimeout time.Duration) time.Duration {
 	const minimum = 25 * time.Second
 	const replyReserve = 5 * time.Second
@@ -518,7 +532,7 @@ func commandTimeout(newAPITimeout, qqAPITimeout time.Duration) time.Duration {
 	if qqAPITimeout <= 0 {
 		qqAPITimeout = 10 * time.Second
 	}
-	timeout := newAPITimeout*2 + qqAPITimeout + replyReserve
+	timeout := newAPITimeout*3 + qqAPITimeout + replyReserve
 	if timeout < minimum {
 		return minimum
 	}
@@ -781,39 +795,36 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 	if err != nil {
 		return s.reply(ctx, event, "未找到绑定信息。")
 	}
-	period, next := periodKey(time.Now(), s.cfg.CheckinPeriod, s.cfg.CheckinTimezone)
+	now := s.now()
+	period, next := periodKey(now, s.cfg.CheckinPeriod, s.cfg.CheckinTimezone)
 	lockKey := canonical + "|" + period
 	unlock := s.checkins.Lock(lockKey)
 	defer unlock()
-
-	credit, err := s.currentCheckinCredit()
-	if err != nil {
-		return s.reply(ctx, event, "读取签到额度配置失败，请联系管理员。")
+	if existing, existingErr := s.store.GetCheckin(canonical, period); existingErr == nil {
+		return s.replyExistingCheckin(ctx, event, existing, next)
+	} else if !errors.Is(existingErr, store.ErrNotFound) {
+		return s.reply(ctx, event, "读取签到状态失败，请稍后重试。")
 	}
+
 	status, err := s.newAPI.GetStatus(ctx, false)
 	if err != nil {
 		return s.reply(ctx, event, publicError(err))
 	}
-	rawQuota, err := newapi.DisplayToQuota(credit, status.QuotaPerUnit)
+	rawQuota, usageQuota, capCredit, err := s.dynamicCheckinQuota(ctx, binding.NewAPIID, now, status.QuotaPerUnit)
 	if err != nil {
-		return s.reply(ctx, event, "签到额度配置无效，请联系管理员："+err.Error())
+		return s.reply(ctx, event, "计算签到额度失败："+publicError(err))
 	}
+	credit := newapi.QuotaToDisplay(rawQuota, status.QuotaPerUnit)
 	record := model.CheckinRecord{
 		CanonicalID: canonical, NewAPIID: binding.NewAPIID, PeriodKey: period,
-		RawQuota: rawQuota, DisplayCredit: credit, CreatedAt: time.Now(), UpdatedAt: time.Now(), Status: "pending",
+		RawQuota: rawQuota, DisplayCredit: credit, CreatedAt: now, UpdatedAt: now, Status: "pending",
 	}
 	record, created, err := s.store.ReserveCheckin(record)
 	if err != nil {
 		return s.reply(ctx, event, "保存签到状态失败，请稍后重试。")
 	}
 	if !created {
-		if record.Status == "completed" {
-			return s.reply(ctx, event, fmt.Sprintf("本周期已经签到，额度 %s 已发放至绑定的 New API 用户 %d；下次可签到时间：%s", record.DisplayCredit, record.NewAPIID, next.Format("2006-01-02 15:04 MST")))
-		}
-		if record.Status == "pending_confirmation" {
-			return s.reply(ctx, event, "本周期签到额度发放结果待确认，请勿重复签到；如长时间未到账请联系管理员核查。")
-		}
-		return s.reply(ctx, event, "本周期签到请求正在处理中，请勿重复提交；如长时间未到账请联系管理员核查。")
+		return s.replyExistingCheckin(ctx, event, record, next)
 	}
 	if err := s.newAPI.AddQuota(ctx, binding.NewAPIID, rawQuota); err != nil {
 		if isAmbiguousQuotaWrite(err) {
@@ -823,11 +834,11 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 			if saveErr := s.store.FinalizeCheckin(record); saveErr != nil {
 				s.logger.Error("签到结果待确认状态保存失败", "canonical", canonical, "newapi_user_id", binding.NewAPIID, "error", saveErr)
 			}
-			_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: "额度写入结果待确认：" + publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota}})
+			_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: "额度写入结果待确认：" + publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota, "yesterday_usage_quota": usageQuota, "random_cap_credit": capCredit}})
 			return s.reply(ctx, event, "签到额度请求超时，发放结果待确认。请勿重复签到；如长时间未到账请联系管理员核查。")
 		}
 		_ = s.store.DeletePendingCheckin(record)
-		_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota}})
+		_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota, "yesterday_usage_quota": usageQuota, "random_cap_credit": capCredit}})
 		return s.reply(ctx, event, publicError(err))
 	}
 	record.Status = "completed"
@@ -836,8 +847,68 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 		s.logger.Error("签到额度已发放但保存完成状态失败", "canonical", canonical, "newapi_user_id", binding.NewAPIID, "error", err)
 		return s.reply(ctx, event, "额度已经发放，但本地签到状态保存失败，请联系管理员核查，勿重复签到。")
 	}
-	_ = s.store.AddAudit(model.AuditRecord{At: time.Now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: true, Metadata: map[string]any{"period": period, "quota": rawQuota, "display_credit": credit}})
-	return s.reply(ctx, event, fmt.Sprintf("🎉 签到成功！额度 %s 已直接发放至绑定的 New API 用户 %d。", credit, binding.NewAPIID))
+	_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: true, Metadata: map[string]any{"period": period, "quota": rawQuota, "display_credit": credit, "yesterday_usage_quota": usageQuota, "random_cap_credit": capCredit}})
+	return s.reply(ctx, event, fmt.Sprintf("🎉 签到成功！昨日消耗额度 %s，本次随机上限 %d，已发放额度 %s 至绑定的 New API 用户 %d。", newapi.QuotaToDisplay(usageQuota, status.QuotaPerUnit), capCredit, credit, binding.NewAPIID))
+}
+
+func (s *Service) replyExistingCheckin(ctx context.Context, event qq.MessageEvent, record model.CheckinRecord, next time.Time) error {
+	if record.Status == "completed" {
+		return s.reply(ctx, event, fmt.Sprintf("本周期已经签到，额度 %s 已发放至绑定的 New API 用户 %d；下次可签到时间：%s", record.DisplayCredit, record.NewAPIID, next.Format("2006-01-02 15:04 MST")))
+	}
+	if record.Status == "pending_confirmation" {
+		return s.reply(ctx, event, "本周期签到额度发放结果待确认，请勿重复签到；如长时间未到账请联系管理员核查。")
+	}
+	return s.reply(ctx, event, "本周期签到请求正在处理中，请勿重复提交；如长时间未到账请联系管理员核查。")
+}
+
+func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.Time, quotaPerUnit int64) (reward, yesterdayUsage, capCredit int64, err error) {
+	if quotaPerUnit <= 0 {
+		return 0, 0, 0, errors.New("quota_per_unit 必须大于 0")
+	}
+	start, end := previousNaturalDay(now, s.cfg.CheckinTimezone)
+	rows, err := s.newAPI.ListUsageByUser(ctx, start, end)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	for _, row := range rows {
+		if row.UserID != userID || row.Quota <= 0 {
+			continue
+		}
+		if row.Quota > math.MaxInt64-yesterdayUsage {
+			return 0, 0, 0, errors.New("昨日用量额度超出支持范围")
+		}
+		yesterdayUsage += row.Quota
+	}
+	capCredit, err = s.randomCheckinCap()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("生成随机签到上限失败: %w", err)
+	}
+	if capCredit < 5 || capCredit > 10 || quotaPerUnit > math.MaxInt64/capCredit {
+		return 0, 0, 0, errors.New("随机签到上限无效")
+	}
+	reward = yesterdayUsage
+	if reward < quotaPerUnit {
+		reward = quotaPerUnit
+	}
+	capQuota := capCredit * quotaPerUnit
+	if reward > capQuota {
+		reward = capQuota
+	}
+	return reward, yesterdayUsage, capCredit, nil
+}
+
+func previousNaturalDay(now time.Time, location *time.Location) (time.Time, time.Time) {
+	local := now.In(location)
+	end := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+	return end.AddDate(0, 0, -1), end
+}
+
+func randomCheckinCreditCap() (int64, error) {
+	value, err := rand.Int(rand.Reader, big.NewInt(6))
+	if err != nil {
+		return 0, err
+	}
+	return value.Int64() + 5, nil
 }
 
 func (s *Service) handleCheckinStatus(ctx context.Context, event qq.MessageEvent, canonical string) error {
@@ -1223,7 +1294,7 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 		return s.reply(ctx, event, "你没有执行管理员指令的权限。")
 	}
 	if len(fields) < 2 {
-		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户>、/admin report [时间长度] 或 /admin checkin [edit <发放额度>]")
+		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户>、/admin report [时间长度] 或 /admin checkin")
 	}
 	switch strings.ToLower(fields[1]) {
 	case "bindings":
@@ -1281,7 +1352,7 @@ func (s *Service) handleAdmin(ctx context.Context, event qq.MessageEvent, canoni
 		}
 		return s.handleAdminUser(ctx, event, canonical, identity, fields)
 	default:
-		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户>、/admin report [时间长度] 或 /admin checkin [edit <发放额度>]")
+		return s.reply(ctx, event, "用法：/admin bindings [页码]、/admin unbind <用户ID或@用户>、/admin report [时间长度] 或 /admin checkin")
 	}
 }
 
@@ -1513,7 +1584,7 @@ func helpText(cfg config.Config) string {
 		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）",
 		"管理员：/plan add、/plan sub、/plan view <用户ID或@群成员>",
 		"管理员：/admin bindings、/admin unbind <用户ID或@群成员>",
-		"管理员：/admin checkin、/admin checkin edit <发放额度>",
+		"管理员：/admin checkin - 查看今日签到统计与动态发放规则",
 		"管理员：/admin report [时间长度] - 查看全站用量摘要",
 		"管理员：/welcome on|off|set <欢迎语>、/recall",
 		"管理员：/join on|off|status、/join limit <QQ等级>、/join check \"<匹配字符串>\" - 配置入群自动审批",

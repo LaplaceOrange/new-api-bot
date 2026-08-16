@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -75,6 +76,27 @@ func TestListGroupBindingsUsesObservedGroupAliases(t *testing.T) {
 	}
 	if len(bindings) != 2 || bindings[0].NewAPIID != 1 || bindings[1].NewAPIID != 2 {
 		t.Fatalf("unexpected group bindings: %#v", bindings)
+	}
+}
+
+func TestListKnownGroupsIncludesObservedAndLegacyData(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.ObserveGroup("group-observed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateBinding(model.Binding{CanonicalID: "member:group-binding:member-1", NewAPIID: 7, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutGroupWelcome(model.GroupWelcome{GroupOpenID: "group-welcome", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	groups, err := s.ListKnownGroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"group-binding", "group-observed", "group-welcome"}
+	if !reflect.DeepEqual(groups, want) {
+		t.Fatalf("groups=%v, want %v", groups, want)
 	}
 }
 

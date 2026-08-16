@@ -39,6 +39,7 @@ type fakeNewAPI struct {
 	subscriptions  map[int][]newapi.UserSubscriptionRecord
 	nextSubID      int
 	usageByUser    []newapi.UsageRecord
+	usageUserErr   error
 	usageUserCalls int
 	usageRanges    []usageRange
 	usageByModel   []newapi.UsageRecord
@@ -110,6 +111,9 @@ func (f *fakeNewAPI) SubtractQuota(_ context.Context, userID int, quota int64) e
 func (f *fakeNewAPI) ListUsageByUser(_ context.Context, start, end time.Time) ([]newapi.UsageRecord, error) {
 	f.usageUserCalls++
 	f.usageRanges = append(f.usageRanges, usageRange{Start: start, End: end})
+	if f.usageUserErr != nil {
+		return nil, f.usageUserErr
+	}
 	return append([]newapi.UsageRecord(nil), f.usageByUser...), nil
 }
 func (f *fakeNewAPI) ListUsageByModel(_ context.Context, _ time.Time, _ time.Time, username string) ([]newapi.UsageRecord, error) {
@@ -1244,6 +1248,9 @@ func TestCheckinIsIdempotent(t *testing.T) {
 	if api.quotaAdds != 1 {
 		t.Fatalf("quota adds=%d", api.quotaAdds)
 	}
+	if api.usageUserCalls != 1 {
+		t.Fatalf("usage calls=%d, want 1", api.usageUserCalls)
+	}
 	if api.lastQuotaUser != 42 || api.lastQuota != 500000 {
 		t.Fatalf("quota user=%d raw=%d", api.lastQuotaUser, api.lastQuota)
 	}
@@ -1318,7 +1325,7 @@ func TestUsageChartBusyFailsFast(t *testing.T) {
 }
 
 func TestCommandTimeoutAllowsTwoNewAPIRequestsAndReply(t *testing.T) {
-	if got, want := commandTimeout(30*time.Second, 10*time.Second), 75*time.Second; got != want {
+	if got, want := commandTimeout(30*time.Second, 10*time.Second), 105*time.Second; got != want {
 		t.Fatalf("commandTimeout()=%s, want %s", got, want)
 	}
 	if got, want := commandTimeout(time.Second, time.Second), 25*time.Second; got != want {
@@ -1326,7 +1333,7 @@ func TestCommandTimeoutAllowsTwoNewAPIRequestsAndReply(t *testing.T) {
 	}
 }
 
-func TestAdminCheckinStatsAndImmediateCreditEdit(t *testing.T) {
+func TestAdminCheckinStatsUsesDynamicRule(t *testing.T) {
 	service, storage, api, qqAPI, _ := testService(t)
 	now := time.Now()
 	for _, binding := range []model.Binding{
@@ -1352,19 +1359,113 @@ func TestAdminCheckinStatsAndImmediateCreditEdit(t *testing.T) {
 	}
 
 	service.process(context.Background(), c2cEvent("admin", "/admin checkin"))
-	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "签到人数：2") || !strings.Contains(reply, "已发放额度：3") || !strings.Contains(reply, "处理中签到：1") {
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "签到人数：2") || !strings.Contains(reply, "已发放额度：3") || !strings.Contains(reply, "处理中签到：1") || !strings.Contains(reply, "随机上限5~10") {
 		t.Fatalf("unexpected checkin stats: %q", reply)
 	}
 	service.process(context.Background(), c2cEvent("admin", "/admin checkin edit 2.5"))
-	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "更新为 2.5") || !strings.Contains(reply, "已立即生效") {
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "动态规则") || !strings.Contains(reply, "不再修改") {
 		t.Fatalf("unexpected checkin edit reply: %q", reply)
 	}
-	if credit, err := storage.GetCheckinCreditOverride(); err != nil || credit != "2.5" {
-		t.Fatalf("checkin credit override=%q err=%v", credit, err)
-	}
+	service.randomCheckinCap = func() (int64, error) { return 8, nil }
+	api.usageByUser = []newapi.UsageRecord{{UserID: 46, Quota: 1750000}}
 	service.process(context.Background(), c2cEvent("fresh", "/checkin"))
-	if api.lastQuota != 1250000 {
-		t.Fatalf("updated checkin quota=%d, want 1250000", api.lastQuota)
+	if api.lastQuota != 1750000 {
+		t.Fatalf("dynamic checkin quota=%d, want 1750000", api.lastQuota)
+	}
+}
+
+func TestDynamicCheckinQuotaBoundsAndYesterdayRange(t *testing.T) {
+	service, _, api, _, _ := testService(t)
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.cfg.CheckinTimezone = location
+	now := time.Date(2026, 8, 16, 13, 30, 0, 0, location)
+	service.randomCheckinCap = func() (int64, error) { return 6, nil }
+
+	tests := []struct {
+		name  string
+		rows  []newapi.UsageRecord
+		want  int64
+		usage int64
+	}{
+		{name: "no usage receives minimum", want: 500000},
+		{name: "below minimum receives minimum", rows: []newapi.UsageRecord{{UserID: 42, Quota: 250000}}, want: 500000, usage: 250000},
+		{name: "usage is summed", rows: []newapi.UsageRecord{{UserID: 42, Quota: 1000000}, {UserID: 7, Quota: 9000000}, {UserID: 42, Quota: 750000}}, want: 1750000, usage: 1750000},
+		{name: "usage is capped", rows: []newapi.UsageRecord{{UserID: 42, Quota: 9000000}}, want: 3000000, usage: 9000000},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api.usageByUser = test.rows
+			api.usageRanges = nil
+			got, usage, capCredit, err := service.dynamicCheckinQuota(context.Background(), 42, now, 500000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want || usage != test.usage || capCredit != 6 {
+				t.Fatalf("reward=%d usage=%d cap=%d, want reward=%d usage=%d cap=6", got, usage, capCredit, test.want, test.usage)
+			}
+			if len(api.usageRanges) != 1 {
+				t.Fatalf("usage calls=%d", len(api.usageRanges))
+			}
+			wantStart := time.Date(2026, 8, 15, 0, 0, 0, 0, location)
+			wantEnd := time.Date(2026, 8, 16, 0, 0, 0, 0, location)
+			if !api.usageRanges[0].Start.Equal(wantStart) || !api.usageRanges[0].End.Equal(wantEnd) {
+				t.Fatalf("usage range=[%s,%s), want [%s,%s)", api.usageRanges[0].Start, api.usageRanges[0].End, wantStart, wantEnd)
+			}
+		})
+	}
+}
+
+func TestPreviousNaturalDayCrossesMonthAndYear(t *testing.T) {
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := previousNaturalDay(time.Date(2026, 1, 1, 8, 0, 0, 0, location), location)
+	if want := time.Date(2025, 12, 31, 0, 0, 0, 0, location); !start.Equal(want) {
+		t.Fatalf("start=%s, want %s", start, want)
+	}
+	if want := time.Date(2026, 1, 1, 0, 0, 0, 0, location); !end.Equal(want) {
+		t.Fatalf("end=%s, want %s", end, want)
+	}
+}
+
+func TestRandomCheckinCreditCapRange(t *testing.T) {
+	seen := make(map[int64]bool)
+	for i := 0; i < 256; i++ {
+		value, err := randomCheckinCreditCap()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value < 5 || value > 10 {
+			t.Fatalf("cap=%d outside [5,10]", value)
+		}
+		seen[value] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("random generator produced only %v", seen)
+	}
+}
+
+func TestCheckinUsageFailureDoesNotReserveOrAddQuota(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	service.now = func() time.Time { return time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC) }
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: service.now()}); err != nil {
+		t.Fatal(err)
+	}
+	api.usageUserErr = errors.New("usage unavailable")
+	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	if api.quotaAdds != 0 {
+		t.Fatalf("quota adds=%d", api.quotaAdds)
+	}
+	period, _ := periodKey(service.now(), service.cfg.CheckinPeriod, service.cfg.CheckinTimezone)
+	if _, err := storage.GetCheckin("user:u1", period); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("checkin record err=%v, want not found", err)
+	}
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "计算签到额度失败") {
+		t.Fatalf("unexpected reply: %q", reply)
 	}
 }
 

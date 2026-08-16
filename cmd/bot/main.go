@@ -69,17 +69,33 @@ func main() {
 	}
 	preflightCancel()
 
-	appCtx, stopSignal := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stopSignal()
+	appCtx, stopApp := context.WithCancel(context.Background())
+	defer stopApp()
+	shutdownSignals := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(shutdownSignals)
 	serviceCtx, cancelService := context.WithCancel(context.Background())
 	service.Start(serviceCtx)
+	go func() {
+		select {
+		case received := <-shutdownSignals:
+			logger.Info("收到退出信号，发布升级通知", "signal", received.String())
+			notifyCtx, notifyCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if err := service.AnnounceUpgradeStart(notifyCtx); err != nil {
+				logger.Warn("机器人升级开始通知未全部发送成功", "error", err)
+			}
+			notifyCancel()
+			stopApp()
+		case <-appCtx.Done():
+		}
+	}()
 
 	gatewayDone := make(chan struct{})
 	go func() {
 		defer close(gatewayDone)
 		if err := gateway.Run(appCtx, service.HandleGateway); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("QQ Gateway 已停止", "error", err)
-			stopSignal()
+			stopApp()
 		}
 	}()
 
@@ -98,7 +114,7 @@ func main() {
 		logger.Info("健康检查服务已启动", "listen", cfg.ListenAddr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("健康检查服务异常退出", "error", err)
-			stopSignal()
+			stopApp()
 		}
 	}()
 

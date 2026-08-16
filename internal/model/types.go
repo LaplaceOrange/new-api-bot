@@ -41,6 +41,11 @@ type CheckinRecord struct {
 	LastError      string    `json:"last_error,omitempty"`
 }
 
+type UpgradeNotification struct {
+	StartedAt time.Time `json:"started_at"`
+	Groups    []string  `json:"groups"`
+}
+
 type AuditRecord struct {
 	At          time.Time      `json:"at"`
 	Actor       string         `json:"actor"`

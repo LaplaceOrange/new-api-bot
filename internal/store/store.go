@@ -38,6 +38,7 @@ var buckets = [][]byte{
 	[]byte("bindings_by_user"),
 	[]byte("aliases"),
 	[]byte("contacts"),
+	[]byte("observed_groups"),
 	[]byte("pending_binds"),
 	[]byte("email_rate"),
 	[]byte("link_codes"),
@@ -336,6 +337,95 @@ func (s *Store) GetContact(canonical string) (string, error) {
 		return nil
 	})
 	return result, err
+}
+
+func (s *Store) ObserveGroup(group string) error {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return nil
+	}
+	var observed bool
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		observed = tx.Bucket([]byte("observed_groups")).Get([]byte(group)) != nil
+		return nil
+	}); err != nil {
+		return err
+	}
+	if observed {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if tx.Bucket([]byte("observed_groups")).Get([]byte(group)) != nil {
+			return nil
+		}
+		return tx.Bucket([]byte("observed_groups")).Put([]byte(group), []byte{1})
+	})
+}
+
+func (s *Store) ListKnownGroups() ([]string, error) {
+	groups := make(map[string]struct{})
+	add := func(group string) {
+		if group = strings.TrimSpace(group); group != "" {
+			groups[group] = struct{}{}
+		}
+	}
+	addMemberAlias := func(value string) {
+		if !strings.HasPrefix(value, "member:") {
+			return
+		}
+		value = strings.TrimPrefix(value, "member:")
+		if separator := strings.LastIndexByte(value, ':'); separator > 0 {
+			add(value[:separator])
+		}
+	}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if err := tx.Bucket([]byte("observed_groups")).ForEach(func(key, _ []byte) error {
+			add(string(key))
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, bucketName := range []string{"aliases", "bindings"} {
+			if err := tx.Bucket([]byte(bucketName)).ForEach(func(key, _ []byte) error {
+				addMemberAlias(string(key))
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		for _, bucketName := range []string{"group_welcome", "group_join_approval", "reset_settings"} {
+			if err := tx.Bucket([]byte(bucketName)).ForEach(func(key, _ []byte) error {
+				add(string(key))
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		for _, bucketName := range []string{"quota_notifications", "benefit_campaigns", "reset_activities"} {
+			if err := tx.Bucket([]byte(bucketName)).ForEach(func(_, value []byte) error {
+				var record struct {
+					GroupOpenID string `json:"group_openid"`
+				}
+				if err := json.Unmarshal(value, &record); err != nil {
+					return err
+				}
+				add(record.GroupOpenID)
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, 0, len(groups))
+	for group := range groups {
+		result = append(result, group)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 func (s *Store) CreateBinding(binding model.Binding) error {
@@ -776,6 +866,75 @@ func (s *Store) PutCheckinCreditOverride(credit string) error {
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket([]byte("runtime_settings")).Put([]byte("checkin_credit"), []byte(credit))
+	})
+}
+
+func (s *Store) PutUpgradeNotification(notification model.UpgradeNotification) error {
+	groups := make(map[string]struct{}, len(notification.Groups))
+	cleaned := make([]string, 0, len(notification.Groups))
+	for _, group := range notification.Groups {
+		group = strings.TrimSpace(group)
+		if group == "" {
+			continue
+		}
+		if _, exists := groups[group]; exists {
+			continue
+		}
+		groups[group] = struct{}{}
+		cleaned = append(cleaned, group)
+	}
+	sort.Strings(cleaned)
+	if notification.StartedAt.IsZero() {
+		notification.StartedAt = time.Now()
+	}
+	notification.Groups = cleaned
+	data, err := json.Marshal(notification)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("runtime_settings")).Put([]byte("upgrade_notification"), data)
+	})
+}
+
+func (s *Store) GetUpgradeNotification() (model.UpgradeNotification, error) {
+	var notification model.UpgradeNotification
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte("runtime_settings")).Get([]byte("upgrade_notification"))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &notification)
+	})
+	return notification, err
+}
+
+func (s *Store) CompleteUpgradeNotificationGroup(group string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("runtime_settings"))
+		data := bucket.Get([]byte("upgrade_notification"))
+		if data == nil {
+			return nil
+		}
+		var notification model.UpgradeNotification
+		if err := json.Unmarshal(data, &notification); err != nil {
+			return err
+		}
+		remaining := notification.Groups[:0]
+		for _, candidate := range notification.Groups {
+			if candidate != group {
+				remaining = append(remaining, candidate)
+			}
+		}
+		if len(remaining) == 0 {
+			return bucket.Delete([]byte("upgrade_notification"))
+		}
+		notification.Groups = remaining
+		updated, err := json.Marshal(notification)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("upgrade_notification"), updated)
 	})
 }
 
