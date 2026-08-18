@@ -1374,6 +1374,7 @@ func TestAdminCheckinStatsUsesDynamicRule(t *testing.T) {
 		t.Fatalf("unexpected checkin edit reply: %q", reply)
 	}
 	service.randomCheckinMultiplier = func() (int64, error) { return 10, nil }
+	service.randomCheckinMaxCredit = func() (int64, error) { return 10, nil }
 	api.usageByUser = []newapi.UsageRecord{{UserID: 46, Quota: 1750000}}
 	service.process(context.Background(), c2cEvent("fresh", "/checkin"))
 	if api.lastQuota != 1750000 {
@@ -1390,6 +1391,7 @@ func TestDynamicCheckinQuotaBoundsAndYesterdayRange(t *testing.T) {
 	service.cfg.CheckinTimezone = location
 	now := time.Date(2026, 8, 16, 13, 30, 0, 0, location)
 	service.randomCheckinMultiplier = func() (int64, error) { return 20, nil }
+	service.randomCheckinMaxCredit = func() (int64, error) { return 5, nil }
 
 	tests := []struct {
 		name  string
@@ -1399,9 +1401,10 @@ func TestDynamicCheckinQuotaBoundsAndYesterdayRange(t *testing.T) {
 	}{
 		{name: "no usage receives minimum quota", want: 500000},
 		{name: "below minimum is clamped after multiplication", rows: []newapi.UsageRecord{{UserID: 42, Quota: 250000}}, want: 500000, usage: 250000},
-		{name: "usage is summed and multiplied", rows: []newapi.UsageRecord{{UserID: 42, Quota: 1000000}, {UserID: 7, Quota: 9000000}, {UserID: 42, Quota: 750000}}, want: 3500000, usage: 1750000},
-		{name: "username fallback is multiplied", rows: []newapi.UsageRecord{{Username: "alice", Quota: 1750000}, {Username: "other", Quota: 9000000}}, want: 3500000, usage: 1750000},
-		{name: "usage is no longer capped at five to ten", rows: []newapi.UsageRecord{{UserID: 42, Quota: 9000000}}, want: 18000000, usage: 9000000},
+		{name: "display result rounds to one decimal", rows: []newapi.UsageRecord{{UserID: 42, Quota: 312500}}, want: 650000, usage: 312500},
+		{name: "usage is summed and multiplied", rows: []newapi.UsageRecord{{UserID: 42, Quota: 1000000}, {UserID: 7, Quota: 9000000}, {UserID: 42, Quota: 750000}}, want: 2500000, usage: 1750000},
+		{name: "username fallback is multiplied", rows: []newapi.UsageRecord{{Username: "alice", Quota: 1750000}, {Username: "other", Quota: 9000000}}, want: 2500000, usage: 1750000},
+		{name: "usage is capped by random display limit", rows: []newapi.UsageRecord{{UserID: 42, Quota: 9000000}}, want: 2500000, usage: 9000000},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1449,6 +1452,23 @@ func TestRandomCheckinMultiplierRange(t *testing.T) {
 		}
 		if value < 10 || value > 30 {
 			t.Fatalf("multiplier tenths=%d outside [10,30]", value)
+		}
+		seen[value] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("random generator produced only %v", seen)
+	}
+}
+
+func TestRandomCheckinMaxCreditRange(t *testing.T) {
+	seen := make(map[int64]bool)
+	for i := 0; i < 128; i++ {
+		value, err := randomCheckinMaxCredit()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value < 5 || value > 10 {
+			t.Fatalf("max credit=%d outside [5,10]", value)
 		}
 		seen[value] = true
 	}

@@ -110,6 +110,7 @@ type Service struct {
 	resetSettleWake         chan struct{}
 	now                     func() time.Time
 	randomCheckinMultiplier func() (int64, error)
+	randomCheckinMaxCredit  func() (int64, error)
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
@@ -121,7 +122,7 @@ func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI
 	}
 	service := &Service{
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
-		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1), resetSettleWake: make(chan struct{}, 1), now: time.Now, randomCheckinMultiplier: randomCheckinMultiplier,
+		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1), resetSettleWake: make(chan struct{}, 1), now: time.Now, randomCheckinMultiplier: randomCheckinMultiplier, randomCheckinMaxCredit: randomCheckinMaxCredit,
 	}
 	if cfg.ResetEnabled {
 		service.resetRadar = resetradar.NewScanner(cfg.ResetHTTPTimeout, cfg.ResetSignalMaxAge)
@@ -909,15 +910,35 @@ func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.
 	if multiplierTenths < 10 || multiplierTenths > 30 {
 		return 0, 0, 0, errors.New("随机签到倍数无效")
 	}
-	if yesterdayUsage > (math.MaxInt64-5)/multiplierTenths {
+	maxCredit, err := s.randomCheckinMaxCredit()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("生成签到额度上限失败: %w", err)
+	}
+	if maxCredit < 5 || maxCredit > 10 {
+		return 0, 0, 0, errors.New("随机签到额度上限无效")
+	}
+	// Keep the calculation in display-credit tenths. The quotient is the
+	// exact value of (yesterday usage * multiplier) * 10 in display units.
+	usageProduct := new(big.Int).Mul(big.NewInt(yesterdayUsage), big.NewInt(multiplierTenths))
+	displayTenths := roundPositiveQuotient(usageProduct, big.NewInt(quotaPerUnit))
+	if !displayTenths.IsInt64() {
 		return 0, 0, 0, errors.New("签到额度超出支持范围")
 	}
-	// multiplierTenths is a one-decimal multiplier. Round half up because the
-	// New API quota field must remain an integer.
-	reward = (yesterdayUsage*multiplierTenths + 5) / 10
-	if reward < quotaPerUnit {
-		reward = quotaPerUnit
+	displayTenthsValue := displayTenths.Int64()
+	if displayTenthsValue < 10 {
+		displayTenthsValue = 10
 	}
+	if displayTenthsValue > maxCredit*10 {
+		displayTenthsValue = maxCredit * 10
+	}
+	// Convert the one-decimal display value back to the integer quota used by
+	// New API, rounding half up only at the final storage boundary.
+	rewardBig := new(big.Int).Mul(big.NewInt(displayTenthsValue), big.NewInt(quotaPerUnit))
+	rewardBig = roundPositiveQuotient(rewardBig, big.NewInt(10))
+	if !rewardBig.IsInt64() {
+		return 0, 0, 0, errors.New("签到额度超出支持范围")
+	}
+	reward = rewardBig.Int64()
 	return reward, yesterdayUsage, multiplierTenths, nil
 }
 
@@ -933,6 +954,23 @@ func randomCheckinMultiplier() (int64, error) {
 		return 0, err
 	}
 	return value.Int64() + 10, nil
+}
+
+func randomCheckinMaxCredit() (int64, error) {
+	value, err := rand.Int(rand.Reader, big.NewInt(6))
+	if err != nil {
+		return 0, err
+	}
+	return value.Int64() + 5, nil
+}
+
+func roundPositiveQuotient(numerator, denominator *big.Int) *big.Int {
+	quotient, remainder := new(big.Int), new(big.Int)
+	quotient.QuoRem(numerator, denominator, remainder)
+	if remainder.Sign() > 0 && new(big.Int).Lsh(remainder, 1).Cmp(denominator) >= 0 {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+	return quotient
 }
 
 func (s *Service) handleCheckinStatus(ctx context.Context, event qq.MessageEvent, canonical string) error {

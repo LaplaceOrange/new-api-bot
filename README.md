@@ -192,7 +192,7 @@ $bytes = New-Object byte[] 32
 
 ### 签到与额度换算
 
-签到奖励按 `CHECKIN_TIMEZONE` 的昨日自然日计算：`max(用户昨日总额度用量 × rand(1.0, 3.0), 1)`。随机倍数以 0.1 为步进并包含 1.0 和 3.0；结果换算为整数 quota 时采用四舍五入，没有昨日用量或乘积低于 1 个显示额度时按 1 个显示额度发放。`CHECKIN_CREDIT` 仅为旧版部署兼容项，不再影响签到结果。
+签到奖励按 `CHECKIN_TIMEZONE` 的昨日自然日计算：`min(max(round1(昨日显示用量 × rand(1.0, 3.0)), 1), randInt(5, 10))`。随机倍数以 0.1 为步进并包含 1.0 和 3.0；上限为包含 5 和 10 的随机整数。所有计算使用显示额度，最终再换算为 New API 的整数 quota。`CHECKIN_CREDIT` 仅为旧版部署兼容项，不再影响签到结果。
 
 `CREDIT_MAX_PER_COMMAND` 和 `/credit add` 使用 New API 页面显示的额度单位。服务读取 `/api/status` 中的 `quota_per_unit` 进行精确有理数换算，不使用浮点数。
 
@@ -319,7 +319,7 @@ go build -trimpath -ldflags="-s -w" -o bin/new-api-bot.exe ./cmd/bot
 ## 签到一致性
 
 - 签到同时按 QQ 主身份、New API 用户 ID 和周期键去重。
-- 签到查询 `CHECKIN_TIMEZONE` 下昨日 `[00:00, 今日00:00)` 的用户总用量，并按 `max(昨日用量 × rand(1.0,3.0), 1)` 计算奖励。
+- 签到查询 `CHECKIN_TIMEZONE` 下昨日 `[00:00, 今日00:00)` 的用户总用量，换算为显示额度后按 `min(max(round1(昨日显示用量 × rand(1.0,3.0)), 1), randInt(5,10))` 计算奖励。
 - 签到通过 New API `add_quota` 操作直接增加绑定用户额度，不创建兑换码。
 - 已完成签到时重复执行只返回本周期已签到，不会再次增加额度。
 - 明确的 New API 请求失败会撤销本地待处理记录，用户可稍后重试。
