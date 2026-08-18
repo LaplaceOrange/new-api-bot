@@ -1393,6 +1393,7 @@ func TestDynamicCheckinQuotaBoundsAndYesterdayRange(t *testing.T) {
 		{name: "no usage receives minimum", want: 500000},
 		{name: "below minimum receives minimum", rows: []newapi.UsageRecord{{UserID: 42, Quota: 250000}}, want: 500000, usage: 250000},
 		{name: "usage is summed", rows: []newapi.UsageRecord{{UserID: 42, Quota: 1000000}, {UserID: 7, Quota: 9000000}, {UserID: 42, Quota: 750000}}, want: 1750000, usage: 1750000},
+		{name: "username fallback when user id is omitted", rows: []newapi.UsageRecord{{Username: "alice", Quota: 1750000}, {Username: "other", Quota: 9000000}}, want: 1750000, usage: 1750000},
 		{name: "usage is capped", rows: []newapi.UsageRecord{{UserID: 42, Quota: 9000000}}, want: 3000000, usage: 9000000},
 	}
 	for _, test := range tests {

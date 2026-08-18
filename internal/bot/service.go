@@ -870,8 +870,30 @@ func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.
 	if err != nil {
 		return 0, 0, 0, err
 	}
+	// New API deployments may omit user_id from the aggregated user-usage
+	// response. Resolve the bound user's username only when a username fallback
+	// is needed, while retaining the direct ID path for richer responses.
+	usageUsername := ""
+	needsUsernameFallback := false
 	for _, row := range rows {
-		if row.UserID != userID || row.Quota <= 0 {
+		if row.UserID == 0 && strings.TrimSpace(row.Username) != "" {
+			needsUsernameFallback = true
+			break
+		}
+	}
+	if needsUsernameFallback {
+		user, userErr := s.newAPI.GetUser(ctx, userID)
+		if userErr != nil {
+			return 0, 0, 0, fmt.Errorf("解析昨日用量所属用户失败: %w", userErr)
+		}
+		usageUsername = strings.TrimSpace(user.Username)
+	}
+	for _, row := range rows {
+		matched := row.UserID == userID
+		if !matched && row.UserID == 0 && usageUsername != "" {
+			matched = strings.EqualFold(strings.TrimSpace(row.Username), usageUsername)
+		}
+		if !matched || row.Quota <= 0 {
 			continue
 		}
 		if row.Quota > math.MaxInt64-yesterdayUsage {
