@@ -913,16 +913,15 @@ func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.
 	if multiplierTenths < 10 || multiplierTenths > 30 {
 		return 0, 0, 0, errors.New("随机签到倍数无效")
 	}
-	reward = yesterdayUsage
-	if reward < quotaPerUnit {
-		reward = quotaPerUnit
-	}
-	if reward > (math.MaxInt64-5)/multiplierTenths {
+	if yesterdayUsage > (math.MaxInt64-5)/multiplierTenths {
 		return 0, 0, 0, errors.New("签到额度超出支持范围")
 	}
 	// multiplierTenths is a one-decimal multiplier. Round half up because the
 	// New API quota field must remain an integer.
-	reward = (reward*multiplierTenths + 5) / 10
+	reward = (yesterdayUsage*multiplierTenths + 5) / 10
+	if reward < quotaPerUnit {
+		reward = quotaPerUnit
+	}
 	return reward, yesterdayUsage, multiplierTenths, nil
 }
 

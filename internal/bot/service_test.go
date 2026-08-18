@@ -1394,8 +1394,8 @@ func TestDynamicCheckinQuotaBoundsAndYesterdayRange(t *testing.T) {
 		want  int64
 		usage int64
 	}{
-		{name: "no usage receives minimum times multiplier", want: 1000000},
-		{name: "below minimum uses minimum times multiplier", rows: []newapi.UsageRecord{{UserID: 42, Quota: 250000}}, want: 1000000, usage: 250000},
+		{name: "no usage receives minimum quota", want: 500000},
+		{name: "below minimum is clamped after multiplication", rows: []newapi.UsageRecord{{UserID: 42, Quota: 250000}}, want: 500000, usage: 250000},
 		{name: "usage is summed and multiplied", rows: []newapi.UsageRecord{{UserID: 42, Quota: 1000000}, {UserID: 7, Quota: 9000000}, {UserID: 42, Quota: 750000}}, want: 3500000, usage: 1750000},
 		{name: "username fallback is multiplied", rows: []newapi.UsageRecord{{Username: "alice", Quota: 1750000}, {Username: "other", Quota: 9000000}}, want: 3500000, usage: 1750000},
 		{name: "usage is no longer capped at five to ten", rows: []newapi.UsageRecord{{UserID: 42, Quota: 9000000}}, want: 18000000, usage: 9000000},
