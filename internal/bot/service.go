@@ -854,11 +854,7 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 
 func (s *Service) replyExistingCheckin(ctx context.Context, event qq.MessageEvent, record model.CheckinRecord, next time.Time) error {
 	if record.Status == "completed" {
-		yesterdayUsage := record.YesterdayUsageDisplay
-		if yesterdayUsage == "" {
-			yesterdayUsage = "未知"
-		}
-		return s.reply(ctx, event, fmt.Sprintf("🎉 签到成功！昨日用量：%s，获取额度：%s", yesterdayUsage, record.DisplayCredit))
+		return s.reply(ctx, event, fmt.Sprintf("🎉 今日已签到。今日获取额度：%s", record.DisplayCredit))
 	}
 	if record.Status == "pending_confirmation" {
 		return s.reply(ctx, event, "本周期签到额度发放结果待确认，请勿重复签到；如长时间未到账请联系管理员核查。")

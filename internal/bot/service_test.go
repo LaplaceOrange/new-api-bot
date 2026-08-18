@@ -1245,6 +1245,9 @@ func TestCheckinIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	if reply := lastReply(t, qqAPI); reply != "🎉 签到成功！昨日用量：0，获取额度：1" {
+		t.Fatalf("unexpected first checkin reply: %q", reply)
+	}
 	service.process(context.Background(), c2cEvent("u1", "/checkin"))
 	if api.quotaAdds != 1 {
 		t.Fatalf("quota adds=%d", api.quotaAdds)
@@ -1255,7 +1258,7 @@ func TestCheckinIsIdempotent(t *testing.T) {
 	if api.lastQuotaUser != 42 || api.lastQuota != 500000 {
 		t.Fatalf("quota user=%d raw=%d", api.lastQuotaUser, api.lastQuota)
 	}
-	if reply := lastReply(t, qqAPI); reply != "🎉 签到成功！昨日用量：0，获取额度：1" {
+	if reply := lastReply(t, qqAPI); reply != "🎉 今日已签到。今日获取额度：1" {
 		t.Fatalf("unexpected checkin reply: %q", reply)
 	}
 }
