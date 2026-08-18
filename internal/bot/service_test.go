@@ -1255,7 +1255,7 @@ func TestCheckinIsIdempotent(t *testing.T) {
 	if api.lastQuotaUser != 42 || api.lastQuota != 500000 {
 		t.Fatalf("quota user=%d raw=%d", api.lastQuotaUser, api.lastQuota)
 	}
-	if reply := lastReply(t, qqAPI); reply != "昨日用量：0\n获取额度：1" {
+	if reply := lastReply(t, qqAPI); reply != "🎉 签到成功！昨日用量：0，获取额度：1" {
 		t.Fatalf("unexpected checkin reply: %q", reply)
 	}
 }

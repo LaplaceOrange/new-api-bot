@@ -849,7 +849,7 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 		return s.reply(ctx, event, "额度已经发放，但本地签到状态保存失败，请联系管理员核查，勿重复签到。")
 	}
 	_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: true, Metadata: map[string]any{"period": period, "quota": rawQuota, "display_credit": credit, "yesterday_usage_quota": usageQuota, "random_multiplier_tenths": multiplierTenths}})
-	return s.reply(ctx, event, fmt.Sprintf("昨日用量：%s\n获取额度：%s", newapi.QuotaToDisplay(usageQuota, status.QuotaPerUnit), credit))
+	return s.reply(ctx, event, fmt.Sprintf("🎉 签到成功！昨日用量：%s，获取额度：%s", newapi.QuotaToDisplay(usageQuota, status.QuotaPerUnit), credit))
 }
 
 func (s *Service) replyExistingCheckin(ctx context.Context, event qq.MessageEvent, record model.CheckinRecord, next time.Time) error {
@@ -858,7 +858,7 @@ func (s *Service) replyExistingCheckin(ctx context.Context, event qq.MessageEven
 		if yesterdayUsage == "" {
 			yesterdayUsage = "未知"
 		}
-		return s.reply(ctx, event, fmt.Sprintf("昨日用量：%s\n获取额度：%s", yesterdayUsage, record.DisplayCredit))
+		return s.reply(ctx, event, fmt.Sprintf("🎉 签到成功！昨日用量：%s，获取额度：%s", yesterdayUsage, record.DisplayCredit))
 	}
 	if record.Status == "pending_confirmation" {
 		return s.reply(ctx, event, "本周期签到额度发放结果待确认，请勿重复签到；如长时间未到账请联系管理员核查。")
