@@ -17,6 +17,12 @@ import (
 
 var redemptionLogPattern = regexp.MustCompile(`兑换码ID\s*(\d+)`)
 
+const (
+	benefitLogOverlap        = 10 * time.Minute
+	benefitLogIngestionGrace = 10 * time.Minute
+	maxBenefitLogPages       = 100
+)
+
 func (s *Service) handleBenefit(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
 	if !s.cfg.BenefitEnabled {
 		return s.reply(ctx, event, "福利兑换码功能当前已关闭。")
@@ -187,7 +193,7 @@ func (s *Service) runBenefitWorker(ctx context.Context) {
 	if interval <= 0 {
 		interval = time.Minute
 	}
-	s.checkBenefitLifecycle()
+	s.checkBenefitLifecycle(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -197,15 +203,23 @@ func (s *Service) runBenefitWorker(ctx context.Context) {
 		case <-s.notifyStop:
 			return
 		case <-ticker.C:
-			s.checkBenefitLifecycle()
+			s.checkBenefitLifecycle(ctx)
 		}
 	}
 }
 
-func (s *Service) checkBenefitLifecycle() {
+func (s *Service) checkBenefitLifecycle(parent context.Context) {
 	s.benefitMu.Lock()
 	defer s.benefitMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.NewAPITimeout*4)
+	now := time.Now()
+	if s.lastPruneAt.IsZero() || now.Sub(s.lastPruneAt) >= time.Hour {
+		if err := s.store.PruneEphemeral(now, s.cfg.BindEmailWindow, 10*time.Minute); err != nil {
+			s.logger.Warn("清理过期本地数据失败", "error", err)
+		} else {
+			s.lastPruneAt = now
+		}
+	}
+	ctx, cancel := context.WithTimeout(parent, s.cfg.NewAPITimeout*4)
 	defer cancel()
 	if s.cfg.BenefitEnabled {
 		campaigns, err := s.store.ListBenefitCampaigns()
@@ -251,51 +265,65 @@ func (s *Service) processBenefitCampaign(ctx context.Context, campaign model.Ben
 		}
 		campaign.Announced = true
 	}
-	if err := s.detectBenefitViolations(ctx, campaign); err != nil {
+	if err := s.detectBenefitViolations(ctx, &campaign); err != nil {
 		s.logger.Warn("检测福利活动违规失败", "campaign", campaign.ID, "error", publicError(err))
 		return
 	}
-	if time.Now().After(campaign.ExpiresAt) {
+	if time.Now().After(campaign.ExpiresAt.Add(benefitLogIngestionGrace)) {
 		campaign.Status = "expired"
+		campaign.RedemptionIDs = nil
+		campaign.EncryptedCodes = nil
+		campaign.ClaimedCodes = nil
 		_ = s.store.PutBenefitCampaign(campaign)
 	}
 }
 
-func (s *Service) detectBenefitViolations(ctx context.Context, campaign model.BenefitCampaign) error {
+func (s *Service) detectBenefitViolations(ctx context.Context, campaign *model.BenefitCampaign) error {
 	idSet := make(map[int]struct{}, len(campaign.RedemptionIDs))
 	for _, id := range campaign.RedemptionIDs {
 		idSet[id] = struct{}{}
 	}
-	used := make(map[int]map[int]struct{})
+	used := make(map[int]map[int]struct{}, len(campaign.ClaimedCodes))
+	for userID, ids := range campaign.ClaimedCodes {
+		set := make(map[int]struct{}, len(ids))
+		for _, id := range ids {
+			if _, belongs := idSet[id]; belongs {
+				set[id] = struct{}{}
+			}
+		}
+		if len(set) > 0 {
+			used[userID] = set
+		}
+	}
 	end := time.Now()
 	if end.After(campaign.ExpiresAt) {
 		end = campaign.ExpiresAt
 	}
-	if !campaign.CreatedAt.Before(end) {
+	start := campaign.CreatedAt
+	if campaign.LastCheckedAt.After(start) {
+		start = campaign.LastCheckedAt.Add(-benefitLogOverlap)
+		if start.Before(campaign.CreatedAt) {
+			start = campaign.CreatedAt
+		}
+	}
+	if !start.Before(end) {
 		return nil
 	}
-	for page := 1; page <= 100; page++ {
-		logs, err := s.newAPI.ListLogsByType(ctx, campaign.CreatedAt, end, "", 1, page, 100)
-		if err != nil {
-			return err
+	if err := s.scanBenefitLogs(ctx, start, end, idSet, used); err != nil {
+		return err
+	}
+	campaign.ClaimedCodes = make(map[int][]int, len(used))
+	for userID, ids := range used {
+		values := make([]int, 0, len(ids))
+		for id := range ids {
+			values = append(values, id)
 		}
-		for _, entry := range logs.Items {
-			match := redemptionLogPattern.FindStringSubmatch(entry.Content)
-			if len(match) != 2 {
-				continue
-			}
-			redemptionID, _ := strconv.Atoi(match[1])
-			if _, ok := idSet[redemptionID]; !ok {
-				continue
-			}
-			if used[entry.UserID] == nil {
-				used[entry.UserID] = make(map[int]struct{})
-			}
-			used[entry.UserID][redemptionID] = struct{}{}
-		}
-		if len(logs.Items) < 100 || page*100 >= logs.Total {
-			break
-		}
+		sort.Ints(values)
+		campaign.ClaimedCodes[userID] = values
+	}
+	campaign.LastCheckedAt = end
+	if err := s.store.PutBenefitCampaign(*campaign); err != nil {
+		return err
 	}
 	for userID, ids := range used {
 		if len(ids) <= 1 {
@@ -304,14 +332,77 @@ func (s *Service) detectBenefitViolations(ctx context.Context, campaign model.Be
 		if _, err := s.store.GetBenefitBan(campaign.ID, userID); err == nil {
 			continue
 		}
-		s.disableBenefitViolator(ctx, campaign, userID, len(ids))
+		if err := s.disableBenefitViolator(ctx, *campaign, userID, len(ids)); err != nil {
+			s.logger.Warn("保存或执行福利违规封禁失败", "campaign", campaign.ID, "user_id", userID, "error", err)
+		}
 	}
 	return nil
 }
 
-func (s *Service) disableBenefitViolator(ctx context.Context, campaign model.BenefitCampaign, userID, count int) {
+func (s *Service) scanBenefitLogs(ctx context.Context, start, end time.Time, redemptionIDs map[int]struct{}, used map[int]map[int]struct{}) error {
+	first, err := s.newAPI.ListLogsByType(ctx, start, end, "", 1, 1, 100)
+	if err != nil {
+		return err
+	}
+	if first.Total > maxBenefitLogPages*100 {
+		return s.splitBenefitLogRange(ctx, start, end, redemptionIDs, used)
+	}
+	consumeBenefitLogs(first.Items, redemptionIDs, used)
+	if len(first.Items) < 100 || (first.Total > 0 && first.Total <= len(first.Items)) {
+		return nil
+	}
+	for page := 2; page <= maxBenefitLogPages; page++ {
+		logs, err := s.newAPI.ListLogsByType(ctx, start, end, "", 1, page, 100)
+		if err != nil {
+			return err
+		}
+		consumeBenefitLogs(logs.Items, redemptionIDs, used)
+		if len(logs.Items) < 100 || (logs.Total > 0 && page*100 >= logs.Total) {
+			return nil
+		}
+		if page == maxBenefitLogPages {
+			return s.splitBenefitLogRange(ctx, start, end, redemptionIDs, used)
+		}
+	}
+	return nil
+}
+
+func (s *Service) splitBenefitLogRange(ctx context.Context, start, end time.Time, redemptionIDs map[int]struct{}, used map[int]map[int]struct{}) error {
+	startUnix := start.Unix()
+	endUnix := end.Unix()
+	if endUnix-startUnix <= 1 {
+		return fmt.Errorf("福利活动日志在单秒内超过 %d 条，无法继续分片", maxBenefitLogPages*100)
+	}
+	middle := time.Unix(startUnix+(endUnix-startUnix)/2, 0)
+	if err := s.scanBenefitLogs(ctx, start, middle, redemptionIDs, used); err != nil {
+		return err
+	}
+	return s.scanBenefitLogs(ctx, middle, end, redemptionIDs, used)
+}
+
+func consumeBenefitLogs(entries []newapi.LogRecord, redemptionIDs map[int]struct{}, used map[int]map[int]struct{}) {
+	for _, entry := range entries {
+		match := redemptionLogPattern.FindStringSubmatch(entry.Content)
+		if len(match) != 2 {
+			continue
+		}
+		redemptionID, _ := strconv.Atoi(match[1])
+		if _, ok := redemptionIDs[redemptionID]; !ok {
+			continue
+		}
+		if used[entry.UserID] == nil {
+			used[entry.UserID] = make(map[int]struct{})
+		}
+		used[entry.UserID][redemptionID] = struct{}{}
+	}
+}
+
+func (s *Service) disableBenefitViolator(ctx context.Context, campaign model.BenefitCampaign, userID, count int) error {
 	now := time.Now()
-	ban := model.BenefitBan{Key: campaign.ID + "|" + strconv.Itoa(userID), CampaignID: campaign.ID, GroupOpenID: campaign.GroupOpenID, UserID: userID, RedeemCount: count, Status: "disable_failed"}
+	ban := model.BenefitBan{Key: campaign.ID + "|" + strconv.Itoa(userID), CampaignID: campaign.ID, GroupOpenID: campaign.GroupOpenID, UserID: userID, RedeemCount: count, Status: "disable_pending", EnableAt: now.AddDate(0, 0, campaign.BanDays)}
+	if err := s.store.PutBenefitBan(ban); err != nil {
+		return err
+	}
 	err := s.newAPI.ManageUserStatus(ctx, userID, "disable")
 	result := "封禁操作暂时失败，机器人会自动重试。"
 	if err == nil {
@@ -322,12 +413,15 @@ func (s *Service) disableBenefitViolator(ctx context.Context, campaign model.Ben
 	} else {
 		ban.LastError = publicError(err)
 	}
-	_ = s.store.PutBenefitBan(ban)
+	if saveErr := s.store.PutBenefitBan(ban); saveErr != nil {
+		return saveErr
+	}
 	_ = s.store.AddAudit(model.AuditRecord{At: now, Actor: "benefit-worker", Action: "benefit.disable", Target: strconv.Itoa(userID), Success: err == nil, Description: ban.LastError, Metadata: map[string]any{"campaign": campaign.ID, "redeem_count": count, "ban_days": campaign.BanDays}})
 	message := fmt.Sprintf("🚫 福利违规处理\n用户 ID：%d\n违反规则：同一用户在福利有效期内限领一个，实际领取 %d 个。\n封禁时长：%d day\n处理结果：%s", userID, count, campaign.BanDays, result)
 	if sendErr := s.qq.ReplyGroup(ctx, campaign.GroupOpenID, "", message); sendErr != nil {
 		s.logger.Warn("发送福利违规通知失败", "user_id", userID, "error", sendErr)
 	}
+	return nil
 }
 
 func (s *Service) processBenefitBans(ctx context.Context) {
@@ -339,7 +433,7 @@ func (s *Service) processBenefitBans(ctx context.Context) {
 	now := time.Now()
 	for _, ban := range bans {
 		switch ban.Status {
-		case "disable_failed":
+		case "disable_pending", "disable_failed":
 			err = s.newAPI.ManageUserStatus(ctx, ban.UserID, "disable")
 			if err != nil {
 				ban.LastError = publicError(err)

@@ -69,17 +69,33 @@ func main() {
 	}
 	preflightCancel()
 
-	appCtx, stopSignal := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stopSignal()
+	appCtx, stopApp := context.WithCancel(context.Background())
+	defer stopApp()
+	shutdownSignals := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(shutdownSignals)
 	serviceCtx, cancelService := context.WithCancel(context.Background())
 	service.Start(serviceCtx)
+	go func() {
+		select {
+		case received := <-shutdownSignals:
+			logger.Info("收到退出信号，发布升级通知", "signal", received.String())
+			notifyCtx, notifyCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if err := service.AnnounceUpgradeStart(notifyCtx); err != nil {
+				logger.Warn("机器人升级开始通知未全部发送成功", "error", err)
+			}
+			notifyCancel()
+			stopApp()
+		case <-appCtx.Done():
+		}
+	}()
 
 	gatewayDone := make(chan struct{})
 	go func() {
 		defer close(gatewayDone)
 		if err := gateway.Run(appCtx, service.HandleGateway); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("QQ Gateway 已停止", "error", err)
-			stopSignal()
+			stopApp()
 		}
 	}()
 
@@ -98,18 +114,32 @@ func main() {
 		logger.Info("健康检查服务已启动", "listen", cfg.ListenAddr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("健康检查服务异常退出", "error", err)
-			stopSignal()
+			stopApp()
 		}
 	}()
 
 	<-appCtx.Done()
 	logger.Info("收到退出信号，开始优雅关闭")
 	<-gatewayDone
-	service.Stop()
-	cancelService()
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_ = httpServer.Shutdown(shutdownCtx)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := service.StopContext(shutdownCtx); err != nil {
+		logger.Warn("命令队列未在宽限期内完成，取消剩余任务", "error", err)
+		cancelService()
+		forceCtx, forceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if forceErr := service.StopContext(forceCtx); forceErr != nil {
+			logger.Error("取消任务后服务仍未及时停止", "error", forceErr)
+		}
+		forceCancel()
+	} else {
+		cancelService()
+	}
 	shutdownCancel()
+	httpShutdownCtx, httpShutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
+		logger.Warn("健康检查服务优雅停止超时，执行强制关闭", "error", err)
+		_ = httpServer.Close()
+	}
+	httpShutdownCancel()
 	<-httpDone
 	logger.Info("服务已停止")
 }

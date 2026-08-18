@@ -18,6 +18,8 @@ services:
       GOMEMLIMIT: ${GOMEMLIMIT:-64MiB}
       # 将 GOGC 传入容器并提供偏低内存的默认值。
       GOGC: ${GOGC:-50}
+      # 将 Go 调度器限制为两个逻辑处理器，降低多核服务器上的线程和运行时常驻内存。
+      GOMAXPROCS: ${GOMAXPROCS:-2}
     # 映射健康检查 HTTP 服务端口。
     ports:
       # 默认仅将宿主机回环地址 18080 映射到容器 8080；可通过 HEALTH_HOST_PORT 修改宿主机端口。
@@ -28,6 +30,8 @@ services:
       - ./data:/data
     # 限制异常时的自动重启行为。
     restart: unless-stopped
+    # 给正在处理的命令和数据库关闭流程预留 SIGTERM 宽限期。
+    stop_grace_period: 45s
     # 设置容器日志轮转，防止日志无限增长。
     logging:
       # 使用 Docker 默认的 json-file 日志驱动。

@@ -12,10 +12,13 @@
 - QQ Access Token 自动刷新、心跳、Resume、断线重连与消息去重。
 - 一个 QQ 主身份与一个 New API 用户 ID 的双向唯一绑定。
 - SMTP 邮箱验证码，每个 QQ 身份和目标账户每小时默认最多发送两封。
-- 按自然日、自然周或自然月直接给已绑定 New API 用户增加签到额度。
+- 按自然日、自然周或自然月限制签到次数，并按昨日用量与随机上限动态增加绑定用户额度。
 - 管理员增加/扣除额度、管理用户订阅、查看绑定和解除绑定。
 - 查询个人、指定用户或全站用户用量，查看调用记录和站点已启用模型。
 - 在指定群内发送低额度提醒；管理员可查看全站用户与模型用量报表。
+- 支持 QQ 2026-08-10 新增的入群申请事件与审批接口；可按群开启 New API 邮箱/用户 ID 自动核验。
+- 支持 QQ 官方群成员禁言状态查询、定时禁言和解除禁言接口。
+- 低资源监测 Codex 重置信号，并按群发起可恢复的用量补偿抽奖。
 - bbolt 单文件持久化、AES-256-GCM 敏感数据加密、JSON 结构化日志。
 - `/healthz` 和 `/readyz` 健康检查。
 
@@ -24,7 +27,7 @@
 | 指令 | 场景 | 说明 |
 | --- | --- | --- |
 | `/bind <邮箱或用户ID>` | 群聊 | 向 New API 账户邮箱发送绑定验证码 |
-| `/bind vertify <6位验证码>` | 群聊 | 在当前群完成双向唯一绑定 |
+| `/bind verify <6位验证码>` | 群聊 | 在当前群完成双向唯一绑定 |
 | `/bind status` | 群聊 | 查看当前绑定的 New API 用户信息 |
 | `/unbind` | 群聊 | 解除当前 QQ 身份的 New API 绑定 |
 | `/checkin` | 群聊 | 签到并直接增加绑定账户额度 |
@@ -34,7 +37,9 @@
 | `/usage <用户ID或@用户> <时间长度>` | 管理员 | 查看指定用户用量 |
 | `/usage <时间长度> all` | 已绑定用户 | 查看该时间段全站总请求次数、总 Token、总消耗额度和活跃用户数 |
 | `/usage <时间长度> <前N名>` | 已绑定用户 | 查看按消耗额度排序的前 N 名用户，例如 `/usage 7d 10` |
-| `/usage chart <时间长度>` | 已绑定用户 | 生成每日额度折线及模型用量占比 PNG 图表 |
+| `/usage chart <时间长度>` | 已绑定用户 | 生成自己的每日额度折线及模型用量占比 PNG 图表 |
+| `/usage chart <时间长度> <@群成员或用户ID>` | 管理员 | 生成指定已绑定群成员或 New API 用户的用量图表 |
+| `/usage chart <时间长度> all` | 已绑定用户 | 汇总当前群内已被机器人识别且已绑定成员的用量图表 |
 | `/logs [数量]` | 已绑定用户 | 查看自己的最近调用记录，默认 10 条、最多 20 条 |
 | `/logs <用户ID或@用户> [数量]` | 管理员 | 查看指定用户的最近调用记录 |
 | `/models [用户ID或@用户]` | 用户/管理员 | 查看用户分组可用模型；目标用户查询仅管理员可用 |
@@ -59,10 +64,15 @@
 | `/admin unbind <用户ID或@用户>` | 管理员 | 解除绑定 |
 | `/admin report [时间长度]` | 管理员 | 查看全站用户及模型用量摘要，默认最近 24 小时 |
 | `/admin report export [时间长度]` | 管理员 | 生成并发送 UTF-8 CSV 全站报表 |
-| `/admin checkin` | 管理员 | 查看当天签到人数、已发放总额度和当前单次发放额度 |
-| `/admin checkin edit <发放额度>` | 管理员 | 立即更新后续签到的单次发放额度，并持久化保存 |
+| `/admin checkin` | 管理员 | 查看当天签到人数、已发放总额度和动态签到规则 |
 | `/welcome on\|off` | 管理员 | 开启或关闭当前群的新成员欢迎；欢迎消息会实际 @ 新成员 |
 | `/welcome set <欢迎语>` | 管理员 | 设置当前群欢迎语并自动开启 |
+| `/join on\|off\|status` | 管理员 | 按群开启、关闭或查看 New API 账户入群自动审批 |
+| `/join limit <QQ等级数>` | 管理员 | 设置自动审批最低 QQ 用户等级；`0` 表示不限制 |
+| `/join check "<匹配字符串>"` | 管理员 | 要求申请内容包含指定字符串；`""` 表示不限制 |
+| `/mute <@成员或member_openid> <时长>` | 管理员 | 禁言普通群成员，时长支持 `10m`、`2h`、`3d`，最长 30 天 |
+| `/mute off <@成员或member_openid>` | 管理员 | 解除指定普通群成员禁言 |
+| `/mute status` | 管理员 | 查看全员禁言模式和当前成员禁言列表 |
 | `/recall [消息ID]` | 管理员 | 回复机器人两分钟内的消息进行撤回；消息 ID 可作回退 |
 | `/admin user status <用户ID或@用户>` | 管理员 | 查看用户状态、角色和分组 |
 | `/admin user enable <用户ID或@用户>` | 管理员 | 启用用户 |
@@ -71,8 +81,18 @@
 | `/admin user resetpasskey <用户ID或@用户>` | 管理员 | 二次确认后重置用户 Passkey |
 | `/confirm <一次性操作码>` | 管理员 | 确认五分钟内的敏感管理操作 |
 | `/benefit <面额> <数量> <有效期(h)> <违者封禁时间(day)>` | 管理员 | @全体成员并批量发放一人限领一个的福利兑换码；自动检测多领、封禁并到期解封 |
+| `/reset check` | 任意 | 查看当前群状态：未知、可能重置、即将重置或确认重置（抽奖进行中） |
+| `/reset last` | 任意 | 查看 Codex Reset timeline API 最新重置事件、验证状态和时间窗口，不改变当前群状态或活动 |
+| `/reset join` | 已绑定用户 | 参加当前群有效期内正在进行的重置补偿抽奖 |
+| `/reset new` | 管理员 | 按当前群 `/reset set` 配置手动开启一轮新的重置补偿活动 |
+| `/reset stop` | 管理员 | 停止当前活动，不抽取用户、不发放补偿额度 |
+| `/reset end` | 管理员 | 提前截止当前活动，并立即抽取用户、发放补偿额度 |
+| `/reset set duration <时长>` | 管理员 | 设置下一轮活动有效期，默认 `5h` |
+| `/reset set winners <人数>` | 管理员 | 设置下一轮抽取人数，默认 `5` |
+| `/reset set lookback <时长>` | 管理员 | 设置获奖者在活动开始前的用量补偿回溯时间，默认 `24h` |
+| `/reset proxy <代理链接或off>` | 管理员 | 设置仅用于访问 Codex Reset timeline API 的 HTTP/SOCKS5 代理，凭据加密保存 |
 
-除 `/help`、`/whoami`、`/bind`、`/enable list`、`/disable list` 以及管理员的 `/enable`、`/disable` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
+除 `/help`、`/whoami`、`/bind`、`/reset check`、`/reset last`、`/enable list`、`/disable list` 以及管理员的 `/enable`、`/disable` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
 
 命令关键词状态持久化保存在 bbolt。示例：管理员执行 `/disable "bind view"` 后，标准化内容中包含 `bind view` 的指令会被静默忽略，`/help` 中匹配该关键词的行也会隐藏；执行 `/enable "bind view"` 即可恢复。匹配不区分英文大小写，并会合并连续空白字符。`/enable` 和 `/disable` 管理指令本身始终可执行，避免规则将管理入口锁死。
 
@@ -84,8 +104,9 @@
 
 1. 在 QQ 开放平台创建机器人，记录 AppID 和 AppSecret/ClientSecret。
 2. 开通群聊消息能力，并允许 `GROUP_MESSAGE_CREATE`（兼容旧名 `GROUP_AT_MESSAGE_CREATE`）及 `GROUP_MEMBER_ADD` 对应事件。
-3. 群聊中需要 @ 机器人后发送指令；官方事件会自动移除消息开头的机器人 @ 前缀。
-4. QQ API v2 不提供数字 QQ 号。启动机器人后执行 `/whoami`，将输出的 OpenID 写入 `QQ_ADMIN_OPENIDS`。
+3. 如需入群自动审批，将机器人设置为目标群管理员，并确保开放平台向 Gateway 投递 `GROUP_JOIN_REQUEST`；该事件与群/C2C 消息使用同一个 `GROUP_AND_C2C_EVENT (1<<25)` Intent。
+4. 群聊中需要 @ 机器人后发送指令；官方事件会自动移除消息开头的机器人 @ 前缀。
+5. QQ API v2 不提供数字 QQ 号。启动机器人后执行 `/whoami`，将输出的 OpenID 写入 `QQ_ADMIN_OPENIDS`。
 
 管理员名单格式示例：
 
@@ -169,15 +190,21 @@ $bytes = New-Object byte[] 32
 - `tls`：连接建立时直接使用 TLS，常见端口为 465。
 - `none`：明文 SMTP，仅适用于可信内网测试环境。
 
-### 额度换算
+### 签到与额度换算
 
-`CHECKIN_CREDIT`、`CREDIT_MAX_PER_COMMAND` 和 `/credit add` 使用 New API 页面显示的额度单位。服务读取 `/api/status` 中的 `quota_per_unit` 进行精确有理数换算，不使用浮点数。
+签到奖励按 `CHECKIN_TIMEZONE` 的昨日自然日计算：`min(max(用户昨日总额度用量, 1), rand(5,10))`。随机上限是包含 5 和 10 的整数；没有昨日用量时发放 1，昨日用量超过随机上限时按该上限发放。`CHECKIN_CREDIT` 仅为旧版部署兼容项，不再影响签到结果。
+
+`CREDIT_MAX_PER_COMMAND` 和 `/credit add` 使用 New API 页面显示的额度单位。服务读取 `/api/status` 中的 `quota_per_unit` 进行精确有理数换算，不使用浮点数。
 
 例如 `quota_per_unit=500000` 时：
 
 - 显示额度 `1` 对应原始 quota `500000`。
 - 显示额度 `0.01` 对应原始 quota `5000`。
 - 如果换算结果不是整数 quota，指令会被拒绝。
+
+### 升级通知
+
+容器收到 `SIGTERM` 或 `SIGINT` 时，会先向已识别的 QQ 群发送“机器人正在更新！”，并把待完成通知持久化到 bbolt。新进程连接 QQ Gateway 后发送“机器人更新完毕！”并清除记录；首次启动和异常退出不会误发更新完成通知。`docker-compose.yml` 默认提供 45 秒停止宽限期。
 
 ### 额度提醒
 
@@ -192,9 +219,21 @@ $bytes = New-Object byte[] 32
 
 - `/welcome on` 会在 QQ `GROUP_MEMBER_ADD` 事件到达时发送主动群消息，并使用 QQ 当前的 `<qqbot-at-user id="..." />` 文本协议实际 @ 新成员；`/welcome set` 可为每个群保存独立欢迎语。机器人日志会记录群成员事件、欢迎设置状态和发送失败原因，便于排查 QQ 平台未投递事件或主动消息配额问题。
 - `/bot status` 会优先查询 QQ 的群内机器人状态和群基础信息。相关接口未获得开放权限时，仍会返回 Gateway、Access Token 和 New API 连通状态。
-- `/usage chart 7d` 将 PNG 上传到当前群；`/admin report export 7d` 将 CSV 文件上传到当前群。需要 QQ 机器人具备群文件/富媒体接口权限。
+- `/usage chart 7d`、`/usage chart 7d @某成员` 和 `/usage chart 7d all` 将 PNG 上传到当前群；`all` 仅统计当前群内已被机器人识别且已绑定 New API 的成员。`/admin report export 7d` 将 CSV 文件上传到当前群。需要 QQ 机器人具备群文件/富媒体接口权限。
 - `/recall` 仅撤回机器人自己发送且不超过两分钟的消息。
 - 禁用用户、重置 2FA 和重置 Passkey 使用 `/confirm <code>` 文本确认，并写入本地审计记录。
+
+### 入群审批和群禁言
+
+- QQ 官方在 2026-08-10 新增 `GROUP_JOIN_REQUEST`、入群申请审批和群禁言接口，并将所有 HTTP API 域名统一为 `api.bot.qq.com`；本项目已使用统一域名。
+- 自动审批默认对所有群关闭。管理员需在目标群执行 `/join on`，关闭时使用 `/join off`。
+- 开启后，机器人从验证消息或管理员问答答案中查找完整邮箱或正整数 New API 用户 ID；账户存在且状态正常时才调用 QQ `approve`。不匹配、账户禁用、申请人为机器人、QQ 返回 `risk_tips` 或接口查询失败时均保留为人工审核。
+- `/join check "内部用户"` 会额外要求验证消息或任一管理员问答答案包含大小写敏感的字面字符串 `内部用户`；使用 `/join check ""` 清除该限制。
+- `/join limit 20` 会额外要求 QQ 入群申请事件中的 `qq_level` 或 `level` 至少为 20；使用 `/join limit 0` 清除该限制。当前 QQ 官方 `GROUP_JOIN_REQUEST` 文档未承诺提供用户 QQ 等级，因此阈值大于 0 且事件缺少等级字段时，机器人会保留该申请等待人工审核，不会猜测等级或自动放行。
+- 自动审批不会建立 QQ 与 New API 的绑定关系；入群后仍需执行 `/bind` 完成邮箱验证。
+- 入群申请事件和审批接口都要求机器人是目标群管理员。事件按 `group_openid`、`member_openid` 和 `join_request_id` 去重，避免重复审批。
+- `/mute` 使用 QQ `/v2/groups/{group_openid}/restrict_chat_setting` 接口，只能操作普通成员，不能禁言群主、管理员或机器人；QQ 返回的权限或参数错误会直接回复执行者。
+- 新增的 Markdown 参数 `force_verify_image_resource` 仅影响 Markdown 图片资源转存；当前机器人发送文本和上传文件，不受该参数影响。
 
 ### 群福利兑换码
 
@@ -203,6 +242,23 @@ $bytes = New-Object byte[] 32
 - 同一用户在活动有效期内兑换两个或以上活动兑换码时，机器人会在发放群公布用户 ID、违反规则和封禁天数，并调用 New API 禁用用户。
 - 封禁记录持久化在 bbolt；达到解封时间后自动重新启用用户并发送群消息，机器人重启不会丢失封禁计划。
 - 兑换码在本地数据库中使用 AES-256-GCM 加密保存；日志不输出完整兑换码。
+
+### Codex 重置监测与补偿
+
+- 首次在某个群执行 `/reset check`、`/reset join` 或管理员设置命令时，该群会自动登记为重置通知群。`/reset last` 只查询 `https://codex-reset.com/api/timeline` 的最新重置事件，不登记群、不改变状态，也不会创建活动。没有登记群时后台不会发起监测请求。
+- `/reset last` 展示 API 最新重置事件的公告时间、机器人状态、API 验证状态、摘要和官方时间窗口；该查询不受 `RESET_SIGNAL_MAX_AGE` 限制。
+- 后台默认每 `3m` 请求一次 Codex Reset timeline API，只处理最近 `24h` 的全局 reset 事件。单次响应限制为 `512 KiB`，使用一个受限 HTTP 连接池，不运行浏览器、Node 或其他常驻进程。
+- 状态分为：未知、可能重置、即将重置、确认重置（抽奖进行中）。API 的 pending、hinted 和仍有效的官方时间窗口映射为候选状态；只有 `confirmed` 或 `reset_observed` 才会启动活动。`rejected`、`unchanged`、`unverified` 或 `expired` 会将对应候选恢复为未知并发送更正通知，已经开始或正在结算的活动不会被自动取消。
+- timeline 事件以稳定事件 ID 去重；同一事件从可能重置升级为即将重置或确认重置时只通知一次对应变化。部署或重启后不会把超出 `RESET_SIGNAL_MAX_AGE` 的历史确认事件补建为新活动。
+- 活动默认持续 `5h`，随机抽取最多 `5` 名参与者。每名获奖者获得从活动开始前 `24h` 到活动开始时刻的实际消耗额度，活动进行期间产生的用量不计入补偿；参与人数不足时抽取全部参与者，消耗为零时不调用额度写入接口。
+- 管理员执行 `/reset new` 可立即手动开启活动；活动会读取执行时该群通过 `/reset set duration`、`winners` 和 `lookback` 保存的配置。已有活动正在进行或结算时不会重复创建。
+- 管理员执行 `/reset stop` 会原子停止仍在进行的活动、取消后续结算并将群状态恢复为未知，不抽取用户也不发放额度；已经进入结算阶段的活动不会被强行停止。
+- 管理员执行 `/reset end` 会立即关闭参加入口并唤醒持久化结算流程，按原活动配置抽取用户和发放额度；服务异常重启后仍会继续未完成的结算。
+- 中奖名单、补偿额度和逐人发放状态会先写入 bbolt。服务重启不会重新抽取；额度写入超时等结果不确定的情况会标记待确认，不会自动重复加额。
+- 重置信号、活动开始和活动结束通知使用持久化 outbox；正文与分块边界会冻结保存，每发送一块就持久化游标，QQ 暂时发送失败或服务重启后会从未完成分块继续退避重试。
+- QQ 主动群消息接口没有可查询的幂等键，因此若消息已被 QQ 接收、但进程在写入发送游标前异常退出，该分块存在极小概率重复。服务采用至少一次投递以避免通知静默丢失。
+- `/reset proxy http://user:password@host:port` 与 `/reset proxy socks5://user:password@host:port` 均受支持；用户名或密码中的特殊字符需使用 URL 编码。代理只用于访问 Codex Reset timeline API，QQ 和 New API 始终使用各自现有连接。代理完整地址使用 `BOT_DATA_KEY` 加密保存，回复与日志不显示密码。
+- 可通过 `RESET_ENABLED`、`RESET_POLL_INTERVAL`、`RESET_HTTP_TIMEOUT`、`RESET_SIGNAL_MAX_AGE`、`RESET_DEFAULT_DURATION`、`RESET_DEFAULT_WINNERS` 和 `RESET_DEFAULT_LOOKBACK` 调整全局默认值。管理员的群内设置只影响后续新活动。
 
 ## Docker Compose 部署
 
@@ -255,7 +311,7 @@ go build -trimpath -ldflags="-s -w" -o bin/new-api-bot.exe ./cmd/bot
 1. 用户在群内 @ 机器人并发送：`/bind user@example.com` 或 `/bind 123`。
 2. 机器人通过管理员接口确认用户存在、已启用且有邮箱。
 3. 机器人通过 SMTP 向账户邮箱发送六位验证码。
-4. 用户在同一群内 @ 机器人并发送：`/bind vertify 123456`。
+4. 用户在同一群内 @ 机器人并发送：`/bind verify 123456`。
 5. 验证通过后写入双向唯一绑定。
 
 验证码只以 HMAC 摘要保存。连续输错达到 `BIND_CODE_MAX_ATTEMPTS` 后，本次绑定请求立即失效。
@@ -263,9 +319,11 @@ go build -trimpath -ldflags="-s -w" -o bin/new-api-bot.exe ./cmd/bot
 ## 签到一致性
 
 - 签到同时按 QQ 主身份、New API 用户 ID 和周期键去重。
+- 签到查询 `CHECKIN_TIMEZONE` 下昨日 `[00:00, 今日00:00)` 的用户总用量，并按 `min(max(昨日用量, 1), rand(5,10))` 计算奖励。
 - 签到通过 New API `add_quota` 操作直接增加绑定用户额度，不创建兑换码。
 - 已完成签到时重复执行只返回本周期已签到，不会再次增加额度。
-- 已知的 New API 请求失败会撤销本地待处理记录，用户可稍后重试。
+- 明确的 New API 请求失败会撤销本地待处理记录，用户可稍后重试。
+- 请求在等待响应头时超时，机器人会将签到标记为“待确认”并禁止本周期重试，避免 New API 已完成加额而响应丢失时重复发放。管理员核对到账情况后再处理。
 
 ## 健康检查
 
@@ -291,7 +349,8 @@ Docker Compose 默认仅在服务器本机的 `127.0.0.1:18080` 暴露健康检�
 - 日志使用单行 JSON，方便 Docker、Loki 或其他日志系统采集。
 - 不记录管理员 Token、QQ AppSecret、SMTP 密码、验证码和完整邮箱。
 - bbolt 数据库默认权限为 `0600`，数据目录默认权限为 `0700`。
-- 管理员加额度、解绑、绑定和签到操作会写入本地审计桶。
+- 管理员加额度、解绑、绑定和签到操作会写入本地审计桶；为限制数据库长期增长，仅保留最近 10,000 条审计记录。
+- 过期验证码、关联码、管理员确认码、邮件限流记录和机器人消息撤回索引由后台每小时清理。
 
 ## 测试
 
@@ -328,18 +387,23 @@ Docker Compose 默认设置：
 ```dotenv
 GOMEMLIMIT=64MiB
 GOGC=50
+GOMAXPROCS=2
 ```
 
-服务使用两个命令工作协程、长度 64 的有界队列、最多两个每主机空闲 HTTP 连接，并限制单个 HTTP/WebSocket 消息为 1 MiB。可根据实际消息量调整 Go 运行时参数，但不建议无界增加协程或队列。
+服务使用两个命令工作协程、长度 64 的有界内存队列、最多四个每主机 HTTP 连接，并将用量图表生成限制为单任务执行；第二个图表请求会立即返回忙碌提示，不占用另一个 worker 等待。非 `/` 消息在进入队列和 bbolt 去重前直接忽略，超过 4096 字节的指令只保留必要元数据并回复长度错误。QQ HTTP/WebSocket 响应限制为 1 MiB，New API 响应限制为 8 MiB，并使用流式受限解码降低峰值内存。
+
+Gateway 序号最多每秒持久化一次，并在断线时强制保存；健康连接建立后会重置重连退避。待处理事件会使用 `BOT_DATA_KEY` 加密，并与去重状态在同一个 bbolt 事务中写入持久化收件箱；内存队列满时事件仍可落盘并由后台调度，进程异常退出后也会恢复处理。持久化待处理事件固定上限为 512 条；达到上限时 Gateway 才会退避重连，避免无界占用磁盘或内存。
 
 ## 停止与备份
 
 收到 SIGINT 或 SIGTERM 后，服务会：
 
 1. 停止 QQ Gateway 接收新事件。
-2. 等待已经入队的命令处理完成。
+2. 最多等待 30 秒完成已经入队的命令，超时后取消剩余上游请求。
 3. 关闭健康检查 HTTP 服务。
 4. 同步并关闭 bbolt 数据库。
+
+Docker Compose 为该流程配置了 45 秒的 `stop_grace_period`。
 
 备份时复制：
 

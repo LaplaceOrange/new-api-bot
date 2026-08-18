@@ -1,13 +1,65 @@
 package newapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestGetStatusCoalescesConcurrentRefresh(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"system_name":"test","quota_per_unit":500000}}`))
+	}))
+	defer server.Close()
+	client := New(server.URL, "token", 1, time.Second)
+	var wait sync.WaitGroup
+	for range 16 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if _, err := client.GetStatus(context.Background(), false); err != nil {
+				t.Errorf("GetStatus: %v", err)
+			}
+		}()
+	}
+	wait.Wait()
+	if calls.Load() != 1 {
+		t.Fatalf("status requests=%d, want 1", calls.Load())
+	}
+}
+
+func TestResponseBodyLimitUsesStreamingDecoder(t *testing.T) {
+	chunk := bytes.Repeat([]byte(" "), 32<<10)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"success":true,"message":"","data":null}`))
+		for written := 0; written <= maxResponseBody; written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	client := New(server.URL, "token", 1, 3*time.Second)
+	_, err := client.do(context.Background(), http.MethodGet, "/large", nil, false)
+	if err == nil || !strings.Contains(err.Error(), "8 MiB") {
+		t.Fatalf("unexpected oversized response error: %v", err)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusOK || apiErr.Cause == nil {
+		t.Fatalf("oversized 2xx response did not retain ambiguity cause: %#v", err)
+	}
+}
 
 func TestDisplayToQuota(t *testing.T) {
 	tests := []struct {

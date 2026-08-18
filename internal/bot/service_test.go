@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -28,22 +29,39 @@ func TestPublicErrorMapsExistingAdministratorPermissionFailure(t *testing.T) {
 }
 
 type fakeNewAPI struct {
-	user          newapi.User
-	users         []newapi.User
-	quotaAdds     int
-	quotaSubs     int
-	lastQuotaUser int
-	lastQuota     int64
-	subscriptions map[int][]newapi.UserSubscriptionRecord
-	nextSubID     int
-	usageByUser   []newapi.UsageRecord
-	usageByModel  []newapi.UsageRecord
-	logs          []newapi.LogRecord
-	models        []string
-	managedAction string
-	reset2FA      int
-	resetPasskey  int
-	redemptions   []newapi.Redemption
+	user           newapi.User
+	users          []newapi.User
+	quotaAdds      int
+	quotaSubs      int
+	lastQuotaUser  int
+	lastQuota      int64
+	quotaAddCalls  []quotaAddCall
+	subscriptions  map[int][]newapi.UserSubscriptionRecord
+	nextSubID      int
+	usageByUser    []newapi.UsageRecord
+	usageUserErr   error
+	usageUserCalls int
+	usageRanges    []usageRange
+	usageByModel   []newapi.UsageRecord
+	logs           []newapi.LogRecord
+	models         []string
+	managedAction  string
+	reset2FA       int
+	resetPasskey   int
+	redemptions    []newapi.Redemption
+	addQuotaErr    error
+	logQueryStarts []time.Time
+	logSplitAfter  time.Duration
+}
+
+type quotaAddCall struct {
+	UserID int
+	Quota  int64
+}
+
+type usageRange struct {
+	Start time.Time
+	End   time.Time
 }
 
 func (f *fakeNewAPI) GetStatus(context.Context, bool) (newapi.Status, error) {
@@ -81,7 +99,8 @@ func (f *fakeNewAPI) AddQuota(_ context.Context, userID int, quota int64) error 
 	f.quotaAdds++
 	f.lastQuotaUser = userID
 	f.lastQuota = quota
-	return nil
+	f.quotaAddCalls = append(f.quotaAddCalls, quotaAddCall{UserID: userID, Quota: quota})
+	return f.addQuotaErr
 }
 func (f *fakeNewAPI) SubtractQuota(_ context.Context, userID int, quota int64) error {
 	f.quotaSubs++
@@ -89,7 +108,12 @@ func (f *fakeNewAPI) SubtractQuota(_ context.Context, userID int, quota int64) e
 	f.lastQuota = quota
 	return nil
 }
-func (f *fakeNewAPI) ListUsageByUser(context.Context, time.Time, time.Time) ([]newapi.UsageRecord, error) {
+func (f *fakeNewAPI) ListUsageByUser(_ context.Context, start, end time.Time) ([]newapi.UsageRecord, error) {
+	f.usageUserCalls++
+	f.usageRanges = append(f.usageRanges, usageRange{Start: start, End: end})
+	if f.usageUserErr != nil {
+		return nil, f.usageUserErr
+	}
 	return append([]newapi.UsageRecord(nil), f.usageByUser...), nil
 }
 func (f *fakeNewAPI) ListUsageByModel(_ context.Context, _ time.Time, _ time.Time, username string) ([]newapi.UsageRecord, error) {
@@ -147,7 +171,11 @@ func (f *fakeNewAPI) SearchRedemptions(_ context.Context, name string, _ int) ([
 	}
 	return result, nil
 }
-func (f *fakeNewAPI) ListLogsByType(_ context.Context, _ time.Time, _ time.Time, username string, logType, _, pageSize int) (newapi.LogPage, error) {
+func (f *fakeNewAPI) ListLogsByType(_ context.Context, start time.Time, end time.Time, username string, logType, _, pageSize int) (newapi.LogPage, error) {
+	f.logQueryStarts = append(f.logQueryStarts, start)
+	if f.logSplitAfter > 0 && end.Sub(start) > f.logSplitAfter {
+		return newapi.LogPage{Items: []newapi.LogRecord{}, Total: maxBenefitLogPages*100 + 1}, nil
+	}
 	items := make([]newapi.LogRecord, 0, pageSize)
 	for _, record := range f.logs {
 		if logType != 0 && record.Type != logType {
@@ -200,8 +228,17 @@ func (f *fakeNewAPI) InvalidateUserSubscription(_ context.Context, subscriptionI
 }
 
 type fakeQQ struct {
-	mu       sync.Mutex
-	messages []string
+	mu              sync.Mutex
+	messages        []string
+	groupReplyErr   error
+	groupReplyErrAt int
+	groupReplies    int
+	groupReplyHook  func(int)
+	joinApprovals   []qq.GroupJoinRequest
+	muteState       qq.GroupMuteState
+	muteMember      string
+	muteOperation   string
+	muteExpiresAt   time.Time
 }
 
 func (f *fakeQQ) ReplyC2C(_ context.Context, _, _, content string) error {
@@ -211,7 +248,39 @@ func (f *fakeQQ) ReplyC2C(_ context.Context, _, _, content string) error {
 	return nil
 }
 func (f *fakeQQ) ReplyGroup(_ context.Context, _, _, content string) error {
-	return f.ReplyC2C(context.Background(), "", "", content)
+	f.mu.Lock()
+	f.groupReplies++
+	call := f.groupReplies
+	hook := f.groupReplyHook
+	if f.groupReplyErr != nil && (f.groupReplyErrAt == 0 || f.groupReplyErrAt == call) {
+		f.mu.Unlock()
+		return f.groupReplyErr
+	}
+	f.messages = append(f.messages, content)
+	f.mu.Unlock()
+	if hook != nil {
+		hook(call)
+	}
+	return nil
+}
+func (f *fakeQQ) ReviewGroupJoinRequest(_ context.Context, group, member, requestID, operation, _ string, _ bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.joinApprovals = append(f.joinApprovals, qq.GroupJoinRequest{GroupOpenID: group, MemberOpenID: member, JoinRequestID: requestID, ApplySource: operation})
+	return nil
+}
+func (f *fakeQQ) GetGroupMuteState(context.Context, string) (qq.GroupMuteState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.muteState, nil
+}
+func (f *fakeQQ) SetGroupMemberMute(_ context.Context, _ string, member, operation string, expiresAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.muteMember = member
+	f.muteOperation = operation
+	f.muteExpiresAt = expiresAt
+	return nil
 }
 
 type fakeMailer struct {
@@ -260,6 +329,13 @@ func testService(t *testing.T) (*Service, *store.Store, *fakeNewAPI, *fakeQQ, *f
 		BenefitMaxCount:            100,
 		BenefitMaxBanDays:          365,
 		BenefitCheckInterval:       time.Minute,
+		ResetEnabled:               true,
+		ResetPollInterval:          3 * time.Minute,
+		ResetHTTPTimeout:           time.Second,
+		ResetSignalMaxAge:          24 * time.Hour,
+		ResetDefaultDuration:       5 * time.Hour,
+		ResetDefaultWinners:        5,
+		ResetDefaultLookback:       24 * time.Hour,
 	}
 	api := &fakeNewAPI{
 		user:          newapi.User{ID: 42, Username: "alice", Email: "alice@example.com", Status: 1},
@@ -423,6 +499,113 @@ func TestUnknownSlashCommandGetsReply(t *testing.T) {
 	}
 }
 
+func TestOversizedCommandIsCollapsedBeforeQueueing(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.Start(ctx)
+	event := groupEvent("g1", "u1", "/"+strings.Repeat("x", maxCommandBytes+1))
+	if accepted := service.HandleGateway(ctx, event); !accepted {
+		t.Fatal("oversized command was not accepted for a bounded error reply")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && replyCount(qqAPI) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	service.Stop()
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "4096") {
+		t.Fatalf("unexpected reply: %q", reply)
+	}
+}
+
+func TestNonCommandBypassesPersistentDedup(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	event := groupEvent("g1", "u1", "hello")
+	if accepted := service.HandleGateway(context.Background(), event); !accepted {
+		t.Fatal("non-command event should be intentionally accepted")
+	}
+	key := event.EventType + "|" + event.Message.ID + "|"
+	duplicate, err := storage.CheckAndMarkMessage(key, time.Now(), time.Hour)
+	if err != nil || duplicate {
+		t.Fatalf("non-command touched persistent dedup: duplicate=%v err=%v", duplicate, err)
+	}
+}
+
+func TestQueueBackpressureSpillsToPersistentInbox(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	for index := 0; index < cap(service.queue); index++ {
+		event := groupEvent("g1", "u1", fmt.Sprintf("/queued-%d", index))
+		if accepted := service.HandleGateway(context.Background(), event); !accepted {
+			t.Fatalf("queue rejected event %d before reaching capacity", index)
+		}
+	}
+	overflow := groupEvent("g1", "u1", "/overflow")
+	if accepted := service.HandleGateway(context.Background(), overflow); !accepted {
+		t.Fatal("full memory queue should accept a durably stored event")
+	}
+	if accepted := service.HandleGateway(context.Background(), overflow); !accepted {
+		t.Fatal("duplicate pending event should be acknowledged")
+	}
+	pending, err := storage.ListPendingGatewayEvents(cap(service.queue) + 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != cap(service.queue)+1 {
+		t.Fatalf("pending events=%d, want %d", len(pending), cap(service.queue)+1)
+	}
+}
+
+func TestPendingGatewayEventIsRecoveredByDispatcher(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	event := groupEvent("g1", "u1", "/help")
+	if accepted := service.HandleGateway(context.Background(), event); !accepted {
+		t.Fatal("event was not accepted")
+	}
+	queued := <-service.queue
+	service.releaseGatewayEvent(queued.key)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	service.Start(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for replyCount(qqAPI) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	service.Stop()
+	cancel()
+	if replyCount(qqAPI) == 0 {
+		t.Fatal("recovered event was not processed")
+	}
+	pending, err := storage.ListPendingGatewayEvents(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("completed event remained in inbox: %#v", pending)
+	}
+}
+
+func TestPendingGatewayEventPayloadIsEncrypted(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	event := groupEvent("g1", "u1", "/bind verify 123456")
+	if accepted := service.HandleGateway(context.Background(), event); !accepted {
+		t.Fatal("event was not accepted")
+	}
+	items, err := storage.ListPendingGatewayEvents(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("pending events=%d, want 1", len(items))
+	}
+	if bytes.Contains(items[0].Payload, []byte("123456")) || bytes.Contains(items[0].Payload, []byte("bind verify")) {
+		t.Fatalf("pending event contains plaintext command: %q", items[0].Payload)
+	}
+	plaintext, err := service.secure.Decrypt(string(items[0].Payload))
+	if err != nil || !strings.Contains(plaintext, "123456") {
+		t.Fatalf("encrypted payload could not be restored: plaintext=%q err=%v", plaintext, err)
+	}
+}
+
 func TestBindMissingArgumentShowsExactUsage(t *testing.T) {
 	service, _, _, qqAPI, _ := testService(t)
 	service.process(context.Background(), groupEvent("g1", "u1", "/bind"))
@@ -442,6 +625,179 @@ func TestWelcomeAndMemberAdd(t *testing.T) {
 	service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_MEMBER_ADD", Member: qq.GroupMemberEvent{GroupOpenID: "g1", MemberOpenID: "new-user", Timestamp: time.Now().Unix()}})
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "欢迎使用机器人") || !strings.Contains(reply, `<qqbot-at-user id="new-user" />`) {
 		t.Fatalf("unexpected welcome reply: %q", reply)
+	}
+}
+
+func TestGroupJoinApprovalMatchesNewAPIEmailAndID(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if err := storage.PutGroupJoinApproval(model.GroupJoinApproval{GroupOpenID: "g1", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	for index, answer := range []string{"alice@example.com", "42"} {
+		service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_JOIN_REQUEST", JoinRequest: qq.GroupJoinRequest{
+			GroupOpenID: "g1", MemberOpenID: fmt.Sprintf("member-%d", index), JoinRequestID: fmt.Sprintf("request-%d", index),
+			VerifyInfo: qq.GroupJoinVerifyInfo{Method: "verify_message", VerifyMessage: answer},
+		}})
+	}
+	qqAPI.mu.Lock()
+	defer qqAPI.mu.Unlock()
+	if len(qqAPI.joinApprovals) != 2 {
+		t.Fatalf("join approvals=%d, want 2", len(qqAPI.joinApprovals))
+	}
+	for _, approval := range qqAPI.joinApprovals {
+		if approval.GroupOpenID != "g1" || approval.JoinRequestID == "" || approval.ApplySource != "approve" {
+			t.Fatalf("unexpected approval: %#v", approval)
+		}
+	}
+}
+
+func TestGroupJoinApprovalLeavesUnsafeOrUnknownRequestsPending(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if err := storage.PutGroupJoinApproval(model.GroupJoinApproval{GroupOpenID: "g1", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	requests := []qq.GroupJoinRequest{
+		{GroupOpenID: "g1", MemberOpenID: "unsafe", JoinRequestID: "r1", RiskTips: "warning", VerifyInfo: qq.GroupJoinVerifyInfo{VerifyMessage: "42"}},
+		{GroupOpenID: "g1", MemberOpenID: "unknown", JoinRequestID: "r2", VerifyInfo: qq.GroupJoinVerifyInfo{VerifyMessage: "not-an-account"}},
+		{GroupOpenID: "g2", MemberOpenID: "disabled-group", JoinRequestID: "r3", VerifyInfo: qq.GroupJoinVerifyInfo{VerifyMessage: "42"}},
+	}
+	for _, request := range requests {
+		service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_JOIN_REQUEST", JoinRequest: request})
+	}
+	qqAPI.mu.Lock()
+	defer qqAPI.mu.Unlock()
+	if len(qqAPI.joinApprovals) != 0 {
+		t.Fatalf("unexpected approvals: %#v", qqAPI.joinApprovals)
+	}
+}
+
+func TestJoinCommandConfiguresCurrentGroup(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	service.process(context.Background(), groupEvent("g1", "admin", "/join on"))
+	setting, err := storage.GetGroupJoinApproval("g1")
+	if err != nil || !setting.Enabled {
+		t.Fatalf("join setting=%#v err=%v", setting, err)
+	}
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已开启") {
+		t.Fatalf("unexpected reply: %q", reply)
+	}
+	service.process(context.Background(), groupEvent("g1", "admin", "/join status"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "自动审批：开启") {
+		t.Fatalf("unexpected status: %q", reply)
+	}
+}
+
+func TestJoinCommandConfiguresLevelAndContentLimits(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "admin", "/join limit 20"))
+	service.process(context.Background(), groupEvent("g1", "admin", `/join check "内部 用户"`))
+	setting, err := storage.GetGroupJoinApproval("g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setting.MinQQLevel != 20 || setting.MatchText != "内部 用户" {
+		t.Fatalf("unexpected setting: %#v", setting)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "admin", "/join status"))
+	status := lastReply(t, qqAPI)
+	if !strings.Contains(status, "至少 20 级") || !strings.Contains(status, `"内部 用户"`) {
+		t.Fatalf("unexpected status: %q", status)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "admin", "/join limit 0"))
+	service.process(context.Background(), groupEvent("g1", "admin", `/join check ""`))
+	setting, err = storage.GetGroupJoinApproval("g1")
+	if err != nil || setting.MinQQLevel != 0 || setting.MatchText != "" {
+		t.Fatalf("limits were not cleared: setting=%#v err=%v", setting, err)
+	}
+}
+
+func TestJoinCommandRejectsInvalidLevelAndUnquotedCheck(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	service.process(context.Background(), groupEvent("g1", "admin", "/join limit -1"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "非负整数") {
+		t.Fatalf("unexpected level error: %q", reply)
+	}
+	service.process(context.Background(), groupEvent("g1", "admin", "/join check unquoted"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, `/join check "<匹配字符串>"`) {
+		t.Fatalf("unexpected check error: %q", reply)
+	}
+}
+
+func TestGroupJoinApprovalRequiresConfiguredLevelAndContent(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	if err := storage.PutGroupJoinApproval(model.GroupJoinApproval{GroupOpenID: "g1", Enabled: true, MinQQLevel: 20, MatchText: "内部用户"}); err != nil {
+		t.Fatal(err)
+	}
+	requests := []qq.GroupJoinRequest{
+		{
+			GroupOpenID: "g1", MemberOpenID: "approved", JoinRequestID: "r1", QQLevel: qq.OptionalInt{Value: 25, Set: true},
+			VerifyInfo: qq.GroupJoinVerifyInfo{ReviewQAList: []qq.GroupJoinReviewQA{{Answer: "alice@example.com"}, {Answer: "我是内部用户"}}},
+		},
+		{
+			GroupOpenID: "g1", MemberOpenID: "low-level", JoinRequestID: "r2", QQLevel: qq.OptionalInt{Value: 19, Set: true},
+			VerifyInfo: qq.GroupJoinVerifyInfo{ReviewQAList: []qq.GroupJoinReviewQA{{Answer: "alice@example.com"}, {Answer: "我是内部用户"}}},
+		},
+		{
+			GroupOpenID: "g1", MemberOpenID: "missing-level", JoinRequestID: "r3",
+			VerifyInfo: qq.GroupJoinVerifyInfo{ReviewQAList: []qq.GroupJoinReviewQA{{Answer: "alice@example.com"}, {Answer: "我是内部用户"}}},
+		},
+		{
+			GroupOpenID: "g1", MemberOpenID: "wrong-content", JoinRequestID: "r4", QQLevel: qq.OptionalInt{Value: 25, Set: true},
+			VerifyInfo: qq.GroupJoinVerifyInfo{ReviewQAList: []qq.GroupJoinReviewQA{{Answer: "alice@example.com"}, {Answer: "外部用户"}}},
+		},
+	}
+	for _, request := range requests {
+		service.process(context.Background(), qq.MessageEvent{EventType: "GROUP_JOIN_REQUEST", JoinRequest: request})
+	}
+	qqAPI.mu.Lock()
+	defer qqAPI.mu.Unlock()
+	if len(qqAPI.joinApprovals) != 1 || qqAPI.joinApprovals[0].MemberOpenID != "approved" {
+		t.Fatalf("unexpected approvals: %#v", qqAPI.joinApprovals)
+	}
+}
+
+func TestMuteCommandsUseOfficialGroupModerationAPI(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	service.cfg.QQAdminOpenIDs["member:g1:admin"] = struct{}{}
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:admin", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	event := groupEvent("g1", "admin", "/mute @alice 2h")
+	event.Message.Mentions = []qq.MessageAuthor{{MemberOpenID: "target", Username: "alice"}}
+	service.process(context.Background(), event)
+	qqAPI.mu.Lock()
+	if qqAPI.muteMember != "target" || qqAPI.muteOperation != "add" || time.Until(qqAPI.muteExpiresAt) < 119*time.Minute {
+		qqAPI.mu.Unlock()
+		t.Fatalf("unexpected mute call: member=%q operation=%q expires=%s", qqAPI.muteMember, qqAPI.muteOperation, qqAPI.muteExpiresAt)
+	}
+	qqAPI.mu.Unlock()
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "禁言 2 小时") {
+		t.Fatalf("unexpected mute reply: %q", reply)
+	}
+
+	event.Message.ID = "mute-off"
+	event.Message.Content = "/mute off @alice"
+	service.process(context.Background(), event)
+	qqAPI.mu.Lock()
+	defer qqAPI.mu.Unlock()
+	if qqAPI.muteOperation != "del" || qqAPI.muteMember != "target" {
+		t.Fatalf("unexpected unmute call: member=%q operation=%q", qqAPI.muteMember, qqAPI.muteOperation)
 	}
 }
 
@@ -484,8 +840,9 @@ func TestBenefitCreatesCodesAndEnforcesSingleClaim(t *testing.T) {
 	if err != nil || len(campaign.RedemptionIDs) != 3 {
 		t.Fatalf("campaign not stored: %#v err=%v", campaign, err)
 	}
+	campaign.CreatedAt = campaign.CreatedAt.Add(-2 * time.Minute)
 	api.logs = []newapi.LogRecord{{ID: 1, UserID: 9, Type: 1, Content: fmt.Sprintf("通过兑换码充值，兑换码ID %d", campaign.RedemptionIDs[0])}, {ID: 2, UserID: 9, Type: 1, Content: fmt.Sprintf("通过兑换码充值，兑换码ID %d", campaign.RedemptionIDs[1])}}
-	if err := service.detectBenefitViolations(context.Background(), campaign); err != nil {
+	if err := service.detectBenefitViolations(context.Background(), &campaign); err != nil {
 		t.Fatal(err)
 	}
 	if api.managedAction != "disable" || api.lastQuotaUser != 9 {
@@ -495,6 +852,20 @@ func TestBenefitCreatesCodesAndEnforcesSingleClaim(t *testing.T) {
 	if err != nil || ban.Status != "disabled" {
 		t.Fatalf("ban not stored: %#v err=%v", ban, err)
 	}
+	firstCheckedAt := campaign.LastCheckedAt
+	if firstCheckedAt.IsZero() || len(campaign.ClaimedCodes[9]) != 2 {
+		t.Fatalf("campaign scan state not persisted: %#v", campaign)
+	}
+	if err := service.detectBenefitViolations(context.Background(), &campaign); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.logQueryStarts) < 2 {
+		t.Fatalf("benefit scan did not run twice: starts=%v", api.logQueryStarts)
+	}
+	secondStart := api.logQueryStarts[len(api.logQueryStarts)-1]
+	if secondStart.Before(campaign.CreatedAt) || secondStart.After(firstCheckedAt) {
+		t.Fatalf("benefit scan overlap is outside the safe window: start=%v created=%v checked=%v", secondStart, campaign.CreatedAt, firstCheckedAt)
+	}
 	ban.EnableAt = time.Now().Add(-time.Minute)
 	if err := storage.PutBenefitBan(ban); err != nil {
 		t.Fatal(err)
@@ -502,6 +873,50 @@ func TestBenefitCreatesCodesAndEnforcesSingleClaim(t *testing.T) {
 	service.processBenefitBans(context.Background())
 	if api.managedAction != "enable" {
 		t.Fatalf("user not re-enabled: %s", api.managedAction)
+	}
+}
+
+func TestBenefitLogScanSplitsOversizedTimeRange(t *testing.T) {
+	service, _, api, _, _ := testService(t)
+	api.logSplitAfter = time.Second
+	start := time.Unix(100, 0)
+	if err := service.scanBenefitLogs(context.Background(), start, start.Add(4*time.Second), map[int]struct{}{1: {}}, make(map[int]map[int]struct{})); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.logQueryStarts) < 3 {
+		t.Fatalf("oversized log range was not split: starts=%v", api.logQueryStarts)
+	}
+}
+
+func TestBenefitCampaignKeepsFinalScanGrace(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	now := time.Now()
+	campaign := model.BenefitCampaign{
+		ID: "benefit-grace", GroupOpenID: "g1", Status: "active", Announced: true,
+		CreatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(-time.Minute), RedemptionIDs: []int{1},
+	}
+	if err := storage.PutBenefitCampaign(campaign); err != nil {
+		t.Fatal(err)
+	}
+	service.processBenefitCampaign(context.Background(), campaign)
+	stored, err := storage.GetBenefitCampaign(campaign.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != "active" || len(stored.RedemptionIDs) != 1 {
+		t.Fatalf("campaign expired before ingestion grace: %#v", stored)
+	}
+	stored.ExpiresAt = now.Add(-benefitLogIngestionGrace - time.Minute)
+	if err := storage.PutBenefitCampaign(stored); err != nil {
+		t.Fatal(err)
+	}
+	service.processBenefitCampaign(context.Background(), stored)
+	stored, err = storage.GetBenefitCampaign(campaign.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != "expired" || len(stored.RedemptionIDs) != 0 {
+		t.Fatalf("campaign did not expire after ingestion grace: %#v", stored)
 	}
 }
 
@@ -523,7 +938,7 @@ func TestBindFlow(t *testing.T) {
 	if mail.code == "" {
 		t.Fatal("verification email was not sent")
 	}
-	service.process(context.Background(), c2cEvent("u1", "/bind vertify "+mail.code))
+	service.process(context.Background(), c2cEvent("u1", "/bind verify "+mail.code))
 	binding, err := storage.GetBinding("user:u1")
 	if err != nil {
 		t.Fatal(err)
@@ -542,7 +957,7 @@ func TestGroupBindFlow(t *testing.T) {
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "当前群") {
 		t.Fatalf("unexpected reply: %q", reply)
 	}
-	service.process(context.Background(), groupEvent("g1", "u1", "/bind vertify "+mail.code))
+	service.process(context.Background(), groupEvent("g1", "u1", "/bind verify "+mail.code))
 	binding, err := storage.GetBinding("member:g1:u1")
 	if err != nil {
 		t.Fatal(err)
@@ -756,7 +1171,7 @@ func TestQuotaNotificationSendsOnceAndRearms(t *testing.T) {
 	if err := storage.PutQuotaNotification(preference); err != nil {
 		t.Fatal(err)
 	}
-	service.checkQuotaNotifications()
+	service.checkQuotaNotifications(context.Background())
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "额度提醒") || !strings.Contains(reply, "Alice") {
 		t.Fatalf("unexpected notify reply: %q", reply)
 	}
@@ -765,15 +1180,40 @@ func TestQuotaNotificationSendsOnceAndRearms(t *testing.T) {
 		t.Fatalf("notification not marked alerted: %#v err=%v", saved, err)
 	}
 	messageCount := len(qqAPI.messages)
-	service.checkQuotaNotifications()
+	service.checkQuotaNotifications(context.Background())
 	if len(qqAPI.messages) != messageCount {
 		t.Fatal("duplicate quota notification was sent")
 	}
 	api.user.Quota = 1000000
-	service.checkQuotaNotifications()
+	service.checkQuotaNotifications(context.Background())
 	saved, _ = storage.GetQuotaNotification("member:g1:u1")
 	if saved.Alerted {
 		t.Fatal("quota notification was not rearmed after balance recovery")
+	}
+}
+
+func TestDailyNotificationsShareOneUsageQuery(t *testing.T) {
+	service, storage, api, _, _ := testService(t)
+	service.cfg.NotifyDailyTime = time.Now().UTC().Format("15:04")
+	api.users = []newapi.User{
+		{ID: 42, Username: "alice", Quota: 500000},
+		{ID: 43, Username: "bob", Quota: 500000},
+	}
+	api.usageByUser = []newapi.UsageRecord{
+		{Username: "alice", Count: 2, TokenUsed: 10, Quota: 100},
+		{Username: "bob", Count: 3, TokenUsed: 20, Quota: 200},
+	}
+	for _, preference := range []model.QuotaNotification{
+		{CanonicalID: "member:g1:u1", NewAPIID: 42, GroupOpenID: "g1", DailyEnabled: true},
+		{CanonicalID: "member:g2:u2", NewAPIID: 43, GroupOpenID: "g2", DailyEnabled: true},
+	} {
+		if err := storage.PutQuotaNotification(preference); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service.checkQuotaNotifications(context.Background())
+	if api.usageUserCalls != 1 {
+		t.Fatalf("daily usage queries=%d, want 1", api.usageUserCalls)
 	}
 }
 
@@ -808,12 +1248,92 @@ func TestCheckinIsIdempotent(t *testing.T) {
 	if api.quotaAdds != 1 {
 		t.Fatalf("quota adds=%d", api.quotaAdds)
 	}
+	if api.usageUserCalls != 1 {
+		t.Fatalf("usage calls=%d, want 1", api.usageUserCalls)
+	}
 	if api.lastQuotaUser != 42 || api.lastQuota != 500000 {
 		t.Fatalf("quota user=%d raw=%d", api.lastQuotaUser, api.lastQuota)
 	}
 }
 
-func TestAdminCheckinStatsAndImmediateCreditEdit(t *testing.T) {
+func TestCheckinResponseHeaderTimeoutStaysPendingWithoutRetry(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	now := time.Now()
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	api.addQuotaErr = &newapi.APIError{Message: `Post "https://example.com/api/user/manage": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`}
+
+	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "发放结果待确认") {
+		t.Fatalf("unexpected timeout reply: %q", reply)
+	}
+	period, _ := periodKey(time.Now(), service.cfg.CheckinPeriod, service.cfg.CheckinTimezone)
+	record, err := storage.GetCheckin("user:u1", period)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "pending_confirmation" || record.LastError == "" {
+		t.Fatalf("unexpected checkin record: %#v", record)
+	}
+
+	api.addQuotaErr = nil
+	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	if api.quotaAdds != 1 {
+		t.Fatalf("ambiguous request was retried: quota adds=%d", api.quotaAdds)
+	}
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "发放结果待确认") {
+		t.Fatalf("unexpected pending reply: %q", reply)
+	}
+}
+
+func TestCheckinTruncatedHTTP200StaysPendingWithoutRetry(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	api.addQuotaErr = &newapi.APIError{StatusCode: 200, Message: "解析响应失败", Cause: io.ErrUnexpectedEOF}
+	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "发放结果待确认") {
+		t.Fatalf("unexpected truncated response reply: %q", reply)
+	}
+	period, _ := periodKey(time.Now(), service.cfg.CheckinPeriod, service.cfg.CheckinTimezone)
+	record, err := storage.GetCheckin("user:u1", period)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "pending_confirmation" {
+		t.Fatalf("checkin status=%q, want pending_confirmation", record.Status)
+	}
+}
+
+func TestUsageChartBusyFailsFast(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+	service.chartSemaphore <- struct{}{}
+	start := time.Now()
+	err := service.handleUsageChart(context.Background(), groupEvent("g1", "u1", "/usage chart 7d"), "member:g1:u1", model.QQIdentity{}, "7d", "")
+	<-service.chartSemaphore
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("busy chart waited instead of failing fast: %s", elapsed)
+	}
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "已有用量图表") {
+		t.Fatalf("unexpected busy chart reply: %q", reply)
+	}
+}
+
+func TestCommandTimeoutAllowsTwoNewAPIRequestsAndReply(t *testing.T) {
+	if got, want := commandTimeout(30*time.Second, 10*time.Second), 105*time.Second; got != want {
+		t.Fatalf("commandTimeout()=%s, want %s", got, want)
+	}
+	if got, want := commandTimeout(time.Second, time.Second), 25*time.Second; got != want {
+		t.Fatalf("commandTimeout minimum=%s, want %s", got, want)
+	}
+}
+
+func TestAdminCheckinStatsUsesDynamicRule(t *testing.T) {
 	service, storage, api, qqAPI, _ := testService(t)
 	now := time.Now()
 	for _, binding := range []model.Binding{
@@ -839,19 +1359,113 @@ func TestAdminCheckinStatsAndImmediateCreditEdit(t *testing.T) {
 	}
 
 	service.process(context.Background(), c2cEvent("admin", "/admin checkin"))
-	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "签到人数：2") || !strings.Contains(reply, "已发放额度：3") || !strings.Contains(reply, "处理中签到：1") {
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "签到人数：2") || !strings.Contains(reply, "已发放额度：3") || !strings.Contains(reply, "处理中签到：1") || !strings.Contains(reply, "随机上限5~10") {
 		t.Fatalf("unexpected checkin stats: %q", reply)
 	}
 	service.process(context.Background(), c2cEvent("admin", "/admin checkin edit 2.5"))
-	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "更新为 2.5") || !strings.Contains(reply, "已立即生效") {
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "动态规则") || !strings.Contains(reply, "不再修改") {
 		t.Fatalf("unexpected checkin edit reply: %q", reply)
 	}
-	if credit, err := storage.GetCheckinCreditOverride(); err != nil || credit != "2.5" {
-		t.Fatalf("checkin credit override=%q err=%v", credit, err)
-	}
+	service.randomCheckinCap = func() (int64, error) { return 8, nil }
+	api.usageByUser = []newapi.UsageRecord{{UserID: 46, Quota: 1750000}}
 	service.process(context.Background(), c2cEvent("fresh", "/checkin"))
-	if api.lastQuota != 1250000 {
-		t.Fatalf("updated checkin quota=%d, want 1250000", api.lastQuota)
+	if api.lastQuota != 1750000 {
+		t.Fatalf("dynamic checkin quota=%d, want 1750000", api.lastQuota)
+	}
+}
+
+func TestDynamicCheckinQuotaBoundsAndYesterdayRange(t *testing.T) {
+	service, _, api, _, _ := testService(t)
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.cfg.CheckinTimezone = location
+	now := time.Date(2026, 8, 16, 13, 30, 0, 0, location)
+	service.randomCheckinCap = func() (int64, error) { return 6, nil }
+
+	tests := []struct {
+		name  string
+		rows  []newapi.UsageRecord
+		want  int64
+		usage int64
+	}{
+		{name: "no usage receives minimum", want: 500000},
+		{name: "below minimum receives minimum", rows: []newapi.UsageRecord{{UserID: 42, Quota: 250000}}, want: 500000, usage: 250000},
+		{name: "usage is summed", rows: []newapi.UsageRecord{{UserID: 42, Quota: 1000000}, {UserID: 7, Quota: 9000000}, {UserID: 42, Quota: 750000}}, want: 1750000, usage: 1750000},
+		{name: "usage is capped", rows: []newapi.UsageRecord{{UserID: 42, Quota: 9000000}}, want: 3000000, usage: 9000000},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api.usageByUser = test.rows
+			api.usageRanges = nil
+			got, usage, capCredit, err := service.dynamicCheckinQuota(context.Background(), 42, now, 500000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want || usage != test.usage || capCredit != 6 {
+				t.Fatalf("reward=%d usage=%d cap=%d, want reward=%d usage=%d cap=6", got, usage, capCredit, test.want, test.usage)
+			}
+			if len(api.usageRanges) != 1 {
+				t.Fatalf("usage calls=%d", len(api.usageRanges))
+			}
+			wantStart := time.Date(2026, 8, 15, 0, 0, 0, 0, location)
+			wantEnd := time.Date(2026, 8, 16, 0, 0, 0, 0, location)
+			if !api.usageRanges[0].Start.Equal(wantStart) || !api.usageRanges[0].End.Equal(wantEnd) {
+				t.Fatalf("usage range=[%s,%s), want [%s,%s)", api.usageRanges[0].Start, api.usageRanges[0].End, wantStart, wantEnd)
+			}
+		})
+	}
+}
+
+func TestPreviousNaturalDayCrossesMonthAndYear(t *testing.T) {
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := previousNaturalDay(time.Date(2026, 1, 1, 8, 0, 0, 0, location), location)
+	if want := time.Date(2025, 12, 31, 0, 0, 0, 0, location); !start.Equal(want) {
+		t.Fatalf("start=%s, want %s", start, want)
+	}
+	if want := time.Date(2026, 1, 1, 0, 0, 0, 0, location); !end.Equal(want) {
+		t.Fatalf("end=%s, want %s", end, want)
+	}
+}
+
+func TestRandomCheckinCreditCapRange(t *testing.T) {
+	seen := make(map[int64]bool)
+	for i := 0; i < 256; i++ {
+		value, err := randomCheckinCreditCap()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value < 5 || value > 10 {
+			t.Fatalf("cap=%d outside [5,10]", value)
+		}
+		seen[value] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("random generator produced only %v", seen)
+	}
+}
+
+func TestCheckinUsageFailureDoesNotReserveOrAddQuota(t *testing.T) {
+	service, storage, api, qqAPI, _ := testService(t)
+	service.now = func() time.Time { return time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC) }
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: service.now()}); err != nil {
+		t.Fatal(err)
+	}
+	api.usageUserErr = errors.New("usage unavailable")
+	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	if api.quotaAdds != 0 {
+		t.Fatalf("quota adds=%d", api.quotaAdds)
+	}
+	period, _ := periodKey(service.now(), service.cfg.CheckinPeriod, service.cfg.CheckinTimezone)
+	if _, err := storage.GetCheckin("user:u1", period); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("checkin record err=%v, want not found", err)
+	}
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "计算签到额度失败") {
+		t.Fatalf("unexpected reply: %q", reply)
 	}
 }
 

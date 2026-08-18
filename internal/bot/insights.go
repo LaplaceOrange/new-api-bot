@@ -25,18 +25,25 @@ type usageTotal struct {
 }
 
 func (s *Service) handleUsage(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
-	if len(fields) > 3 {
-		return s.reply(ctx, event, usageHelp())
-	}
 	if len(fields) >= 2 && strings.EqualFold(fields[1], "chart") {
+		if len(fields) > 4 {
+			return s.reply(ctx, event, usageHelp())
+		}
 		if !s.cfg.UsageChartEnabled {
 			return s.reply(ctx, event, "用量图表功能当前已关闭。")
 		}
 		duration := "7d"
-		if len(fields) == 3 {
+		if len(fields) >= 3 {
 			duration = fields[2]
 		}
-		return s.handleUsageChart(ctx, event, canonical, duration)
+		target := ""
+		if len(fields) == 4 {
+			target = fields[3]
+		}
+		return s.handleUsageChart(ctx, event, canonical, identity, duration, target)
+	}
+	if len(fields) > 3 {
+		return s.reply(ctx, event, usageHelp())
 	}
 	durationArg := "today"
 	if len(fields) >= 2 {
@@ -423,13 +430,13 @@ func (s *Service) runQuotaNotifier(ctx context.Context) {
 		case <-s.notifyStop:
 			return
 		case <-ticker.C:
-			s.checkQuotaNotifications()
+			s.checkQuotaNotifications(ctx)
 		}
 	}
 }
 
-func (s *Service) checkQuotaNotifications() {
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.NewAPITimeout*2)
+func (s *Service) checkQuotaNotifications(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, s.cfg.NewAPITimeout*2)
 	defer cancel()
 	preferences, err := s.store.ListQuotaNotifications()
 	if err != nil || len(preferences) == 0 {
@@ -461,6 +468,9 @@ func (s *Service) checkQuotaNotifications() {
 	local := now.In(s.cfg.CheckinTimezone)
 	dailyDue := local.Hour() == dailyAt.Hour() && local.Minute() >= dailyAt.Minute()
 	dailyKey := local.Format("2006-01-02")
+	var dailyTotals map[string]usageTotal
+	var dailyUsageErr error
+	dailyUsageLoaded := false
 	for _, preference := range preferences {
 		user, exists := byID[preference.NewAPIID]
 		if !exists {
@@ -485,10 +495,27 @@ func (s *Service) checkQuotaNotifications() {
 			}
 		}
 		if preference.DailyEnabled && dailyDue && preference.LastDailyKey != dailyKey {
-			start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, s.cfg.CheckinTimezone)
-			rows, usageErr := s.newAPI.ListUsageByUser(ctx, start, now)
-			if usageErr == nil && notificationGroupAllowed(s, preference.GroupOpenID, groupAllowed) {
-				total := usageForUsername(rows, user.Username)
+			if !dailyUsageLoaded {
+				dailyUsageLoaded = true
+				start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, s.cfg.CheckinTimezone)
+				rows, usageErr := s.newAPI.ListUsageByUser(ctx, start, now)
+				dailyUsageErr = usageErr
+				if usageErr == nil {
+					dailyTotals = make(map[string]usageTotal, len(rows))
+					for _, row := range rows {
+						key := strings.ToLower(strings.TrimSpace(row.Username))
+						total := dailyTotals[key]
+						total.UserID = row.UserID
+						total.Username = row.Username
+						total.Quota += row.Quota
+						total.Tokens += row.TokenUsed
+						total.Count += row.Count
+						dailyTotals[key] = total
+					}
+				}
+			}
+			if dailyUsageErr == nil && notificationGroupAllowed(s, preference.GroupOpenID, groupAllowed) {
+				total := dailyTotals[strings.ToLower(strings.TrimSpace(user.Username))]
 				groupMessages[preference.GroupOpenID] = append(groupMessages[preference.GroupOpenID], fmt.Sprintf("📊 %s 今日用量：%d 次请求，%d Token，消耗额度 %s，余额 %s。", mentionMember(preference.MemberOpenID), total.Count, total.Tokens, newapi.QuotaToDisplay(total.Quota, status.QuotaPerUnit), newapi.QuotaToDisplay(user.Quota, status.QuotaPerUnit)))
 				preference.LastDailyKey = dailyKey
 				updates[preference.CanonicalID] = preference
@@ -746,7 +773,7 @@ func formatLogTime(timestamp int64, location *time.Location) string {
 }
 
 func usageHelp() string {
-	return "用法：/usage [today|7d|month] 查看自己；管理员可用 /usage <用户ID或@用户> 7d；/usage <时间长度> all 查看全站汇总；/usage <时间长度> <前N名> 查看排行榜；/usage chart 7d 生成图表。"
+	return "用法：/usage [today|7d|month] 查看自己；管理员可用 /usage <用户ID或@用户> 7d；/usage <时间长度> all 查看全站汇总；/usage <时间长度> <前N名> 查看排行榜；/usage chart <时间长度> [@用户|用户ID|all] 生成图表。"
 }
 
 func logsHelp() string {

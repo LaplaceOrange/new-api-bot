@@ -3,6 +3,7 @@ package qq
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func TestFlexIntAcceptsStringAndNumber(t *testing.T) {
@@ -45,5 +46,81 @@ func TestMessageCreateEventCompatibility(t *testing.T) {
 	}
 	if isMessageCreateEvent("READY") {
 		t.Fatal("READY must not be treated as a message event")
+	}
+}
+
+func TestGatewayBackoffIsBounded(t *testing.T) {
+	backoff := time.Second
+	for range 10 {
+		backoff = nextGatewayBackoff(backoff)
+	}
+	if backoff != 30*time.Second {
+		t.Fatalf("backoff=%s, want 30s", backoff)
+	}
+}
+
+func TestGroupJoinRequestEventSchema(t *testing.T) {
+	input := []byte(`{
+		"group_openid":"group-1",
+		"join_request_id":"request-1",
+		"risk_tips":"",
+		"union_openid":"union-1",
+		"member_openid":"member-1",
+		"username":"alice",
+		"apply_at":"2026-08-10T20:00:00+08:00",
+		"apply_source":"self_apply",
+		"verify_info":{"method":"admin_review_qa","review_qa_list":[{"question":"账号","answer":"alice@example.com"}]}
+	}`)
+	var request GroupJoinRequest
+	if err := json.Unmarshal(input, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.GroupOpenID != "group-1" || request.JoinRequestID != "request-1" || request.MemberOpenID != "member-1" {
+		t.Fatalf("unexpected request: %#v", request)
+	}
+	if len(request.VerifyInfo.ReviewQAList) != 1 || request.VerifyInfo.ReviewQAList[0].Answer != "alice@example.com" {
+		t.Fatalf("unexpected verification info: %#v", request.VerifyInfo)
+	}
+}
+
+func TestGroupJoinRequestUserLevelAcceptsNumberAndString(t *testing.T) {
+	for _, input := range []string{
+		`{"qq_level":42}`,
+		`{"qq_level":"42"}`,
+		`{"level":42}`,
+		`{"level":"42"}`,
+	} {
+		var request GroupJoinRequest
+		if err := json.Unmarshal([]byte(input), &request); err != nil {
+			t.Fatalf("input %s: %v", input, err)
+		}
+		level, present := request.UserLevel()
+		if !present || level != 42 {
+			t.Fatalf("input %s: level=%d present=%v", input, level, present)
+		}
+	}
+
+	var request GroupJoinRequest
+	if err := json.Unmarshal([]byte(`{"username":"alice"}`), &request); err != nil {
+		t.Fatal(err)
+	}
+	if level, present := request.UserLevel(); present || level != 0 {
+		t.Fatalf("missing level should remain absent: level=%d present=%v", level, present)
+	}
+}
+
+func TestGroupJoinRequestUserLevelSurvivesPersistenceRoundTrip(t *testing.T) {
+	original := GroupJoinRequest{QQLevel: OptionalInt{Value: 42, Set: true}}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored GroupJoinRequest
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	level, present := restored.UserLevel()
+	if !present || level != 42 {
+		t.Fatalf("round-trip level=%d present=%v payload=%s", level, present, data)
 	}
 }
