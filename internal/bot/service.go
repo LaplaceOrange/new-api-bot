@@ -71,45 +71,45 @@ type queuedGatewayEvent struct {
 }
 
 type Service struct {
-	cfg              config.Config
-	store            *store.Store
-	secure           *secure.Box
-	newAPI           NewAPI
-	qq               QQAPI
-	mailer           mailer.Sender
-	logger           *slog.Logger
-	queue            chan queuedGatewayEvent
-	workers          sync.WaitGroup
-	workersDone      chan struct{}
-	checkins         keyedLocker[string]
-	credits          keyedLocker[int]
-	plans            keyedLocker[int]
-	groupSettings    keyedLocker[string]
-	notifyStop       chan struct{}
-	dispatchStop     chan struct{}
-	dispatchDone     chan struct{}
-	inboxWake        chan struct{}
-	started          atomic.Bool
-	stopOnce         sync.Once
-	queueCloseOnce   sync.Once
-	gatewayConnected func() bool
-	lifecycleCtx     context.Context
-	inflightMu       sync.Mutex
-	inflight         map[string]struct{}
-	notifyMu         sync.Mutex
-	groupLastNotify  map[string]time.Time
-	benefitMu        sync.Mutex
-	lastPruneAt      time.Time
-	chartSemaphore   chan struct{}
-	commandRulesMu   sync.Mutex
-	commandRules     atomic.Pointer[[]model.CommandRule]
-	resetRadar       resetRadarClient
-	resetMu          sync.Mutex
-	resetNotifyMu    sync.Mutex
-	resetGroups      keyedLocker[string]
-	resetSettleWake  chan struct{}
-	now              func() time.Time
-	randomCheckinCap func() (int64, error)
+	cfg                     config.Config
+	store                   *store.Store
+	secure                  *secure.Box
+	newAPI                  NewAPI
+	qq                      QQAPI
+	mailer                  mailer.Sender
+	logger                  *slog.Logger
+	queue                   chan queuedGatewayEvent
+	workers                 sync.WaitGroup
+	workersDone             chan struct{}
+	checkins                keyedLocker[string]
+	credits                 keyedLocker[int]
+	plans                   keyedLocker[int]
+	groupSettings           keyedLocker[string]
+	notifyStop              chan struct{}
+	dispatchStop            chan struct{}
+	dispatchDone            chan struct{}
+	inboxWake               chan struct{}
+	started                 atomic.Bool
+	stopOnce                sync.Once
+	queueCloseOnce          sync.Once
+	gatewayConnected        func() bool
+	lifecycleCtx            context.Context
+	inflightMu              sync.Mutex
+	inflight                map[string]struct{}
+	notifyMu                sync.Mutex
+	groupLastNotify         map[string]time.Time
+	benefitMu               sync.Mutex
+	lastPruneAt             time.Time
+	chartSemaphore          chan struct{}
+	commandRulesMu          sync.Mutex
+	commandRules            atomic.Pointer[[]model.CommandRule]
+	resetRadar              resetRadarClient
+	resetMu                 sync.Mutex
+	resetNotifyMu           sync.Mutex
+	resetGroups             keyedLocker[string]
+	resetSettleWake         chan struct{}
+	now                     func() time.Time
+	randomCheckinMultiplier func() (int64, error)
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
@@ -121,7 +121,7 @@ func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI
 	}
 	service := &Service{
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
-		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1), resetSettleWake: make(chan struct{}, 1), now: time.Now, randomCheckinCap: randomCheckinCreditCap,
+		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1), resetSettleWake: make(chan struct{}, 1), now: time.Now, randomCheckinMultiplier: randomCheckinMultiplier,
 	}
 	if cfg.ResetEnabled {
 		service.resetRadar = resetradar.NewScanner(cfg.ResetHTTPTimeout, cfg.ResetSignalMaxAge)
@@ -521,8 +521,9 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	}
 }
 
-// commandTimeout leaves room for the three sequential New API requests used
-// by /checkin (status, yesterday usage, quota update) and the QQ reply.
+// commandTimeout leaves room for the four sequential New API requests used by
+// /checkin (status, yesterday usage, username fallback, quota update) and the
+// QQ reply.
 func commandTimeout(newAPITimeout, qqAPITimeout time.Duration) time.Duration {
 	const minimum = 25 * time.Second
 	const replyReserve = 5 * time.Second
@@ -532,7 +533,7 @@ func commandTimeout(newAPITimeout, qqAPITimeout time.Duration) time.Duration {
 	if qqAPITimeout <= 0 {
 		qqAPITimeout = 10 * time.Second
 	}
-	timeout := newAPITimeout*3 + qqAPITimeout + replyReserve
+	timeout := newAPITimeout*4 + qqAPITimeout + replyReserve
 	if timeout < minimum {
 		return minimum
 	}
@@ -810,14 +811,14 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 	if err != nil {
 		return s.reply(ctx, event, publicError(err))
 	}
-	rawQuota, usageQuota, capCredit, err := s.dynamicCheckinQuota(ctx, binding.NewAPIID, now, status.QuotaPerUnit)
+	rawQuota, usageQuota, multiplierTenths, err := s.dynamicCheckinQuota(ctx, binding.NewAPIID, now, status.QuotaPerUnit)
 	if err != nil {
 		return s.reply(ctx, event, "计算签到额度失败："+publicError(err))
 	}
 	credit := newapi.QuotaToDisplay(rawQuota, status.QuotaPerUnit)
 	record := model.CheckinRecord{
 		CanonicalID: canonical, NewAPIID: binding.NewAPIID, PeriodKey: period,
-		RawQuota: rawQuota, DisplayCredit: credit, CreatedAt: now, UpdatedAt: now, Status: "pending",
+		RawQuota: rawQuota, DisplayCredit: credit, YesterdayUsage: usageQuota, YesterdayUsageDisplay: newapi.QuotaToDisplay(usageQuota, status.QuotaPerUnit), CreatedAt: now, UpdatedAt: now, Status: "pending",
 	}
 	record, created, err := s.store.ReserveCheckin(record)
 	if err != nil {
@@ -834,11 +835,11 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 			if saveErr := s.store.FinalizeCheckin(record); saveErr != nil {
 				s.logger.Error("签到结果待确认状态保存失败", "canonical", canonical, "newapi_user_id", binding.NewAPIID, "error", saveErr)
 			}
-			_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: "额度写入结果待确认：" + publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota, "yesterday_usage_quota": usageQuota, "random_cap_credit": capCredit}})
+			_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: "额度写入结果待确认：" + publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota, "yesterday_usage_quota": usageQuota, "random_multiplier_tenths": multiplierTenths}})
 			return s.reply(ctx, event, "签到额度请求超时，发放结果待确认。请勿重复签到；如长时间未到账请联系管理员核查。")
 		}
 		_ = s.store.DeletePendingCheckin(record)
-		_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota, "yesterday_usage_quota": usageQuota, "random_cap_credit": capCredit}})
+		_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota, "yesterday_usage_quota": usageQuota, "random_multiplier_tenths": multiplierTenths}})
 		return s.reply(ctx, event, publicError(err))
 	}
 	record.Status = "completed"
@@ -847,13 +848,17 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 		s.logger.Error("签到额度已发放但保存完成状态失败", "canonical", canonical, "newapi_user_id", binding.NewAPIID, "error", err)
 		return s.reply(ctx, event, "额度已经发放，但本地签到状态保存失败，请联系管理员核查，勿重复签到。")
 	}
-	_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: true, Metadata: map[string]any{"period": period, "quota": rawQuota, "display_credit": credit, "yesterday_usage_quota": usageQuota, "random_cap_credit": capCredit}})
-	return s.reply(ctx, event, fmt.Sprintf("🎉 签到成功！昨日消耗额度 %s，本次随机上限 %d，已发放额度 %s 至绑定的 New API 用户 %d。", newapi.QuotaToDisplay(usageQuota, status.QuotaPerUnit), capCredit, credit, binding.NewAPIID))
+	_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: true, Metadata: map[string]any{"period": period, "quota": rawQuota, "display_credit": credit, "yesterday_usage_quota": usageQuota, "random_multiplier_tenths": multiplierTenths}})
+	return s.reply(ctx, event, fmt.Sprintf("昨日用量：%s\n获取额度：%s", newapi.QuotaToDisplay(usageQuota, status.QuotaPerUnit), credit))
 }
 
 func (s *Service) replyExistingCheckin(ctx context.Context, event qq.MessageEvent, record model.CheckinRecord, next time.Time) error {
 	if record.Status == "completed" {
-		return s.reply(ctx, event, fmt.Sprintf("本周期已经签到，额度 %s 已发放至绑定的 New API 用户 %d；下次可签到时间：%s", record.DisplayCredit, record.NewAPIID, next.Format("2006-01-02 15:04 MST")))
+		yesterdayUsage := record.YesterdayUsageDisplay
+		if yesterdayUsage == "" {
+			yesterdayUsage = "未知"
+		}
+		return s.reply(ctx, event, fmt.Sprintf("昨日用量：%s\n获取额度：%s", yesterdayUsage, record.DisplayCredit))
 	}
 	if record.Status == "pending_confirmation" {
 		return s.reply(ctx, event, "本周期签到额度发放结果待确认，请勿重复签到；如长时间未到账请联系管理员核查。")
@@ -861,7 +866,7 @@ func (s *Service) replyExistingCheckin(ctx context.Context, event qq.MessageEven
 	return s.reply(ctx, event, "本周期签到请求正在处理中，请勿重复提交；如长时间未到账请联系管理员核查。")
 }
 
-func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.Time, quotaPerUnit int64) (reward, yesterdayUsage, capCredit int64, err error) {
+func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.Time, quotaPerUnit int64) (reward, yesterdayUsage, multiplierTenths int64, err error) {
 	if quotaPerUnit <= 0 {
 		return 0, 0, 0, errors.New("quota_per_unit 必须大于 0")
 	}
@@ -901,22 +906,24 @@ func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.
 		}
 		yesterdayUsage += row.Quota
 	}
-	capCredit, err = s.randomCheckinCap()
+	multiplierTenths, err = s.randomCheckinMultiplier()
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("生成随机签到上限失败: %w", err)
+		return 0, 0, 0, fmt.Errorf("生成随机签到倍数失败: %w", err)
 	}
-	if capCredit < 5 || capCredit > 10 || quotaPerUnit > math.MaxInt64/capCredit {
-		return 0, 0, 0, errors.New("随机签到上限无效")
+	if multiplierTenths < 10 || multiplierTenths > 30 {
+		return 0, 0, 0, errors.New("随机签到倍数无效")
 	}
 	reward = yesterdayUsage
 	if reward < quotaPerUnit {
 		reward = quotaPerUnit
 	}
-	capQuota := capCredit * quotaPerUnit
-	if reward > capQuota {
-		reward = capQuota
+	if reward > (math.MaxInt64-5)/multiplierTenths {
+		return 0, 0, 0, errors.New("签到额度超出支持范围")
 	}
-	return reward, yesterdayUsage, capCredit, nil
+	// multiplierTenths is a one-decimal multiplier. Round half up because the
+	// New API quota field must remain an integer.
+	reward = (reward*multiplierTenths + 5) / 10
+	return reward, yesterdayUsage, multiplierTenths, nil
 }
 
 func previousNaturalDay(now time.Time, location *time.Location) (time.Time, time.Time) {
@@ -925,12 +932,12 @@ func previousNaturalDay(now time.Time, location *time.Location) (time.Time, time
 	return end.AddDate(0, 0, -1), end
 }
 
-func randomCheckinCreditCap() (int64, error) {
-	value, err := rand.Int(rand.Reader, big.NewInt(6))
+func randomCheckinMultiplier() (int64, error) {
+	value, err := rand.Int(rand.Reader, big.NewInt(21))
 	if err != nil {
 		return 0, err
 	}
-	return value.Int64() + 5, nil
+	return value.Int64() + 10, nil
 }
 
 func (s *Service) handleCheckinStatus(ctx context.Context, event qq.MessageEvent, canonical string) error {

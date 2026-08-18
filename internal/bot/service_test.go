@@ -1238,7 +1238,8 @@ func TestParseInsightRange(t *testing.T) {
 }
 
 func TestCheckinIsIdempotent(t *testing.T) {
-	service, storage, api, _, _ := testService(t)
+	service, storage, api, qqAPI, _ := testService(t)
+	service.randomCheckinMultiplier = func() (int64, error) { return 10, nil }
 	now := time.Now()
 	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: now}); err != nil {
 		t.Fatal(err)
@@ -1253,6 +1254,9 @@ func TestCheckinIsIdempotent(t *testing.T) {
 	}
 	if api.lastQuotaUser != 42 || api.lastQuota != 500000 {
 		t.Fatalf("quota user=%d raw=%d", api.lastQuotaUser, api.lastQuota)
+	}
+	if reply := lastReply(t, qqAPI); reply != "昨日用量：0\n获取额度：1" {
+		t.Fatalf("unexpected checkin reply: %q", reply)
 	}
 }
 
@@ -1324,8 +1328,8 @@ func TestUsageChartBusyFailsFast(t *testing.T) {
 	}
 }
 
-func TestCommandTimeoutAllowsTwoNewAPIRequestsAndReply(t *testing.T) {
-	if got, want := commandTimeout(30*time.Second, 10*time.Second), 105*time.Second; got != want {
+func TestCommandTimeoutAllowsFourNewAPIRequestsAndReply(t *testing.T) {
+	if got, want := commandTimeout(30*time.Second, 10*time.Second), 135*time.Second; got != want {
 		t.Fatalf("commandTimeout()=%s, want %s", got, want)
 	}
 	if got, want := commandTimeout(time.Second, time.Second), 25*time.Second; got != want {
@@ -1359,14 +1363,14 @@ func TestAdminCheckinStatsUsesDynamicRule(t *testing.T) {
 	}
 
 	service.process(context.Background(), c2cEvent("admin", "/admin checkin"))
-	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "签到人数：2") || !strings.Contains(reply, "已发放额度：3") || !strings.Contains(reply, "处理中签到：1") || !strings.Contains(reply, "随机上限5~10") {
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "签到人数：2") || !strings.Contains(reply, "已发放额度：3") || !strings.Contains(reply, "处理中签到：1") || !strings.Contains(reply, "随机倍数(1.0~3.0") {
 		t.Fatalf("unexpected checkin stats: %q", reply)
 	}
 	service.process(context.Background(), c2cEvent("admin", "/admin checkin edit 2.5"))
 	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "动态规则") || !strings.Contains(reply, "不再修改") {
 		t.Fatalf("unexpected checkin edit reply: %q", reply)
 	}
-	service.randomCheckinCap = func() (int64, error) { return 8, nil }
+	service.randomCheckinMultiplier = func() (int64, error) { return 10, nil }
 	api.usageByUser = []newapi.UsageRecord{{UserID: 46, Quota: 1750000}}
 	service.process(context.Background(), c2cEvent("fresh", "/checkin"))
 	if api.lastQuota != 1750000 {
@@ -1382,7 +1386,7 @@ func TestDynamicCheckinQuotaBoundsAndYesterdayRange(t *testing.T) {
 	}
 	service.cfg.CheckinTimezone = location
 	now := time.Date(2026, 8, 16, 13, 30, 0, 0, location)
-	service.randomCheckinCap = func() (int64, error) { return 6, nil }
+	service.randomCheckinMultiplier = func() (int64, error) { return 20, nil }
 
 	tests := []struct {
 		name  string
@@ -1390,22 +1394,22 @@ func TestDynamicCheckinQuotaBoundsAndYesterdayRange(t *testing.T) {
 		want  int64
 		usage int64
 	}{
-		{name: "no usage receives minimum", want: 500000},
-		{name: "below minimum receives minimum", rows: []newapi.UsageRecord{{UserID: 42, Quota: 250000}}, want: 500000, usage: 250000},
-		{name: "usage is summed", rows: []newapi.UsageRecord{{UserID: 42, Quota: 1000000}, {UserID: 7, Quota: 9000000}, {UserID: 42, Quota: 750000}}, want: 1750000, usage: 1750000},
-		{name: "username fallback when user id is omitted", rows: []newapi.UsageRecord{{Username: "alice", Quota: 1750000}, {Username: "other", Quota: 9000000}}, want: 1750000, usage: 1750000},
-		{name: "usage is capped", rows: []newapi.UsageRecord{{UserID: 42, Quota: 9000000}}, want: 3000000, usage: 9000000},
+		{name: "no usage receives minimum times multiplier", want: 1000000},
+		{name: "below minimum uses minimum times multiplier", rows: []newapi.UsageRecord{{UserID: 42, Quota: 250000}}, want: 1000000, usage: 250000},
+		{name: "usage is summed and multiplied", rows: []newapi.UsageRecord{{UserID: 42, Quota: 1000000}, {UserID: 7, Quota: 9000000}, {UserID: 42, Quota: 750000}}, want: 3500000, usage: 1750000},
+		{name: "username fallback is multiplied", rows: []newapi.UsageRecord{{Username: "alice", Quota: 1750000}, {Username: "other", Quota: 9000000}}, want: 3500000, usage: 1750000},
+		{name: "usage is no longer capped at five to ten", rows: []newapi.UsageRecord{{UserID: 42, Quota: 9000000}}, want: 18000000, usage: 9000000},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			api.usageByUser = test.rows
 			api.usageRanges = nil
-			got, usage, capCredit, err := service.dynamicCheckinQuota(context.Background(), 42, now, 500000)
+			got, usage, multiplierTenths, err := service.dynamicCheckinQuota(context.Background(), 42, now, 500000)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != test.want || usage != test.usage || capCredit != 6 {
-				t.Fatalf("reward=%d usage=%d cap=%d, want reward=%d usage=%d cap=6", got, usage, capCredit, test.want, test.usage)
+			if got != test.want || usage != test.usage || multiplierTenths != 20 {
+				t.Fatalf("reward=%d usage=%d multiplier=%d, want reward=%d usage=%d multiplier=20", got, usage, multiplierTenths, test.want, test.usage)
 			}
 			if len(api.usageRanges) != 1 {
 				t.Fatalf("usage calls=%d", len(api.usageRanges))
@@ -1433,15 +1437,15 @@ func TestPreviousNaturalDayCrossesMonthAndYear(t *testing.T) {
 	}
 }
 
-func TestRandomCheckinCreditCapRange(t *testing.T) {
+func TestRandomCheckinMultiplierRange(t *testing.T) {
 	seen := make(map[int64]bool)
 	for i := 0; i < 256; i++ {
-		value, err := randomCheckinCreditCap()
+		value, err := randomCheckinMultiplier()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if value < 5 || value > 10 {
-			t.Fatalf("cap=%d outside [5,10]", value)
+		if value < 10 || value > 30 {
+			t.Fatalf("multiplier tenths=%d outside [10,30]", value)
 		}
 		seen[value] = true
 	}

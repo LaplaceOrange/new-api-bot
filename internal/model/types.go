@@ -27,18 +27,20 @@ type LinkChallenge struct {
 }
 
 type CheckinRecord struct {
-	CanonicalID    string    `json:"canonical_id"`
-	NewAPIID       int       `json:"newapi_id"`
-	PeriodKey      string    `json:"period_key"`
-	RedemptionName string    `json:"redemption_name"`
-	EncryptedCode  string    `json:"encrypted_code"`
-	RawQuota       int64     `json:"raw_quota"`
-	DisplayCredit  string    `json:"display_credit"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	Status         string    `json:"status"`
-	LastError      string    `json:"last_error,omitempty"`
+	CanonicalID           string    `json:"canonical_id"`
+	NewAPIID              int       `json:"newapi_id"`
+	PeriodKey             string    `json:"period_key"`
+	RedemptionName        string    `json:"redemption_name"`
+	EncryptedCode         string    `json:"encrypted_code"`
+	RawQuota              int64     `json:"raw_quota"`
+	DisplayCredit         string    `json:"display_credit"`
+	YesterdayUsage        int64     `json:"yesterday_usage"`
+	YesterdayUsageDisplay string    `json:"yesterday_usage_display,omitempty"`
+	ExpiresAt             time.Time `json:"expires_at"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	Status                string    `json:"status"`
+	LastError             string    `json:"last_error,omitempty"`
 }
 
 type UpgradeNotification struct {

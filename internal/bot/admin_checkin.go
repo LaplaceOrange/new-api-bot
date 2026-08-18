@@ -15,7 +15,7 @@ func (s *Service) handleAdminCheckin(ctx context.Context, event qq.MessageEvent,
 		return s.showAdminCheckin(ctx, event)
 	}
 	if len(fields) == 4 && strings.EqualFold(fields[2], "edit") {
-		return s.reply(ctx, event, "签到额度已采用动态规则，/admin checkin edit 不再修改发放值：奖励=min(max(昨日消耗额度, 1), 随机上限5~10)。")
+		return s.reply(ctx, event, "签到额度已采用动态规则，/admin checkin edit 不再修改发放值：奖励=max(昨日消耗额度, 1)×随机倍数(1.0~3.0，步进0.1)。")
 	}
 	return s.reply(ctx, event, "用法：/admin checkin")
 }
@@ -46,7 +46,7 @@ func (s *Service) showAdminCheckin(ctx context.Context, event qq.MessageEvent) e
 		"今日签到统计（" + start.Format("2006-01-02 MST") + "）：",
 		fmt.Sprintf("签到人数：%d", completed),
 		"已发放额度：" + newapi.QuotaToDisplay(issuedQuota, status.QuotaPerUnit),
-		"发放规则：min(max(昨日消耗额度, 1), 随机上限5~10)",
+		"发放规则：max(昨日消耗额度, 1)×随机倍数(1.0~3.0，步进0.1)",
 	}
 	if pending > 0 {
 		lines = append(lines, fmt.Sprintf("处理中签到：%d", pending))
