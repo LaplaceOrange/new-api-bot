@@ -692,11 +692,12 @@ func (s *Service) settleResetActivity(ctx context.Context, activity model.ResetA
 			s.logger.Warn("计算重置活动补偿额度失败", "activity_id", activity.ID, "error", publicError(err))
 			return
 		}
-		activity, _, err = s.store.BeginResetSettlement(activity.ID, awards, time.Now())
-		if err != nil {
-			s.logger.Error("保存重置活动抽奖结果失败", "activity_id", activity.ID, "error", err)
+		settled, _, settleErr := s.store.BeginResetSettlement(activity.ID, awards, time.Now())
+		if settleErr != nil {
+			s.logger.Error("保存重置活动抽奖结果失败", "activity_id", activity.ID, "error", settleErr)
 			return
 		}
+		activity = settled
 	}
 
 	for _, award := range activity.Awards {
@@ -882,11 +883,14 @@ func (s *Service) processResetNotificationAt(ctx context.Context, notification m
 			return
 		}
 		chunks := splitMessage(message, 1700)
-		notification, err = s.store.PrepareResetNotification(notification.ID, chunks, now)
-		if err != nil {
-			s.retryResetNotification(notification, now, "保存通知内容失败", err)
+		// 失败时 PrepareResetNotification 会返回零值，不能直接覆盖 notification：
+		// 否则 retryResetNotification 会拿着空 ID 和 Attempts=0 去标记失败。
+		prepared, prepareErr := s.store.PrepareResetNotification(notification.ID, chunks, now)
+		if prepareErr != nil {
+			s.retryResetNotification(notification, now, "保存通知内容失败", prepareErr)
 			return
 		}
+		notification = prepared
 	}
 	if notification.Status != model.ResetNotificationPending {
 		return
