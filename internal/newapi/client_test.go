@@ -212,8 +212,12 @@ func TestInsightsEndpointsAndUserFallback(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"success":true,"message":"","data":[{"username":"admin","created_at":1700000000,"token_used":12,"count":2,"quota":500000}]}`))
 		case "/api/data":
-			if r.URL.Query().Get("username") != "admin" {
-				t.Errorf("username=%q", r.URL.Query().Get("username"))
+			query := r.URL.Query()
+			if query.Get("start_timestamp") == "" || query.Get("end_timestamp") == "" {
+				t.Error("missing filtered usage timestamps")
+			}
+			if query.Get("username") != "admin" {
+				t.Errorf("username=%q", query.Get("username"))
 			}
 			_, _ = w.Write([]byte(`{"success":true,"message":"","data":[{"username":"admin","model_name":"gpt-test","count":2,"quota":500000}]}`))
 		case "/api/log/":
@@ -243,6 +247,10 @@ func TestInsightsEndpointsAndUserFallback(t *testing.T) {
 	modelsUsage, err := client.ListUsageByModel(context.Background(), start, end, "admin")
 	if err != nil || len(modelsUsage) != 1 || modelsUsage[0].ModelName != "gpt-test" {
 		t.Fatalf("model usage=%#v err=%v", modelsUsage, err)
+	}
+	usernameUsage, err := client.ListUsageByUsername(context.Background(), start, end, "admin")
+	if err != nil || len(usernameUsage) != 1 || usernameUsage[0].Username != "admin" {
+		t.Fatalf("username usage=%#v err=%v", usernameUsage, err)
 	}
 	logs, err := client.ListLogs(context.Background(), start, end, "admin", 1, 10)
 	if err != nil || len(logs.Items) != 1 || logs.Items[0].CompletionTokens != 5 {

@@ -92,6 +92,16 @@ func (c *Client) ListUsageByUser(ctx context.Context, start, end time.Time) ([]U
 	return c.listUsage(ctx, "/api/data/users", start, end, "")
 }
 
+// ListUsageByUsername queries the model-level usage endpoint for one concrete
+// user. Unlike /api/data/users, the filtered endpoint returns user_id and is
+// therefore safe to use when calculating a user's check-in reward.
+func (c *Client) ListUsageByUsername(ctx context.Context, start, end time.Time, username string) ([]UsageRecord, error) {
+	if strings.TrimSpace(username) == "" {
+		return nil, errors.New("用量查询用户名不能为空")
+	}
+	return c.listUsage(ctx, "/api/data", start, end, username)
+}
+
 func (c *Client) ListUsageByModel(ctx context.Context, start, end time.Time, username string) ([]UsageRecord, error) {
 	return c.listUsage(ctx, "/api/data", start, end, username)
 }

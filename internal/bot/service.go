@@ -49,6 +49,14 @@ type NewAPI interface {
 	ManageUserStatus(context.Context, int, string) error
 }
 
+// usageByUsernameLister is implemented by New API clients that can query the
+// model-level usage endpoint for one concrete username. It is deliberately
+// kept optional so existing NewAPI test doubles and integrations remain
+// source-compatible.
+type usageByUsernameLister interface {
+	ListUsageByUsername(context.Context, time.Time, time.Time, string) ([]newapi.UsageRecord, error)
+}
+
 type QQAPI interface {
 	ReplyC2C(context.Context, string, string, string) error
 	ReplyGroup(context.Context, string, string, string) error
@@ -522,9 +530,9 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	}
 }
 
-// commandTimeout leaves room for the four sequential New API requests used by
-// /checkin (status, yesterday usage, username fallback, quota update) and the
-// QQ reply.
+// commandTimeout leaves room for up to five sequential New API requests used
+// by /checkin (status, user lookup, precise usage, compatibility usage, quota
+// update) and the QQ reply.
 func commandTimeout(newAPITimeout, qqAPITimeout time.Duration) time.Duration {
 	const minimum = 25 * time.Second
 	const replyReserve = 5 * time.Second
@@ -534,7 +542,7 @@ func commandTimeout(newAPITimeout, qqAPITimeout time.Duration) time.Duration {
 	if qqAPITimeout <= 0 {
 		qqAPITimeout = 10 * time.Second
 	}
-	timeout := newAPITimeout*4 + qqAPITimeout + replyReserve
+	timeout := newAPITimeout*5 + qqAPITimeout + replyReserve
 	if timeout < minimum {
 		return minimum
 	}
@@ -868,40 +876,9 @@ func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.
 		return 0, 0, 0, errors.New("quota_per_unit 必须大于 0")
 	}
 	start, end := previousNaturalDay(now, s.cfg.CheckinTimezone)
-	rows, err := s.newAPI.ListUsageByUser(ctx, start, end)
+	yesterdayUsage, err = s.checkinYesterdayUsage(ctx, start, end, userID)
 	if err != nil {
 		return 0, 0, 0, err
-	}
-	// New API deployments may omit user_id from the aggregated user-usage
-	// response. Resolve the bound user's username only when a username fallback
-	// is needed, while retaining the direct ID path for richer responses.
-	usageUsername := ""
-	needsUsernameFallback := false
-	for _, row := range rows {
-		if row.UserID == 0 && strings.TrimSpace(row.Username) != "" {
-			needsUsernameFallback = true
-			break
-		}
-	}
-	if needsUsernameFallback {
-		user, userErr := s.newAPI.GetUser(ctx, userID)
-		if userErr != nil {
-			return 0, 0, 0, fmt.Errorf("解析昨日用量所属用户失败: %w", userErr)
-		}
-		usageUsername = strings.TrimSpace(user.Username)
-	}
-	for _, row := range rows {
-		matched := row.UserID == userID
-		if !matched && row.UserID == 0 && usageUsername != "" {
-			matched = strings.EqualFold(strings.TrimSpace(row.Username), usageUsername)
-		}
-		if !matched || row.Quota <= 0 {
-			continue
-		}
-		if row.Quota > math.MaxInt64-yesterdayUsage {
-			return 0, 0, 0, errors.New("昨日用量额度超出支持范围")
-		}
-		yesterdayUsage += row.Quota
 	}
 	multiplierTenths, err = s.randomCheckinMultiplier()
 	if err != nil {
@@ -940,6 +917,135 @@ func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.
 	}
 	reward = rewardBig.Int64()
 	return reward, yesterdayUsage, multiplierTenths, nil
+}
+
+// checkinYesterdayUsage prefers the username-filtered data endpoint when the
+// client exposes it. The /api/data/users aggregation omits user_id on New API
+// deployments, so matching those rows by the bound account's username is only
+// a compatibility fallback.
+func (s *Service) checkinYesterdayUsage(ctx context.Context, start, end time.Time, userID int) (int64, error) {
+	username := ""
+	userResolved := false
+	var userErr error
+	_, hasPreciseEndpoint := s.newAPI.(usageByUsernameLister)
+	if hasPreciseEndpoint {
+		user, resolveErr := s.newAPI.GetUser(ctx, userID)
+		userResolved = true
+		userErr = resolveErr
+		if resolveErr == nil {
+			username = strings.TrimSpace(user.Username)
+			if username != "" {
+				rows, queryErr := s.listCheckinUsageByUsername(ctx, start, end, username)
+				if queryErr == nil {
+					total, matched, sumErr := sumCheckinUsage(rows, userID, username)
+					if sumErr != nil {
+						return 0, sumErr
+					}
+					if matched {
+						return total, nil
+					}
+				}
+			}
+		}
+	}
+
+	rows, err := s.newAPI.ListUsageByUser(ctx, start, end)
+	if err != nil {
+		return 0, err
+	}
+	total, matched, err := sumCheckinUsage(rows, userID, "")
+	if err != nil {
+		return 0, err
+	}
+	if matched {
+		return total, nil
+	}
+
+	if !userResolved {
+		user, resolveErr := s.newAPI.GetUser(ctx, userID)
+		userResolved = true
+		userErr = resolveErr
+		if resolveErr == nil {
+			username = strings.TrimSpace(user.Username)
+		}
+	}
+	if username != "" {
+		total, matched, err = sumCheckinUsage(rows, userID, username)
+		if err != nil {
+			return 0, err
+		}
+		if matched {
+			return total, nil
+		}
+		// Older NewAPI implementations may not expose the optional method,
+		// but they still support the existing model-level endpoint.
+		if !hasPreciseEndpoint {
+			modelRows, modelErr := s.newAPI.ListUsageByModel(ctx, start, end, username)
+			if modelErr == nil {
+				total, matched, err = sumCheckinUsage(modelRows, userID, username)
+				if err != nil {
+					return 0, err
+				}
+				if matched || len(modelRows) == 0 {
+					return total, nil
+				}
+			}
+		}
+	} else if len(rows) > 0 && userErr != nil {
+		return 0, fmt.Errorf("解析昨日用量所属用户失败: %w", userErr)
+	}
+	return 0, nil
+}
+
+func (s *Service) listCheckinUsageByUsername(ctx context.Context, start, end time.Time, username string) ([]newapi.UsageRecord, error) {
+	if lister, ok := s.newAPI.(usageByUsernameLister); ok {
+		return lister.ListUsageByUsername(ctx, start, end, username)
+	}
+	return s.newAPI.ListUsageByModel(ctx, start, end, username)
+}
+
+func sumCheckinUsage(rows []newapi.UsageRecord, userID int, username string) (total int64, matched bool, err error) {
+	// Prefer exact IDs whenever the response contains them. This avoids double
+	// counting a richer row together with a username-only compatibility row.
+	if userID > 0 {
+		hasExactID := false
+		for _, row := range rows {
+			if row.UserID != userID {
+				continue
+			}
+			hasExactID = true
+			matched = true
+			if row.Quota <= 0 {
+				continue
+			}
+			if row.Quota > math.MaxInt64-total {
+				return 0, false, errors.New("昨日用量额度超出支持范围")
+			}
+			total += row.Quota
+		}
+		if hasExactID {
+			return total, matched, nil
+		}
+	}
+
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return 0, false, nil
+	}
+	for _, row := range rows {
+		if !strings.EqualFold(strings.TrimSpace(row.Username), username) {
+			continue
+		}
+		matched = true
+		if row.Quota <= 0 {
+			continue
+		}
+		if row.Quota > math.MaxInt64-total {
+			return 0, false, errors.New("昨日用量额度超出支持范围")
+		}
+		total += row.Quota
+	}
+	return total, matched, nil
 }
 
 func previousNaturalDay(now time.Time, location *time.Location) (time.Time, time.Time) {

@@ -54,6 +54,13 @@ type fakeNewAPI struct {
 	logSplitAfter  time.Duration
 }
 
+type usernameUsageFake struct {
+	*fakeNewAPI
+	usageByUsername    []newapi.UsageRecord
+	usageUsernameErr   error
+	usageUsernameCalls int
+}
+
 type quotaAddCall struct {
 	UserID int
 	Quota  int64
@@ -127,6 +134,14 @@ func (f *fakeNewAPI) ListUsageByModel(_ context.Context, _ time.Time, _ time.Tim
 		}
 	}
 	return result, nil
+}
+
+func (f *usernameUsageFake) ListUsageByUsername(_ context.Context, _ time.Time, _ time.Time, _ string) ([]newapi.UsageRecord, error) {
+	f.usageUsernameCalls++
+	if f.usageUsernameErr != nil {
+		return nil, f.usageUsernameErr
+	}
+	return append([]newapi.UsageRecord(nil), f.usageByUsername...), nil
 }
 func (f *fakeNewAPI) ListLogs(_ context.Context, _ time.Time, _ time.Time, username string, _, pageSize int) (newapi.LogPage, error) {
 	items := make([]newapi.LogRecord, 0, pageSize)
@@ -1331,8 +1346,8 @@ func TestUsageChartBusyFailsFast(t *testing.T) {
 	}
 }
 
-func TestCommandTimeoutAllowsFourNewAPIRequestsAndReply(t *testing.T) {
-	if got, want := commandTimeout(30*time.Second, 10*time.Second), 135*time.Second; got != want {
+func TestCommandTimeoutAllowsFiveNewAPIRequestsAndReply(t *testing.T) {
+	if got, want := commandTimeout(30*time.Second, 10*time.Second), 165*time.Second; got != want {
 		t.Fatalf("commandTimeout()=%s, want %s", got, want)
 	}
 	if got, want := commandTimeout(time.Second, time.Second), 25*time.Second; got != want {
@@ -1426,6 +1441,33 @@ func TestDynamicCheckinQuotaBoundsAndYesterdayRange(t *testing.T) {
 				t.Fatalf("usage range=[%s,%s), want [%s,%s)", api.usageRanges[0].Start, api.usageRanges[0].End, wantStart, wantEnd)
 			}
 		})
+	}
+}
+
+func TestDynamicCheckinQuotaUsesUsernameFilteredUsageWhenAggregateCannotIdentifyUser(t *testing.T) {
+	service, _, api, _, _ := testService(t)
+	service.cfg.CheckinTimezone = time.UTC
+	service.randomCheckinMultiplier = func() (int64, error) { return 20, nil }
+	service.randomCheckinMaxCredit = func() (int64, error) { return 5, nil }
+	api.usageByUser = []newapi.UsageRecord{{Username: "", Quota: 9000000}}
+	precise := &usernameUsageFake{
+		fakeNewAPI:      api,
+		usageByUsername: []newapi.UsageRecord{{UserID: 42, Username: "alice", Quota: 1750000}},
+	}
+	service.newAPI = precise
+
+	reward, usage, _, err := service.dynamicCheckinQuota(context.Background(), 42, time.Date(2026, 8, 16, 13, 30, 0, 0, time.UTC), 500000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reward != 2500000 || usage != 1750000 {
+		t.Fatalf("reward=%d usage=%d, want reward=2500000 usage=1750000", reward, usage)
+	}
+	if precise.usageUsernameCalls != 1 {
+		t.Fatalf("username usage calls=%d, want 1", precise.usageUsernameCalls)
+	}
+	if api.usageUserCalls != 0 {
+		t.Fatalf("aggregate usage calls=%d, want 0", api.usageUserCalls)
 	}
 }
 
