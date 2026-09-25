@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,56 @@ func TestPublicErrorMapsExistingAdministratorPermissionFailure(t *testing.T) {
 	err := errors.New("New API 请求失败（HTTP 200）：No permission to update users of same or higher permission level")
 	if got := publicError(err); got != "该用户已经是管理员。" {
 		t.Fatalf("publicError() = %q", got)
+	}
+}
+
+func TestReadOnlyAdminCommandFilter(t *testing.T) {
+	cases := []struct {
+		command string
+		fields  []string
+		deny    bool
+	}{
+		{command: "/admin", fields: []string{"/admin", "bindings"}, deny: false},
+		{command: "/admin", fields: []string{"/admin", "report"}, deny: false},
+		{command: "/admin", fields: []string{"/admin", "user", "status", "42"}, deny: false},
+		{command: "/admin", fields: []string{"/admin", "unbind", "42"}, deny: true},
+		{command: "/admin", fields: []string{"/admin", "user", "disable", "42"}, deny: true},
+		{command: "/credit", fields: []string{"/credit", "show", "42"}, deny: false},
+		{command: "/credit", fields: []string{"/credit", "add", "42", "1"}, deny: true},
+		{command: "/plan", fields: []string{"/plan", "view"}, deny: false},
+		{command: "/plan", fields: []string{"/plan", "sub", "1", "42"}, deny: true},
+		{command: "/join", fields: []string{"/join", "status"}, deny: false},
+		{command: "/join", fields: []string{"/join", "on"}, deny: true},
+		{command: "/mute", fields: []string{"/mute", "status"}, deny: false},
+		{command: "/mute", fields: []string{"/mute", "user", "10m"}, deny: true},
+		{command: "/reset", fields: []string{"/reset", "check"}, deny: false},
+		{command: "/reset", fields: []string{"/reset", "join"}, deny: true},
+		{command: "/enable", fields: []string{"/enable", "list"}, deny: false},
+		{command: "/disable", fields: []string{"/disable", "usage"}, deny: true},
+	}
+	for _, tc := range cases {
+		if got := readOnlyAdminWriteCommand(tc.command, tc.fields); got != tc.deny {
+			t.Fatalf("readOnlyAdminWriteCommand(%q, %q) = %v, want %v", tc.command, tc.fields, got, tc.deny)
+		}
+	}
+}
+
+func TestReadOnlyAdminIdentityDoesNotOverrideFullAdmin(t *testing.T) {
+	service, _, _, _, _ := testService(t)
+	identity := model.QQIdentity{UserOpenID: "readonly"}
+	service.cfg.QQReadOnlyAdminOpenIDs = map[string]struct{}{"user:readonly": {}}
+	if !service.isAdmin(identity) || !service.isReadOnlyAdmin(identity) {
+		t.Fatal("expected read-only identity to be an administrator with read-only scope")
+	}
+	service.cfg.QQAdminOpenIDs["user:readonly"] = struct{}{}
+	if !service.isAdmin(identity) || service.isReadOnlyAdmin(identity) {
+		t.Fatal("full administrator entry should take precedence over read-only scope")
+	}
+	mixed := model.QQIdentity{UnionOpenID: "readonly", UserOpenID: "full"}
+	service.cfg.QQReadOnlyAdminOpenIDs = map[string]struct{}{"union:readonly": {}}
+	service.cfg.QQAdminOpenIDs["user:full"] = struct{}{}
+	if service.isReadOnlyAdmin(mixed) {
+		t.Fatal("a full administrator candidate must override a read-only candidate")
 	}
 }
 
@@ -256,6 +307,33 @@ type fakeQQ struct {
 	muteExpiresAt   time.Time
 }
 
+// recallQQ is a fakeQQ variant that also implements the official group send
+// and recall endpoints so auto-recall scheduling can be tested.
+type recallQQ struct {
+	*fakeQQ
+	sendGroupErr error
+	sent         []qq.SentMessage
+	recalled     []string
+}
+
+func (f *recallQQ) SendGroupText(_ context.Context, _, _ string, content string) (qq.SentMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sendGroupErr != nil {
+		return qq.SentMessage{}, f.sendGroupErr
+	}
+	sent := qq.SentMessage{ID: "sent-" + strconv.Itoa(len(f.sent)+1)}
+	f.sent = append(f.sent, sent)
+	f.messages = append(f.messages, content)
+	return sent, nil
+}
+
+func (f *recallQQ) RecallGroupMessage(_ context.Context, _, messageID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recalled = append(f.recalled, messageID)
+	return nil
+}
 func (f *fakeQQ) ReplyC2C(_ context.Context, _, _, content string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1275,6 +1353,109 @@ func TestCheckinIsIdempotent(t *testing.T) {
 	}
 	if reply := lastReply(t, qqAPI); reply != "🎉 今日已签到。今日获取额度：1" {
 		t.Fatalf("unexpected checkin reply: %q", reply)
+	}
+}
+
+func TestCheckinGroupReplyIsAutoRecalled(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	recaller := &recallQQ{fakeQQ: qqAPI}
+	service.qq = recaller
+	service.cfg.CheckinAutoRecallAfter = 30 * time.Millisecond
+	service.randomCheckinMultiplier = func() (int64, error) { return 10, nil }
+	service.randomCheckinMaxCredit = func() (int64, error) { return 10, nil }
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	event := qq.MessageEvent{
+		EventType: "GROUP_MESSAGE_CREATE",
+		Message: qq.Message{
+			ID:          "m-checkin",
+			Content:     "/checkin",
+			GroupOpenID: "g1",
+			Author:      qq.MessageAuthor{UserOpenID: "u1", MemberOpenID: "u1"},
+		},
+	}
+	service.process(context.Background(), event)
+
+	recaller.mu.Lock()
+	if len(recaller.sent) != 1 {
+		sent := len(recaller.sent)
+		recaller.mu.Unlock()
+		t.Fatalf("sent messages=%d, want 1", sent)
+	}
+	messageID := recaller.sent[0].ID
+	recaller.mu.Unlock()
+	if messageID == "" {
+		t.Fatal("expected a non-empty sent message id")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		recaller.mu.Lock()
+		recalled := len(recaller.recalled)
+		recaller.mu.Unlock()
+		if recalled == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("message %q was not auto-recalled within timeout", messageID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	recaller.mu.Lock()
+	defer recaller.mu.Unlock()
+	if len(recaller.recalled) != 1 || recaller.recalled[0] != messageID {
+		t.Fatalf("recalled=%v, want single %q", recaller.recalled, messageID)
+	}
+}
+
+func TestCheckinC2CReplyIsNotAutoRecalled(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	recaller := &recallQQ{fakeQQ: qqAPI}
+	service.qq = recaller
+	service.cfg.CheckinAutoRecallAfter = 30 * time.Millisecond
+	service.randomCheckinMultiplier = func() (int64, error) { return 10, nil }
+	service.randomCheckinMaxCredit = func() (int64, error) { return 10, nil }
+	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	service.process(context.Background(), c2cEvent("u1", "/checkin"))
+	time.Sleep(80 * time.Millisecond)
+	recaller.mu.Lock()
+	defer recaller.mu.Unlock()
+	if len(recaller.recalled) != 0 {
+		t.Fatalf("C2C checkin reply should not be recalled, got %v", recaller.recalled)
+	}
+}
+
+func TestAdminCheckinResetClearsCurrentPeriodForAllUsers(t *testing.T) {
+	service, storage, _, qqAPI, _ := testService(t)
+	now := service.now()
+	period, _ := periodKey(now, service.cfg.CheckinPeriod, service.cfg.CheckinTimezone)
+	for i, canonical := range []string{"user:u1", "user:u2"} {
+		if err := storage.CreateBinding(model.Binding{CanonicalID: canonical, NewAPIID: 100 + i, CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		if _, created, err := storage.ReserveCheckin(model.CheckinRecord{CanonicalID: canonical, NewAPIID: 100 + i, PeriodKey: period, Status: "completed", CreatedAt: now}); err != nil || !created {
+			t.Fatalf("reserve checkin created=%v err=%v", created, err)
+		}
+	}
+	service.process(context.Background(), c2cEvent("admin", "/checkin reset"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "共清除 2 位用户") {
+		t.Fatalf("unexpected reset reply: %q", reply)
+	}
+	for _, canonical := range []string{"user:u1", "user:u2"} {
+		if _, err := storage.GetCheckin(canonical, period); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("checkin %s still exists: %v", canonical, err)
+		}
+	}
+}
+
+func TestCheckinResetRequiresAdmin(t *testing.T) {
+	service, _, _, qqAPI, _ := testService(t)
+	service.process(context.Background(), c2cEvent("ordinary", "/checkin reset"))
+	if reply := lastReply(t, qqAPI); !strings.Contains(reply, "没有执行管理员指令的权限") {
+		t.Fatalf("unexpected unauthorized reset reply: %q", reply)
 	}
 }
 

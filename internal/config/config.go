@@ -21,6 +21,7 @@ type Config struct {
 	NewAPIAdminToken           string
 	NewAPIAdminUserID          int
 	QQAdminOpenIDs             map[string]struct{}
+	QQReadOnlyAdminOpenIDs     map[string]struct{}
 	BotDataKey                 []byte
 	SMTPHost                   string
 	SMTPPort                   int
@@ -34,6 +35,7 @@ type Config struct {
 	CheckinTimezone            *time.Location
 	CheckinTimezoneName        string
 	CheckinCodeTTL             time.Duration
+	CheckinAutoRecallAfter     time.Duration
 	BindCodeTTL                time.Duration
 	BindCodeMaxAttempts        int
 	BindEmailLimit             int
@@ -149,7 +151,14 @@ func Load() (Config, error) {
 		}
 		return v
 	}
-
+	parseOptionalDuration := func(name string, def time.Duration) time.Duration {
+		v, err := time.ParseDuration(envString(name, def.String()))
+		if err != nil || v < 0 {
+			errs = append(errs, fmt.Errorf("%s 必须是 Go duration 或 0s（禁用），例如 30s 或 1m", name))
+			return def
+		}
+		return v
+	}
 	c.NewAPIAdminUserID = parseInt("NEWAPI_ADMIN_USER_ID", 0, 1)
 	c.SMTPPort = parseInt("SMTP_PORT", 587, 1)
 	c.BindCodeMaxAttempts = parseInt("BIND_CODE_MAX_ATTEMPTS", 5, 1)
@@ -174,6 +183,7 @@ func Load() (Config, error) {
 	c.ResetDefaultWinners = parseInt("RESET_DEFAULT_WINNERS", 5, 1)
 	c.ResetDefaultLookback = parseDuration("RESET_DEFAULT_LOOKBACK", 24*time.Hour)
 	c.CheckinCodeTTL = parseDuration("CHECKIN_CODE_TTL", 24*time.Hour)
+	c.CheckinAutoRecallAfter = parseOptionalDuration("CHECKIN_AUTO_RECALL_AFTER", 30*time.Second)
 	c.BindCodeTTL = parseDuration("BIND_CODE_TTL", 10*time.Minute)
 	c.BindEmailWindow = parseDuration("BIND_EMAIL_WINDOW", time.Hour)
 	c.LinkCodeTTL = parseDuration("LINK_CODE_TTL", 10*time.Minute)
@@ -247,6 +257,13 @@ func Load() (Config, error) {
 	}
 	if len(c.QQAdminOpenIDs) == 0 {
 		errs = append(errs, errors.New("QQ_ADMIN_OPENIDS 至少需要配置一个 OpenID 标识"))
+	}
+	c.QQReadOnlyAdminOpenIDs = make(map[string]struct{})
+	for _, item := range strings.Split(os.Getenv("QQ_READONLY_ADMIN_OPENIDS"), ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			c.QQReadOnlyAdminOpenIDs[item] = struct{}{}
+		}
 	}
 
 	if err := validatePositiveDecimal("CHECKIN_CREDIT", c.CheckinCredit); err != nil {

@@ -32,6 +32,7 @@
 | `/unbind` | 群聊 | 解除当前 QQ 身份的 New API 绑定 |
 | `/checkin` | 群聊 | 签到并直接增加绑定账户额度 |
 | `/checkin status` | 群聊 | 查看当前周期签到状态 |
+| `/checkin reset` | 管理员 | 重置当前周期所有用户的签到状态，使其可以再次签到 |
 | `/me` | 群聊 | 查看绑定账户及额度 |
 | `/usage [today\|7d\|month]` | 已绑定用户 | 查看自己的请求数、成功/失败数、Token、消耗额度、余额及常用模型，默认今天 |
 | `/usage <用户ID或@用户> <时间长度>` | 管理员 | 查看指定用户用量 |
@@ -112,6 +113,8 @@
 
 ```dotenv
 QQ_ADMIN_OPENIDS=union:ABCDEF,user:123456,member:GROUP_OPENID:MEMBER_OPENID
+# 只读管理员（可选）：只能执行查询/报表类管理员命令，不能修改机器人、QQ 或 New API 状态。
+QQ_READONLY_ADMIN_OPENIDS=member:GROUP_OPENID:READ_ONLY_MEMBER_OPENID
 ```
 
 优先使用 `union:` 标识。纯群聊事件没有 union_openid 时，使用 `member:<group_openid>:<member_openid>`。
@@ -324,6 +327,7 @@ go build -trimpath -ldflags="-s -w" -o bin/new-api-bot.exe ./cmd/bot
 - 已完成签到时重复执行只返回本周期已签到，不会再次增加额度。
 - 明确的 New API 请求失败会撤销本地待处理记录，用户可稍后重试。
 - 请求在等待响应头时超时，机器人会将签到标记为“待确认”并禁止本周期重试，避免 New API 已完成加额而响应丢失时重复发放。管理员核对到账情况后再处理。
+- 群聊中的签到回复会在 `CHECKIN_AUTO_RECALL_AFTER`（默认 `30s`）后自动撤回；设为 `0s` 可禁用。QQ 官方 API 仅支持撤回群消息且限发送后 2 分钟内，因此私聊签到回复不受影响。
 
 ## 健康检查
 

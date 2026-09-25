@@ -416,6 +416,12 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	command := strings.ToLower(fields[0])
 	s.logger.Debug("开始处理 QQ 命令", "event", event.EventType, "command", command)
 	identity := identityFromEvent(event)
+	if s.isReadOnlyAdmin(identity) && readOnlyAdminWriteCommand(command, fields) {
+		if err := s.reply(ctx, event, "只读管理员仅可执行查询类指令。"); err != nil {
+			s.logger.Error("回复只读管理员权限拒绝失败", "command", command, "error", err)
+		}
+		return
+	}
 	if command == "/enable" || command == "/disable" {
 		if err := s.handleCommandRule(ctx, event, identity, command, content); err != nil {
 			s.logger.Error("处理命令关键词状态失败", "command", command, "error", err)
@@ -466,6 +472,12 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		}
 		err = s.handleReset(ctx, event, canonical, identity, fields)
 	default:
+		// /checkin reset is an administrator-only operation and does not require
+		// the issuer to have a personal binding.
+		if command == "/checkin" && len(fields) >= 2 && strings.EqualFold(fields[1], "reset") {
+			err = s.handleCheckinReset(ctx, event, identity, fields)
+			break
+		}
 		if resolveErr != nil || canonical == "" {
 			err = s.reply(ctx, event, "你尚未绑定 New API 账户，请在当前群内使用 /bind <邮箱或用户ID> 完成绑定。")
 			break
@@ -796,14 +808,14 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 		return s.handleCheckinStatus(ctx, event, canonical)
 	}
 	if len(fields) != 1 {
-		return s.reply(ctx, event, "用法：/checkin 或 /checkin status")
+		return s.replyWithAutoRecall(ctx, event, "用法：/checkin 或 /checkin status")
 	}
 	if !s.cfg.CheckinEnabled {
-		return s.reply(ctx, event, "签到功能当前未启用。")
+		return s.replyWithAutoRecall(ctx, event, "签到功能当前未启用。")
 	}
 	binding, err := s.store.GetBinding(canonical)
 	if err != nil {
-		return s.reply(ctx, event, "未找到绑定信息。")
+		return s.replyWithAutoRecall(ctx, event, "未找到绑定信息。")
 	}
 	now := s.now()
 	period, next := periodKey(now, s.cfg.CheckinPeriod, s.cfg.CheckinTimezone)
@@ -813,16 +825,16 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 	if existing, existingErr := s.store.GetCheckin(canonical, period); existingErr == nil {
 		return s.replyExistingCheckin(ctx, event, existing, next)
 	} else if !errors.Is(existingErr, store.ErrNotFound) {
-		return s.reply(ctx, event, "读取签到状态失败，请稍后重试。")
+		return s.replyWithAutoRecall(ctx, event, "读取签到状态失败，请稍后重试。")
 	}
 
 	status, err := s.newAPI.GetStatus(ctx, false)
 	if err != nil {
-		return s.reply(ctx, event, publicError(err))
+		return s.replyWithAutoRecall(ctx, event, publicError(err))
 	}
 	rawQuota, usageQuota, multiplierTenths, err := s.dynamicCheckinQuota(ctx, binding.NewAPIID, now, status.QuotaPerUnit)
 	if err != nil {
-		return s.reply(ctx, event, "计算签到额度失败："+publicError(err))
+		return s.replyWithAutoRecall(ctx, event, "计算签到额度失败："+publicError(err))
 	}
 	credit := newapi.QuotaToDisplay(rawQuota, status.QuotaPerUnit)
 	record := model.CheckinRecord{
@@ -831,7 +843,7 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 	}
 	record, created, err := s.store.ReserveCheckin(record)
 	if err != nil {
-		return s.reply(ctx, event, "保存签到状态失败，请稍后重试。")
+		return s.replyWithAutoRecall(ctx, event, "保存签到状态失败，请稍后重试。")
 	}
 	if !created {
 		return s.replyExistingCheckin(ctx, event, record, next)
@@ -845,30 +857,47 @@ func (s *Service) handleCheckin(ctx context.Context, event qq.MessageEvent, cano
 				s.logger.Error("签到结果待确认状态保存失败", "canonical", canonical, "newapi_user_id", binding.NewAPIID, "error", saveErr)
 			}
 			_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: "额度写入结果待确认：" + publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota, "yesterday_usage_quota": usageQuota, "random_multiplier_tenths": multiplierTenths}})
-			return s.reply(ctx, event, "签到额度请求超时，发放结果待确认。请勿重复签到；如长时间未到账请联系管理员核查。")
+			return s.replyWithAutoRecall(ctx, event, "签到额度请求超时，发放结果待确认。请勿重复签到；如长时间未到账请联系管理员核查。")
 		}
 		_ = s.store.DeletePendingCheckin(record)
 		_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: false, Description: publicError(err), Metadata: map[string]any{"period": period, "quota": rawQuota, "yesterday_usage_quota": usageQuota, "random_multiplier_tenths": multiplierTenths}})
-		return s.reply(ctx, event, publicError(err))
+		return s.replyWithAutoRecall(ctx, event, publicError(err))
 	}
 	record.Status = "completed"
 	record.UpdatedAt = time.Now()
 	if err := s.store.FinalizeCheckin(record); err != nil {
 		s.logger.Error("签到额度已发放但保存完成状态失败", "canonical", canonical, "newapi_user_id", binding.NewAPIID, "error", err)
-		return s.reply(ctx, event, "额度已经发放，但本地签到状态保存失败，请联系管理员核查，勿重复签到。")
+		return s.replyWithAutoRecall(ctx, event, "额度已经发放，但本地签到状态保存失败，请联系管理员核查，勿重复签到。")
 	}
 	_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: canonical, Action: "checkin.quota", Target: strconv.Itoa(binding.NewAPIID), Success: true, Metadata: map[string]any{"period": period, "quota": rawQuota, "display_credit": credit, "yesterday_usage_quota": usageQuota, "random_multiplier_tenths": multiplierTenths}})
-	return s.reply(ctx, event, fmt.Sprintf("🎉 签到成功！昨日用量：%s，获取额度：%s", newapi.QuotaToDisplay(usageQuota, status.QuotaPerUnit), credit))
+	return s.replyWithAutoRecall(ctx, event, fmt.Sprintf("🎉 签到成功！昨日用量：%s，获取额度：%s", newapi.QuotaToDisplay(usageQuota, status.QuotaPerUnit), credit))
+}
+
+func (s *Service) handleCheckinReset(ctx context.Context, event qq.MessageEvent, identity model.QQIdentity, fields []string) error {
+	if !s.isAdmin(identity) {
+		return s.reply(ctx, event, "你没有执行管理员指令的权限。")
+	}
+	if len(fields) != 2 {
+		return s.reply(ctx, event, "用法：/checkin reset")
+	}
+	period, _ := periodKey(s.now(), s.cfg.CheckinPeriod, s.cfg.CheckinTimezone)
+	removed, err := s.store.ResetCheckins(period)
+	if err != nil {
+		return s.reply(ctx, event, "重置签到状态失败，请稍后重试。")
+	}
+	actor := strings.Join(identity.AdminCandidates(), ",")
+	_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: actor, Action: "checkin.reset", Target: period, Success: true, Description: fmt.Sprintf("重置签到记录 %d 条", removed)})
+	return s.reply(ctx, event, fmt.Sprintf("已重置当前签到周期（%s），共清除 %d 位用户的签到状态。", period, removed))
 }
 
 func (s *Service) replyExistingCheckin(ctx context.Context, event qq.MessageEvent, record model.CheckinRecord, next time.Time) error {
 	if record.Status == "completed" {
-		return s.reply(ctx, event, fmt.Sprintf("🎉 今日已签到。今日获取额度：%s", record.DisplayCredit))
+		return s.replyWithAutoRecall(ctx, event, fmt.Sprintf("🎉 今日已签到。今日获取额度：%s", record.DisplayCredit))
 	}
 	if record.Status == "pending_confirmation" {
-		return s.reply(ctx, event, "本周期签到额度发放结果待确认，请勿重复签到；如长时间未到账请联系管理员核查。")
+		return s.replyWithAutoRecall(ctx, event, "本周期签到额度发放结果待确认，请勿重复签到；如长时间未到账请联系管理员核查。")
 	}
-	return s.reply(ctx, event, "本周期签到请求正在处理中，请勿重复提交；如长时间未到账请联系管理员核查。")
+	return s.replyWithAutoRecall(ctx, event, "本周期签到请求正在处理中，请勿重复提交；如长时间未到账请联系管理员核查。")
 }
 
 func (s *Service) dynamicCheckinQuota(ctx context.Context, userID int, now time.Time, quotaPerUnit int64) (reward, yesterdayUsage, multiplierTenths int64, err error) {
@@ -1083,7 +1112,7 @@ func (s *Service) handleCheckinStatus(ctx context.Context, event qq.MessageEvent
 	period, next := periodKey(time.Now(), s.cfg.CheckinPeriod, s.cfg.CheckinTimezone)
 	record, err := s.store.GetCheckin(canonical, period)
 	if err != nil {
-		return s.reply(ctx, event, "本周期尚未签到。下次周期开始时间："+next.Format("2006-01-02 15:04 MST"))
+		return s.replyWithAutoRecall(ctx, event, "本周期尚未签到。下次周期开始时间："+next.Format("2006-01-02 15:04 MST"))
 	}
 	status := "处理中"
 	if record.Status == "completed" {
@@ -1091,7 +1120,7 @@ func (s *Service) handleCheckinStatus(ctx context.Context, event qq.MessageEvent
 	} else if record.Status == "pending_confirmation" {
 		status = "待确认"
 	}
-	return s.reply(ctx, event, fmt.Sprintf("当前周期：%s\n签到状态：%s\n已发放额度：%s\n绑定用户 ID：%d\n下个周期：%s", period, status, record.DisplayCredit, record.NewAPIID, next.Format("2006-01-02 15:04 MST")))
+	return s.replyWithAutoRecall(ctx, event, fmt.Sprintf("当前周期：%s\n签到状态：%s\n已发放额度：%s\n绑定用户 ID：%d\n下个周期：%s", period, status, record.DisplayCredit, record.NewAPIID, next.Format("2006-01-02 15:04 MST")))
 }
 
 // isAmbiguousQuotaWrite identifies a non-idempotent request which may have
@@ -1529,8 +1558,80 @@ func (s *Service) isAdmin(identity model.QQIdentity) bool {
 		if _, ok := s.cfg.QQAdminOpenIDs[candidate]; ok {
 			return true
 		}
+		if _, ok := s.cfg.QQReadOnlyAdminOpenIDs[candidate]; ok {
+			return true
+		}
 	}
 	return false
+}
+
+func (s *Service) isReadOnlyAdmin(identity model.QQIdentity) bool {
+	for _, candidate := range identity.AdminCandidates() {
+		if _, full := s.cfg.QQAdminOpenIDs[candidate]; full {
+			return false
+		}
+	}
+	for _, candidate := range identity.AdminCandidates() {
+		if _, readOnly := s.cfg.QQReadOnlyAdminOpenIDs[candidate]; readOnly {
+			return true
+		}
+	}
+	return false
+}
+
+// readOnlyAdminWriteCommand identifies commands that mutate bot, QQ, or New API
+// state. Read-only administrators may continue to use query/report commands.
+func readOnlyAdminWriteCommand(command string, fields []string) bool {
+	command = strings.ToLower(strings.TrimSpace(command))
+	arg := ""
+	if len(fields) > 1 {
+		arg = strings.ToLower(strings.TrimSpace(fields[1]))
+	}
+	switch command {
+	case "/enable", "/disable":
+		return arg != "list"
+	case "/bind":
+		return arg != "status"
+	case "/unbind", "/checkin", "/notify", "/welcome", "/benefit", "/recall":
+		if command == "/notify" && arg == "status" {
+			return false
+		}
+		if command == "/checkin" && arg == "status" {
+			return false
+		}
+		return true
+	case "/credit":
+		return arg == "add" || arg == "sub"
+	case "/plan":
+		return arg == "add" || arg == "sub"
+	case "/join":
+		return arg != "status"
+	case "/mute":
+		return arg != "status"
+	case "/confirm":
+		return true
+	case "/reset":
+		return arg != "check" && arg != "status" && arg != "last"
+	case "/admin":
+		if arg == "" || arg == "bindings" || arg == "report" || arg == "checkin" {
+			if arg == "report" && len(fields) > 2 && strings.EqualFold(fields[2], "export") {
+				return false
+			}
+			return false
+		}
+		if arg == "user" {
+			return len(fields) < 3 || !strings.EqualFold(fields[2], "status")
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// groupMessageSender is implemented by QQ clients that expose the official
+// "send group message" endpoint and return the created message metadata.
+type groupMessageSender interface {
+	SendGroupText(context.Context, string, string, string) (qq.SentMessage, error)
 }
 
 func (s *Service) reply(ctx context.Context, event qq.MessageEvent, content string) error {
@@ -1541,16 +1642,74 @@ func (s *Service) reply(ctx context.Context, event qq.MessageEvent, content stri
 		}
 		return s.qq.ReplyC2C(ctx, openID, event.Message.ID, content)
 	}
-	if sender, ok := s.qq.(interface {
-		SendGroupText(context.Context, string, string, string) (qq.SentMessage, error)
-	}); ok {
-		sent, err := sender.SendGroupText(ctx, event.Message.GroupOpenID, event.Message.ID, content)
+	return s.sendGroupReply(ctx, event.Message.GroupOpenID, event.Message.ID, content)
+}
+
+// sendGroupReply sends a group text message through the official message
+// endpoint when available and records it for /recall, otherwise falling back
+// to the legacy ReplyGroup path.
+func (s *Service) sendGroupReply(ctx context.Context, groupOpenID, replyTo, content string) error {
+	if sender, ok := s.qq.(groupMessageSender); ok {
+		sent, err := sender.SendGroupText(ctx, groupOpenID, replyTo, content)
 		if err == nil && sent.ID != "" {
-			_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: event.Message.GroupOpenID, MessageID: sent.ID, MessageIdx: sceneValue(sent.MessageScene.Ext, "msg_idx"), SentAt: time.Now()})
+			_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: groupOpenID, MessageID: sent.ID, MessageIdx: sceneValue(sent.MessageScene.Ext, "msg_idx"), SentAt: time.Now()})
 		}
 		return err
 	}
-	return s.qq.ReplyGroup(ctx, event.Message.GroupOpenID, event.Message.ID, content)
+	return s.qq.ReplyGroup(ctx, groupOpenID, replyTo, content)
+}
+
+// replyWithAutoRecall sends a reply and schedules an automatic group recall
+// after CheckinAutoRecallAfter. C2C replies are never recalled because the
+// official QQ bot API only documents message recall for group chats.
+func (s *Service) replyWithAutoRecall(ctx context.Context, event qq.MessageEvent, content string) error {
+	if event.EventType == "C2C_MESSAGE_CREATE" {
+		return s.reply(ctx, event, content)
+	}
+	delay := s.cfg.CheckinAutoRecallAfter
+	if delay <= 0 {
+		return s.reply(ctx, event, content)
+	}
+	sender, ok := s.qq.(groupMessageSender)
+	if !ok {
+		return s.reply(ctx, event, content)
+	}
+	groupOpenID := event.Message.GroupOpenID
+	sent, err := sender.SendGroupText(ctx, groupOpenID, event.Message.ID, content)
+	if err == nil && sent.ID != "" {
+		_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: groupOpenID, MessageID: sent.ID, MessageIdx: sceneValue(sent.MessageScene.Ext, "msg_idx"), SentAt: time.Now()})
+		s.scheduleGroupMessageRecall(groupOpenID, sent.ID, delay)
+	}
+	return err
+}
+
+// scheduleGroupMessageRecall recalls a bot message after the given delay with
+// the QQ official "delete group message" endpoint. QQ only allows recalling a
+// message within two minutes of sending, so callers should keep the delay well
+// below that bound. The recall is best-effort and failures are only logged.
+func (s *Service) scheduleGroupMessageRecall(groupOpenID, messageID string, after time.Duration) {
+	if groupOpenID == "" || messageID == "" || after <= 0 {
+		return
+	}
+	api, ok := s.qq.(groupRecallAPI)
+	if !ok {
+		s.logger.Debug("当前 QQ 客户端不支持自动消息撤回，跳过定时撤回", "group_openid", groupOpenID, "message_id", messageID)
+		return
+	}
+	go func() {
+		timer := time.NewTimer(after)
+		defer timer.Stop()
+		select {
+		case <-s.lifecycleCtx.Done():
+			return
+		case <-timer.C:
+		}
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(s.lifecycleCtx), s.cfg.QQAPITimeout)
+		defer cancel()
+		if err := api.RecallGroupMessage(ctx, groupOpenID, messageID); err != nil {
+			s.logger.Warn("自动撤回群消息失败", "group_openid", groupOpenID, "message_id", messageID, "recall_after", after.String(), "error", err)
+		}
+	}()
 }
 
 func (s *Service) replyChunked(ctx context.Context, event qq.MessageEvent, content string, maxRunes int) error {
@@ -1740,6 +1899,7 @@ func helpText(cfg config.Config) string {
 		"/unbind - 解除当前 QQ 身份绑定",
 		"/checkin - 签到并直接增加绑定账户额度",
 		"/checkin status - 查看签到状态",
+		"管理员：/checkin reset - 重置当前周期所有用户的签到状态",
 		"/me - 查看账户与额度",
 		"/usage [时间长度] - 查看自己的用量，例如 /usage 7d",
 		"/usage <时间长度> all - 查看全站请求、Token 与额度汇总",

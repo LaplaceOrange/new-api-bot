@@ -829,6 +829,64 @@ func (s *Store) GetCheckin(canonical, period string) (model.CheckinRecord, error
 	return result, err
 }
 
+// ResetCheckins removes all check-in records for the supplied period and
+// clears the corresponding New API user indexes. Historical periods remain
+// untouched so that audit and reporting data is preserved.
+func (s *Store) ResetCheckins(period string) (int, error) {
+	period = strings.TrimSpace(period)
+	if period == "" {
+		return 0, errors.New("签到周期不能为空")
+	}
+	removed := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		checkins := tx.Bucket([]byte("checkins"))
+		byUser := tx.Bucket([]byte("checkins_by_user"))
+		type entry struct {
+			key      []byte
+			newAPIID int
+		}
+		entries := make([]entry, 0)
+		if err := checkins.ForEach(func(key, value []byte) error {
+			var record model.CheckinRecord
+			if err := json.Unmarshal(value, &record); err != nil {
+				return err
+			}
+			if record.PeriodKey == period {
+				entries = append(entries, entry{key: append([]byte(nil), key...), newAPIID: record.NewAPIID})
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, item := range entries {
+			if err := checkins.Delete(item.key); err != nil {
+				return err
+			}
+			if err := byUser.Delete([]byte(strconv.Itoa(item.newAPIID) + "|" + period)); err != nil {
+				return err
+			}
+		}
+		// Also remove stale user indexes left by interrupted or older writes.
+		stale := make([][]byte, 0)
+		if err := byUser.ForEach(func(key, _ []byte) error {
+			if bytes.HasSuffix(key, []byte("|"+period)) {
+				stale = append(stale, append([]byte(nil), key...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, key := range stale {
+			if err := byUser.Delete(key); err != nil {
+				return err
+			}
+		}
+		removed = len(entries)
+		return nil
+	})
+	return removed, err
+}
+
 func (s *Store) ListCheckinsBetween(start, end time.Time) ([]model.CheckinRecord, error) {
 	result := make([]model.CheckinRecord, 0)
 	err := s.db.View(func(tx *bolt.Tx) error {
