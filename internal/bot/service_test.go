@@ -1366,10 +1366,11 @@ func TestCheckinGroupReplyIsAutoRecalled(t *testing.T) {
 	if err := storage.CreateBinding(model.Binding{CanonicalID: "user:u1", NewAPIID: 42, Email: "alice@example.com", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
+	const userMessageID = "m-checkin"
 	event := qq.MessageEvent{
 		EventType: "GROUP_MESSAGE_CREATE",
 		Message: qq.Message{
-			ID:          "m-checkin",
+			ID:          userMessageID,
 			Content:     "/checkin",
 			GroupOpenID: "g1",
 			Author:      qq.MessageAuthor{UserOpenID: "u1", MemberOpenID: "u1"},
@@ -1394,18 +1395,26 @@ func TestCheckinGroupReplyIsAutoRecalled(t *testing.T) {
 		recaller.mu.Lock()
 		recalled := len(recaller.recalled)
 		recaller.mu.Unlock()
-		if recalled == 1 {
+		if recalled >= 2 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("message %q was not auto-recalled within timeout", messageID)
+			t.Fatalf("bot reply %q and user message %q were not both auto-recalled within timeout", messageID, userMessageID)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	recaller.mu.Lock()
 	defer recaller.mu.Unlock()
-	if len(recaller.recalled) != 1 || recaller.recalled[0] != messageID {
-		t.Fatalf("recalled=%v, want single %q", recaller.recalled, messageID)
+	containsID := func(ids []string, want string) bool {
+		for _, id := range ids {
+			if id == want {
+				return true
+			}
+		}
+		return false
+	}
+	if len(recaller.recalled) < 2 || !containsID(recaller.recalled, messageID) || !containsID(recaller.recalled, userMessageID) {
+		t.Fatalf("recalled=%v, want both bot reply %q and user message %q", recaller.recalled, messageID, userMessageID)
 	}
 }
 

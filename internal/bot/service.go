@@ -1678,7 +1678,7 @@ func (s *Service) replyWithAutoRecall(ctx context.Context, event qq.MessageEvent
 	sent, err := sender.SendGroupText(ctx, groupOpenID, event.Message.ID, content)
 	if err == nil && sent.ID != "" {
 		_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: groupOpenID, MessageID: sent.ID, MessageIdx: sceneValue(sent.MessageScene.Ext, "msg_idx"), SentAt: time.Now()})
-		s.scheduleGroupMessageRecall(groupOpenID, sent.ID, delay)
+		s.scheduleGroupMessageRecall(groupOpenID, delay, sent.ID, event.Message.ID)
 	}
 	return err
 }
@@ -1687,13 +1687,28 @@ func (s *Service) replyWithAutoRecall(ctx context.Context, event qq.MessageEvent
 // the QQ official "delete group message" endpoint. QQ only allows recalling a
 // message within two minutes of sending, so callers should keep the delay well
 // below that bound. The recall is best-effort and failures are only logged.
-func (s *Service) scheduleGroupMessageRecall(groupOpenID, messageID string, after time.Duration) {
-	if groupOpenID == "" || messageID == "" || after <= 0 {
+// scheduleGroupMessageRecall recalls the given group messages after the delay
+// with the QQ official "delete group message" endpoint. It is used to withdraw
+// the bot reply together with the user command that triggered it. QQ only
+// allows recalling messages within two minutes of sending, so callers should
+// keep the delay well below that bound. Recall is best-effort; individual
+// failures are only logged and never retried.
+func (s *Service) scheduleGroupMessageRecall(groupOpenID string, after time.Duration, messageIDs ...string) {
+	if groupOpenID == "" || after <= 0 {
+		return
+	}
+	targets := make([]string, 0, len(messageIDs))
+	for _, id := range messageIDs {
+		if strings.TrimSpace(id) != "" {
+			targets = append(targets, id)
+		}
+	}
+	if len(targets) == 0 {
 		return
 	}
 	api, ok := s.qq.(groupRecallAPI)
 	if !ok {
-		s.logger.Debug("当前 QQ 客户端不支持自动消息撤回，跳过定时撤回", "group_openid", groupOpenID, "message_id", messageID)
+		s.logger.Debug("当前 QQ 客户端不支持自动消息撤回，跳过定时撤回", "group_openid", groupOpenID, "message_count", len(targets))
 		return
 	}
 	go func() {
@@ -1704,10 +1719,13 @@ func (s *Service) scheduleGroupMessageRecall(groupOpenID, messageID string, afte
 			return
 		case <-timer.C:
 		}
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(s.lifecycleCtx), s.cfg.QQAPITimeout)
-		defer cancel()
-		if err := api.RecallGroupMessage(ctx, groupOpenID, messageID); err != nil {
-			s.logger.Warn("自动撤回群消息失败", "group_openid", groupOpenID, "message_id", messageID, "recall_after", after.String(), "error", err)
+		for _, messageID := range targets {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(s.lifecycleCtx), s.cfg.QQAPITimeout)
+			err := api.RecallGroupMessage(ctx, groupOpenID, messageID)
+			cancel()
+			if err != nil {
+				s.logger.Warn("自动撤回群消息失败", "group_openid", groupOpenID, "message_id", messageID, "recall_after", after.String(), "error", err)
+			}
 		}
 	}()
 }
