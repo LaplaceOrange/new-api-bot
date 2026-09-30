@@ -436,12 +436,12 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	var err error
 	switch command {
 	case "/__command_too_long":
-		err = s.reply(ctx, event, "指令内容过长，请缩短到 4096 字节以内后重试。")
+		err = s.replyWithAutoRecall(ctx, event, "指令内容过长，请缩短到 4096 字节以内后重试。")
 	case "/help":
 		if len(fields) != 1 {
-			err = s.reply(ctx, event, "格式错误。正确用法：/help")
+			err = s.replyWithAutoRecall(ctx, event, "格式错误。正确用法：/help")
 		} else {
-			err = s.reply(ctx, event, s.filteredHelpText())
+			err = s.replyWithAutoRecall(ctx, event, s.filteredHelpText())
 		}
 	case "/whoami":
 		if len(fields) != 1 {
@@ -471,7 +471,8 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 			break
 		}
 		err = s.handleReset(ctx, event, canonical, identity, fields)
-	default:
+	case "/checkin", "/me", "/credit", "/plan", "/benefit", "/usage", "/logs", "/models",
+		"/notify", "/welcome", "/join", "/mute", "/bot", "/recall", "/confirm", "/unbind", "/admin":
 		// /checkin reset is an administrator-only operation and does not require
 		// the issuer to have a personal binding.
 		if command == "/checkin" && len(fields) >= 2 && strings.EqualFold(fields[1], "reset") {
@@ -533,9 +534,9 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 			err = s.handleUnbind(ctx, event, canonical, fields)
 		case "/admin":
 			err = s.handleAdmin(ctx, event, canonical, identity, fields)
-		default:
-			err = s.reply(ctx, event, "未知指令，请使用 /help 查看可用指令。")
 		}
+	default:
+		err = s.replyWithAutoRecall(ctx, event, "未知指令，请使用 /help 查看可用指令。")
 	}
 	if err != nil {
 		s.logger.Error("处理机器人命令失败", "command", command, "error", err)

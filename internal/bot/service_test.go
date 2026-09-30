@@ -1418,6 +1418,73 @@ func TestCheckinGroupReplyIsAutoRecalled(t *testing.T) {
 	}
 }
 
+func TestHelpAndInvalidCommandAutoRecall(t *testing.T) {
+	for _, command := range []string{"/help", "/help extra", "/unknown", "/__command_too_long"} {
+		for _, mode := range []string{"group", "bound-group", "disabled", "c2c", "send-error", "legacy-client"} {
+			t.Run(command+"/"+mode, func(t *testing.T) {
+				service, storage, _, qqAPI, _ := testService(t)
+				recaller := &recallQQ{fakeQQ: qqAPI}
+				service.qq = recaller
+				service.cfg.CheckinAutoRecallAfter = 10 * time.Millisecond
+				event := groupEvent("g1", "u1", command)
+				switch mode {
+				case "bound-group":
+					if err := storage.CreateBinding(model.Binding{CanonicalID: "member:g1:u1", NewAPIID: 42, CreatedAt: time.Now()}); err != nil {
+						t.Fatal(err)
+					}
+				case "disabled":
+					service.cfg.CheckinAutoRecallAfter = 0
+				case "c2c":
+					event = c2cEvent("u1", command)
+				case "send-error":
+					recaller.sendGroupErr = errors.New("send failed")
+				case "legacy-client":
+					service.qq = qqAPI
+				}
+				service.process(context.Background(), event)
+				if mode != "send-error" {
+					reply := lastReply(t, qqAPI)
+					if command == "/unknown" && !strings.Contains(reply, "未知指令") {
+						t.Fatalf("unexpected unknown command reply: %q", reply)
+					}
+					if command == "/help" && !strings.Contains(reply, "/checkin") {
+						t.Fatalf("unexpected help reply: %q", reply)
+					}
+				}
+				wantRecall := mode == "group" || mode == "bound-group"
+				if !wantRecall {
+					time.Sleep(40 * time.Millisecond)
+					recaller.mu.Lock()
+					defer recaller.mu.Unlock()
+					if len(recaller.recalled) != 0 {
+						t.Fatalf("unexpected recalls: %v", recaller.recalled)
+					}
+					return
+				}
+				deadline := time.Now().Add(3 * time.Second)
+				for {
+					recaller.mu.Lock()
+					done := len(recaller.recalled) >= 2
+					recaller.mu.Unlock()
+					if done {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("reply and command were not auto-recalled")
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				recaller.mu.Lock()
+				defer recaller.mu.Unlock()
+				if len(recaller.sent) != 1 || len(recaller.recalled) != 2 ||
+					recaller.recalled[0] != recaller.sent[0].ID || recaller.recalled[1] != event.Message.ID {
+					t.Fatalf("sent=%v recalled=%v, want reply and command %q", recaller.sent, recaller.recalled, event.Message.ID)
+				}
+			})
+		}
+	}
+}
+
 func TestCheckinC2CReplyIsNotAutoRecalled(t *testing.T) {
 	service, storage, _, qqAPI, _ := testService(t)
 	recaller := &recallQQ{fakeQQ: qqAPI}
