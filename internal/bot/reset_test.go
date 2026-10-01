@@ -758,9 +758,25 @@ func TestConfirmedTimelineEventCreatesOneActivity(t *testing.T) {
 	}
 }
 
+// resetNotificationEnqueueTime anchors the dispatch/retry clock to the durable
+// enqueue timestamp. ApplyResetSignalToGroup normalizes UpdatedAt with a new
+// time.Now(), so a producer timestamp captured before that call is not due yet.
+func resetNotificationEnqueueTime(t *testing.T, storage *store.Store, signalID string) time.Time {
+	t.Helper()
+	signal, err := storage.GetResetSignal(signalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signal.UpdatedAt.IsZero() {
+		t.Fatal("reset signal has no persisted enqueue timestamp")
+	}
+	return signal.UpdatedAt
+}
+
 func TestResetNotificationOutboxRetriesAfterQQFailure(t *testing.T) {
 	service, storage, _, qqAPI, _ := testService(t)
-	now := time.Now()
+	// Deliberately make observation older than enqueue, even on coarse clocks.
+	now := time.Now().Add(-time.Second)
 	signal := model.ResetSignal{
 		ID:         "x:outbox-retry",
 		Source:     "test",
@@ -771,6 +787,7 @@ func TestResetNotificationOutboxRetriesAfterQQFailure(t *testing.T) {
 		UpdatedAt:  now,
 	}
 	service.processResetSignalForGroup(context.Background(), "g-reset", signal)
+	now = resetNotificationEnqueueTime(t, storage, signal.ID)
 	if replyCount(qqAPI) != 0 {
 		t.Fatal("reset signal bypassed the notification outbox")
 	}
@@ -797,7 +814,7 @@ func TestResetNotificationOutboxRetriesAfterQQFailure(t *testing.T) {
 
 func TestResetNotificationOutboxResumesAtFailedChunk(t *testing.T) {
 	service, storage, _, qqAPI, _ := testService(t)
-	now := time.Now()
+	now := time.Now().Add(-time.Second)
 	signal := model.ResetSignal{
 		ID:         "x:outbox-chunks",
 		Source:     "test",
@@ -808,6 +825,7 @@ func TestResetNotificationOutboxResumesAtFailedChunk(t *testing.T) {
 		UpdatedAt:  now,
 	}
 	service.processResetSignalForGroup(context.Background(), "g-reset", signal)
+	now = resetNotificationEnqueueTime(t, storage, signal.ID)
 	due, err := storage.ListDueResetNotifications(now, 1)
 	if err != nil || len(due) != 1 {
 		t.Fatalf("due=%#v err=%v", due, err)
@@ -834,7 +852,7 @@ func TestResetNotificationOutboxResumesAtFailedChunk(t *testing.T) {
 
 func TestResetNotificationStopsAfterConcurrentSupersede(t *testing.T) {
 	service, storage, _, qqAPI, _ := testService(t)
-	now := time.Now()
+	now := time.Now().Add(-time.Second)
 	signal := model.ResetSignal{
 		ID:         "x:outbox-superseded-during-send",
 		Source:     "test",
@@ -845,6 +863,7 @@ func TestResetNotificationStopsAfterConcurrentSupersede(t *testing.T) {
 		UpdatedAt:  now,
 	}
 	service.processResetSignalForGroup(context.Background(), "g-reset", signal)
+	now = resetNotificationEnqueueTime(t, storage, signal.ID)
 	due, err := storage.ListDueResetNotifications(now, 1)
 	if err != nil || len(due) != 1 {
 		t.Fatalf("due=%#v err=%v", due, err)
@@ -876,7 +895,7 @@ func TestResetNotificationStopsAfterConcurrentSupersede(t *testing.T) {
 
 func TestResetNotificationRenderFailureIsRetried(t *testing.T) {
 	service, storage, _, _, _ := testService(t)
-	now := time.Now()
+	now := time.Now().Add(-time.Second)
 	signal := model.ResetSignal{
 		ID:         "x:outbox-render",
 		Source:     "test",
@@ -886,6 +905,7 @@ func TestResetNotificationRenderFailureIsRetried(t *testing.T) {
 		UpdatedAt:  now,
 	}
 	service.processResetSignalForGroup(context.Background(), "g-reset", signal)
+	now = resetNotificationEnqueueTime(t, storage, signal.ID)
 	due, err := storage.ListDueResetNotifications(now, 1)
 	if err != nil || len(due) != 1 {
 		t.Fatalf("due=%#v err=%v", due, err)
@@ -899,6 +919,34 @@ func TestResetNotificationRenderFailureIsRetried(t *testing.T) {
 	retried, err := storage.ListDueResetNotifications(now.Add(30*time.Second), 1)
 	if err != nil || len(retried) != 1 || retried[0].Attempts != 1 || retried[0].Status != model.ResetNotificationPending {
 		t.Fatalf("render failure was discarded: due=%#v err=%v", retried, err)
+	}
+}
+
+func TestResetNotificationEnqueueTimeIsInclusiveAndNotObservationTime(t *testing.T) {
+	service, storage, _, _, _ := testService(t)
+	observedAt := time.Now().Add(-time.Second)
+	signal := model.ResetSignal{
+		ID:         "x:outbox-enqueue-clock",
+		Source:     "test",
+		Stage:      model.ResetStagePossible,
+		OccurredAt: observedAt,
+		DetectedAt: observedAt,
+		UpdatedAt:  observedAt,
+	}
+	service.processResetSignalForGroup(context.Background(), "g-reset", signal)
+	enqueuedAt := resetNotificationEnqueueTime(t, storage, signal.ID)
+	if !enqueuedAt.After(observedAt) {
+		t.Fatalf("enqueue=%v did not advance observation=%v", enqueuedAt, observedAt)
+	}
+	for _, before := range []time.Time{observedAt, enqueuedAt.Add(-time.Nanosecond)} {
+		due, err := storage.ListDueResetNotifications(before, 1)
+		if err != nil || len(due) != 0 {
+			t.Fatalf("notification became due before enqueue: now=%v due=%#v err=%v", before, due, err)
+		}
+	}
+	due, err := storage.ListDueResetNotifications(enqueuedAt, 1)
+	if err != nil || len(due) != 1 || !due[0].NextAttemptAt.Equal(enqueuedAt) {
+		t.Fatalf("notification not due at its exact enqueue time: due=%#v err=%v", due, err)
 	}
 }
 
