@@ -25,6 +25,7 @@ import (
 	"github.com/fsykk/new-api-bot/internal/newapi"
 	"github.com/fsykk/new-api-bot/internal/qq"
 	"github.com/fsykk/new-api-bot/internal/resetradar"
+	"github.com/fsykk/new-api-bot/internal/rss"
 	"github.com/fsykk/new-api-bot/internal/secure"
 	"github.com/fsykk/new-api-bot/internal/store"
 	"github.com/fsykk/new-api-bot/internal/vendorstatus"
@@ -127,6 +128,9 @@ type Service struct {
 	vendorConfigWake        chan struct{}
 	vendorPollMu            sync.Mutex
 	vendorPollCancel        context.CancelFunc
+	rssClient               rssFeedClient
+	rssGroups               keyedLocker[string]
+	rssWake                 chan struct{}
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
@@ -135,6 +139,12 @@ func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI
 	}
 	if cfg.GatewayWorkers <= 0 {
 		cfg.GatewayWorkers = 2
+	}
+	if cfg.RSSPollInterval <= 0 {
+		cfg.RSSPollInterval = 5 * time.Minute
+	}
+	if cfg.RSSHTTPTimeout <= 0 {
+		cfg.RSSHTTPTimeout = 20 * time.Second
 	}
 	service := &Service{
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
@@ -146,6 +156,13 @@ func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI
 	service.vendorRunner = vendorstatus.PythonRunner{}
 	service.vendorSemaphore = make(chan struct{}, 1)
 	service.vendorConfigWake = make(chan struct{}, 1)
+	service.rssWake = make(chan struct{}, 1)
+	client, err := rss.NewClient(cfg.RSSHTTPTimeout, cfg.RSSProxyURL)
+	if err == nil {
+		service.rssClient = client
+	} else {
+		logger.Error("RSS 客户端配置无效") // Never log proxy credentials.
+	}
 	return service
 }
 
@@ -156,6 +173,14 @@ func (s *Service) Start(ctx context.Context) {
 		return
 	}
 	s.lifecycleCtx = ctx
+	if s.cfg.RSSEnabled && s.rssClient != nil {
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			defer s.rssClient.Close()
+			s.runRSSWorker(ctx)
+		}()
+	}
 	for i := 0; i < s.cfg.GatewayWorkers; i++ {
 		s.workers.Add(1)
 		go func(worker int) {
@@ -228,6 +253,9 @@ func (s *Service) StopContext(ctx context.Context) error {
 	})
 	if !s.started.Load() {
 		s.queueCloseOnce.Do(func() { close(s.queue) })
+		if s.rssClient != nil {
+			s.rssClient.Close()
+		}
 		return nil
 	}
 	select {
@@ -238,6 +266,9 @@ func (s *Service) StopContext(ctx context.Context) error {
 	}
 	select {
 	case <-s.workersDone:
+		if s.rssClient != nil {
+			s.rssClient.Close()
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -494,6 +525,8 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		err = s.handleBind(ctx, event, canonical, fields)
 	case "/vendor_status":
 		err = s.handleVendorStatus(ctx, event, fields)
+	case "/rss":
+		err = s.handleRSS(ctx, event, identity, fields)
 	case "/vendor_subscribe":
 		err = s.handleVendorSubscription(ctx, event, identity, fields)
 	case "/vendor_config":
@@ -1638,6 +1671,8 @@ func readOnlyAdminWriteCommand(command string, fields []string) bool {
 		arg = strings.ToLower(strings.TrimSpace(fields[1]))
 	}
 	switch command {
+	case "/rss":
+		return arg == "add" || arg == "remove" || arg == "pause" || arg == "resume" || arg == "interval"
 	case "/vendor_config":
 		return vendorConfigWriteCommand(fields)
 	case "/enable", "/disable":

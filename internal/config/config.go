@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fsykk/new-api-bot/internal/rss"
 	"github.com/fsykk/new-api-bot/internal/vendorstatus"
 )
 
@@ -73,6 +74,10 @@ type Config struct {
 	ResetDefaultWinners        int
 	ResetDefaultLookback       time.Duration
 	VendorStatus               vendorstatus.Config
+	RSSEnabled                 bool
+	RSSPollInterval            time.Duration
+	RSSHTTPTimeout             time.Duration
+	RSSProxyURL                string
 }
 
 func Load() (Config, error) {
@@ -173,6 +178,19 @@ func Load() (Config, error) {
 	c.AdminUserManagementEnabled = parseBool("ADMIN_USER_MANAGEMENT_ENABLED", true)
 	c.BenefitEnabled = parseBool("BENEFIT_ENABLED", true)
 	c.ResetEnabled = parseBool("RESET_ENABLED", true)
+	c.RSSEnabled = parseBool("RSS_ENABLED", true)
+	c.RSSPollInterval = parseDuration("RSS_POLL_INTERVAL", 5*time.Minute)
+	c.RSSHTTPTimeout = parseDuration("RSS_HTTP_TIMEOUT", 20*time.Second)
+	c.RSSProxyURL = strings.TrimSpace(os.Getenv("RSS_PROXY_URL"))
+	if c.RSSPollInterval < time.Minute || c.RSSPollInterval > 24*time.Hour {
+		errs = append(errs, errors.New("RSS_POLL_INTERVAL 必须在 1m 至 24h 之间"))
+	}
+	if c.RSSHTTPTimeout > 2*time.Minute {
+		errs = append(errs, errors.New("RSS_HTTP_TIMEOUT 不能超过 2m"))
+	}
+	if err := rss.ValidateProxyURL(c.RSSProxyURL); err != nil {
+		errs = append(errs, err)
+	}
 	c.BenefitMaxCount = parseInt("BENEFIT_MAX_COUNT", 100, 1)
 	if c.BenefitMaxCount > 100 {
 		errs = append(errs, errors.New("BENEFIT_MAX_COUNT 不能超过 New API 单次上限 100"))

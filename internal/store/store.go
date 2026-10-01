@@ -34,6 +34,10 @@ var (
 const maxAuditRecords = 10_000
 
 var buckets = [][]byte{
+	rssSubscriptionsBucket,
+	rssGroupsBucket,
+	rssSeenBucket,
+	rssPendingBucket,
 	[]byte("bindings"),
 	[]byte("bindings_by_user"),
 	[]byte("aliases"),
