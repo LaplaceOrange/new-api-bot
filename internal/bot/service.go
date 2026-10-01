@@ -418,7 +418,11 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	s.logger.Debug("开始处理 QQ 命令", "event", event.EventType, "command", command)
 	identity := identityFromEvent(event)
 	if s.isReadOnlyAdmin(identity) && readOnlyAdminWriteCommand(command, fields) {
-		if err := s.reply(ctx, event, "只读管理员仅可执行查询类指令。"); err != nil {
+		reply := s.reply
+		if command == "/hongbao" && len(fields) > 1 && strings.EqualFold(fields[1], "new") {
+			reply = s.replyHongbaoNotice
+		}
+		if err := reply(ctx, event, "只读管理员仅可执行查询类指令。"); err != nil {
 			s.logger.Error("回复只读管理员权限拒绝失败", "command", command, "error", err)
 		}
 		return
@@ -1687,10 +1691,15 @@ func (s *Service) sendGroupReplyWithSequence(ctx context.Context, groupOpenID, r
 // after CheckinAutoRecallAfter. C2C replies are never recalled because the
 // official QQ bot API only documents message recall for group chats.
 func (s *Service) replyWithAutoRecall(ctx context.Context, event qq.MessageEvent, content string) error {
+	return s.replyWithAutoRecallAfter(ctx, event, content, s.cfg.CheckinAutoRecallAfter)
+}
+
+// replyWithAutoRecallAfter permits command-specific recall delays without
+// changing the check-in/help recall configuration.
+func (s *Service) replyWithAutoRecallAfter(ctx context.Context, event qq.MessageEvent, content string, delay time.Duration) error {
 	if event.EventType == "C2C_MESSAGE_CREATE" {
 		return s.reply(ctx, event, content)
 	}
-	delay := s.cfg.CheckinAutoRecallAfter
 	if delay <= 0 {
 		return s.reply(ctx, event, content)
 	}
@@ -1707,10 +1716,6 @@ func (s *Service) replyWithAutoRecall(ctx context.Context, event qq.MessageEvent
 	return err
 }
 
-// scheduleGroupMessageRecall recalls a bot message after the given delay with
-// the QQ official "delete group message" endpoint. QQ only allows recalling a
-// message within two minutes of sending, so callers should keep the delay well
-// below that bound. The recall is best-effort and failures are only logged.
 // scheduleGroupMessageRecall recalls the given group messages after the delay
 // with the QQ official "delete group message" endpoint. It is used to withdraw
 // the bot reply together with the user command that triggered it. QQ only
@@ -1942,7 +1947,7 @@ func helpText(cfg config.Config) string {
 		"/checkin - 签到并直接增加绑定账户额度",
 		"/checkin status - 查看签到状态",
 		"/hongbao - 领取当前群红包，每个账户每轮限领一次",
-		"管理员：/hongbao new <总金额> <个数> - 发放拼手气额度红包",
+		"管理员：/hongbao new <总额度> <数量> [分组限制 ...] - 发放拼手气额度红包，多个分组以空格分隔",
 		"管理员：/checkin reset - 重置当前周期所有用户的签到状态",
 		"/me - 查看账户与额度",
 		"/usage [时间长度] - 查看自己的用量，例如 /usage 7d",

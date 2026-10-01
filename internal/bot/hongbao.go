@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/fsykk/new-api-bot/internal/model"
 	"github.com/fsykk/new-api-bot/internal/newapi"
@@ -16,24 +18,31 @@ import (
 	"github.com/fsykk/new-api-bot/internal/store"
 )
 
-const maxHongbaoCount = 10000
+const (
+	maxHongbaoCount          = 10000
+	hongbaoNoticeRecallAfter = 30 * time.Second
+)
+
+func (s *Service) replyHongbaoNotice(ctx context.Context, event qq.MessageEvent, content string) error {
+	return s.replyWithAutoRecallAfter(ctx, event, content, hongbaoNoticeRecallAfter)
+}
 
 func hongbaoUsage() string {
-	return "🧧 使用方式：/hongbao 领取当前群红包；管理员可使用 /hongbao new <总金额> <个数> 发放红包。金额以站点显示额度为单位。"
+	return "🧧 使用方式：/hongbao 领取当前群红包；管理员可使用 /hongbao new <总额度> <数量> [分组限制 ...] 发放红包。总额度以站点显示额度为单位，多个分组名称以空格分隔；不填写分组时不限制。"
 }
 
 func (s *Service) handleHongbao(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
 	if event.Message.GroupOpenID == "" || event.EventType == "C2C_MESSAGE_CREATE" {
 		return s.reply(ctx, event, "🧧 红包功能仅限群聊使用。")
 	}
-	if len(fields) != 1 && (len(fields) != 4 || !strings.EqualFold(fields[1], "new")) {
+	if len(fields) != 1 && (len(fields) < 4 || !strings.EqualFold(fields[1], "new")) {
 		return s.reply(ctx, event, hongbaoUsage())
 	}
 	unlock := s.hongbaoGroups.Lock(event.Message.GroupOpenID)
 	defer unlock()
-	if len(fields) == 4 {
+	if len(fields) >= 4 {
 		if !s.isAdmin(identity) || s.isReadOnlyAdmin(identity) {
-			return s.reply(ctx, event, "🧧 仅具备完整管理权限的管理员可以发放红包。")
+			return s.replyHongbaoNotice(ctx, event, "🧧 仅具备完整管理权限的管理员可以发放红包。")
 		}
 		return s.createHongbao(ctx, event, identity, fields)
 	}
@@ -80,7 +89,8 @@ func (s *Service) createHongbao(ctx context.Context, event qq.MessageEvent, iden
 	}
 	packet := model.Hongbao{
 		ID: id, GroupOpenID: group, Actor: commandRuleActor(identity),
-		QuotaPerUnit: status.QuotaPerUnit, TotalQuota: total, TotalCount: count,
+		AllowedGroups: uniqueHongbaoGroups(fields[4:]),
+		QuotaPerUnit:  status.QuotaPerUnit, TotalQuota: total, TotalCount: count,
 		RemainingQuota: total, RemainingCount: count,
 		Claims: make(map[int]model.HongbaoClaim), CreatedAt: s.now(),
 	}
@@ -88,8 +98,25 @@ func (s *Service) createHongbao(ctx context.Context, event qq.MessageEvent, iden
 		return s.reply(ctx, event, "🧧 保存红包失败，请稍后重试。")
 	}
 	_ = s.store.AddAudit(model.AuditRecord{At: s.now(), Actor: packet.Actor, Action: "hongbao.create", Target: id, Success: true,
-		Metadata: map[string]any{"group": group, "quota": total, "count": count}})
-	return s.reply(ctx, event, fmt.Sprintf("🧧 红包已发放\n总额度：%s\n红包数量：%d 个\n已绑定账户可发送 /hongbao 领取，每个账户本轮限领一次。", newapi.QuotaToDisplay(total, packet.QuotaPerUnit), count))
+		Metadata: map[string]any{"group": group, "quota": total, "count": count, "allowed_groups": packet.AllowedGroups}})
+	groupText := ""
+	if len(packet.AllowedGroups) > 0 {
+		groupText = "领取分组：" + strings.Join(packet.AllowedGroups, "、") + "\n"
+	}
+	return s.reply(ctx, event, fmt.Sprintf("🧧 红包已发放\n总额度：%s\n红包数量：%d 个\n%s已绑定账户可发送 /hongbao 领取，每个账户本轮限领一次。", newapi.QuotaToDisplay(total, packet.QuotaPerUnit), count, groupText))
+}
+
+func uniqueHongbaoGroups(groups []string) []string {
+	var result []string
+	seen := make(map[string]struct{}, len(groups))
+	for _, group := range groups {
+		if _, exists := seen[group]; exists {
+			continue
+		}
+		seen[group] = struct{}{}
+		result = append(result, group)
+	}
+	return result
 }
 
 func (s *Service) claimHongbao(ctx context.Context, event qq.MessageEvent, canonical string) error {
@@ -104,11 +131,20 @@ func (s *Service) claimHongbao(ctx context.Context, event qq.MessageEvent, canon
 	if err != nil {
 		return s.reply(ctx, event, "🧧 读取红包状态失败，请稍后重试。")
 	}
+	if len(packet.AllowedGroups) > 0 {
+		user, err := s.newAPI.GetUser(ctx, binding.NewAPIID)
+		if err != nil {
+			return s.reply(ctx, event, "🧧 读取账户分组失败，请稍后重试："+publicError(err))
+		}
+		if !slices.Contains(packet.AllowedGroups, user.Group) {
+			return s.replyHongbaoNotice(ctx, event, "🧧 无权限领取本轮红包，您的账户分组不符合领取条件。")
+		}
+	}
 	if claim, exists := packet.Claims[binding.NewAPIID]; exists {
 		if claim.Status != "granted" {
-			return s.reply(ctx, event, "🧧 本次领取的额度发放结果尚待确认，请勿重复领取；如长时间未到账，请联系管理员核查。")
+			return s.replyHongbaoNotice(ctx, event, "🧧 本次领取的额度发放结果尚待确认，请勿重复领取；如长时间未到账，请联系管理员核查。")
 		}
-		replyErr := s.reply(ctx, event, hongbaoClaimText(packet, claim.RawQuota, true))
+		replyErr := s.replyHongbaoNotice(ctx, event, hongbaoClaimText(packet, claim.RawQuota, true))
 		return errors.Join(replyErr, s.announceHongbaoSummary(ctx, packet, event.Message.ID))
 	}
 	if !packet.CompletedAt.IsZero() {

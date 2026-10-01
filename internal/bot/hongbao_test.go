@@ -48,10 +48,14 @@ func bindHongbaoUser(t *testing.T, storage *store.Store, group, member string, i
 	}
 }
 
-func createTestHongbao(t *testing.T, service *Service, total, count string) {
+func createTestHongbao(t *testing.T, service *Service, total, count string, groups ...string) {
 	t.Helper()
 	service.cfg.QQAdminOpenIDs["member:g:admin"] = struct{}{}
-	service.process(context.Background(), groupEvent("g", "admin", "/hongbao new "+total+" "+count))
+	command := "/hongbao new " + total + " " + count
+	if len(groups) > 0 {
+		command += " " + strings.Join(groups, " ")
+	}
+	service.process(context.Background(), groupEvent("g", "admin", command))
 	packet, err := service.store.GetHongbao("g")
 	if err != nil || packet.TotalCount == 0 {
 		t.Fatalf("packet = %+v, error = %v", packet, err)
@@ -322,7 +326,7 @@ func TestRandomHongbaoQuotaConservation(t *testing.T) {
 
 func TestHongbaoHelpAndDisableRule(t *testing.T) {
 	service, storage, api, qqAPI, _ := testService(t)
-	if !strings.Contains(service.filteredHelpText(), "/hongbao new <总金额> <个数>") {
+	if !strings.Contains(service.filteredHelpText(), "/hongbao new <总额度> <数量> [分组限制 ...]") {
 		t.Fatal("missing help")
 	}
 	if err := storage.PutCommandRule(model.CommandRule{Keyword: "hongbao", Enabled: false}); err != nil {

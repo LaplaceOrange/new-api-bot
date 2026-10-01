@@ -18,7 +18,8 @@ func TestHongbaoPersistsAcrossReopenAndIndexesPendingSummaries(t *testing.T) {
 	}
 	packet := model.Hongbao{
 		ID: "packet", GroupOpenID: "g", Actor: "admin", QuotaPerUnit: 500000,
-		TotalQuota: 500000, TotalCount: 2, RemainingQuota: 250000, RemainingCount: 1,
+		AllowedGroups: []string{"gpt-cheap", "gpt-smart"},
+		TotalQuota:    500000, TotalCount: 2, RemainingQuota: 250000, RemainingCount: 1,
 		Claims:    map[int]model.HongbaoClaim{42: {CanonicalID: "member:g:alice", RawQuota: 250000, Status: "pending_confirmation"}},
 		CreatedAt: time.Now().UTC(),
 	}

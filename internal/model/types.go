@@ -154,6 +154,7 @@ type Hongbao struct {
 	ID             string               `json:"id"`
 	GroupOpenID    string               `json:"group_openid"`
 	Actor          string               `json:"actor"`
+	AllowedGroups  []string             `json:"allowed_groups,omitempty"`
 	QuotaPerUnit   int64                `json:"quota_per_unit"`
 	TotalQuota     int64                `json:"total_quota"`
 	TotalCount     int                  `json:"total_count"`
