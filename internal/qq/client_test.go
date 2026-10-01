@@ -21,7 +21,7 @@ func TestFlexIntAcceptsStringAndNumber(t *testing.T) {
 }
 
 func TestUploadPreparationAcceptsStringBlockSize(t *testing.T) {
-	input := []byte(`{"upload_id":"upload-1","block_size":"1048576","parts":[{"index":0,"presigned_url":"https://example.com/upload","block_size":"524288"}]}`)
+	input := []byte(`{"upload_id":"upload-1","block_size":"1048576","parts":[{"index":1,"presigned_url":"https://example.com/upload","block_size":"524288"}]}`)
 	var value struct {
 		UploadID  string  `json:"upload_id"`
 		BlockSize flexInt `json:"block_size"`

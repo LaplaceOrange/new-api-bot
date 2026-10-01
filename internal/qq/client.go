@@ -339,13 +339,13 @@ func (c *Client) sendFile(ctx context.Context, basePath, replyTo, fileName strin
 	md5sum := md5.Sum(data)
 	sha1sum := sha1.Sum(data)
 	md5Ten := md5.Sum(data[:min(len(data), 10002432)])
-	body := map[string]any{"file_type": fileType, "file_size": strconv.Itoa(len(data)), "file_name": fileName, "md5": fmt.Sprintf("%x", md5sum), "sha1": fmt.Sprintf("%x", sha1sum), "md5_10m": fmt.Sprintf("%x", md5Ten)}
+	body := map[string]any{"file_type": fileType, "file_size": len(data), "file_name": fileName, "md5": fmt.Sprintf("%x", md5sum), "sha1": fmt.Sprintf("%x", sha1sum), "md5_10m": fmt.Sprintf("%x", md5Ten)}
 	var prep struct {
 		UploadID string `json:"upload_id"`
 		// QQ 文件上传接口在不同版本中会将 block_size 返回为 JSON 数字或字符串。
 		BlockSize flexInt `json:"block_size"`
 		Parts     []struct {
-			Index        int     `json:"index"`
+			Index        flexInt `json:"index"`
 			PresignedURL string  `json:"presigned_url"`
 			BlockSize    flexInt `json:"block_size"`
 		} `json:"parts"`
@@ -357,22 +357,46 @@ func (c *Client) sendFile(ctx context.Context, basePath, replyTo, fileName strin
 	if blockSize <= 0 || prep.UploadID == "" {
 		return SentMessage{}, errors.New("QQ 上传分片大小无效")
 	}
-	// Official indexes are zero-based. Reject malformed/duplicate indexes
-	// instead of silently uploading the wrong portion of the image.
+	if len(prep.Parts) == 0 {
+		return SentMessage{}, errors.New("QQ 上传准备响应缺少分片")
+	}
+	// QQ's official SDK uses one-based indexes:
+	// offset = (part.index - 1) * block_size. Validate the whole response
+	// before any PUT so a malformed later part cannot leave a partial upload.
+	partCount := 1 + (len(data)-1)/blockSize
 	seen := make(map[int]bool)
 	for _, part := range prep.Parts {
-		if part.Index < 0 || part.Index > (len(data)-1)/blockSize || seen[part.Index] {
-			return SentMessage{}, errors.New("QQ 上传分片索引无效")
+		index := int(part.Index)
+		if index < 1 || index > partCount {
+			return SentMessage{}, fmt.Errorf("QQ 上传分片索引无效（编号=%d，允许范围=1..%d）", index, partCount)
 		}
-		seen[part.Index] = true
-		start := part.Index * blockSize
+		if seen[index] {
+			return SentMessage{}, fmt.Errorf("QQ 上传分片索引重复（编号=%d）", index)
+		}
+		seen[index] = true
+		start := (index - 1) * blockSize
 		size := int(part.BlockSize)
-		if size <= 0 {
+		if size < 0 {
+			return SentMessage{}, errors.New("QQ 上传分片大小无效")
+		}
+		if size == 0 {
 			size = blockSize
 		}
 		expectedSize := min(blockSize, len(data)-start)
 		if size != blockSize && size != expectedSize {
 			return SentMessage{}, errors.New("QQ 上传分片大小不匹配")
+		}
+		target, parseErr := url.Parse(part.PresignedURL)
+		if parseErr != nil || target == nil || (target.Scheme != "http" && target.Scheme != "https") || target.Hostname() == "" || target.User != nil {
+			return SentMessage{}, errors.New("QQ 上传分片地址无效")
+		}
+	}
+	for _, part := range prep.Parts {
+		index := int(part.Index)
+		start := (index - 1) * blockSize
+		size := int(part.BlockSize)
+		if size == 0 {
+			size = blockSize
 		}
 		end := start + min(size, len(data)-start)
 		chunk := data[start:end]
@@ -389,7 +413,7 @@ func (c *Client) sendFile(ctx context.Context, basePath, replyTo, fileName strin
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return SentMessage{}, fmt.Errorf("QQ 文件分片上传失败（HTTP %d）", resp.StatusCode)
 		}
-		finish := map[string]any{"upload_id": prep.UploadID, "part_index": part.Index, "block_size": strconv.Itoa(len(chunk)), "md5": fmt.Sprintf("%x", md5.Sum(chunk))}
+		finish := map[string]any{"upload_id": prep.UploadID, "part_index": index, "block_size": len(chunk), "md5": fmt.Sprintf("%x", md5.Sum(chunk))}
 		if err := c.request(ctx, http.MethodPost, basePath+"/upload_part_finish", finish, nil); err != nil {
 			return SentMessage{}, err
 		}
@@ -397,7 +421,7 @@ func (c *Client) sendFile(ctx context.Context, basePath, replyTo, fileName strin
 	var complete struct {
 		FileInfo string `json:"file_info"`
 	}
-	if err := c.request(ctx, http.MethodPost, basePath+"/files", map[string]any{"file_type": fileType, "srv_send_msg": false, "file_name": fileName, "upload_id": prep.UploadID}, &complete); err != nil {
+	if err := c.request(ctx, http.MethodPost, basePath+"/files", map[string]any{"upload_id": prep.UploadID}, &complete); err != nil {
 		return SentMessage{}, err
 	}
 	if complete.FileInfo == "" {

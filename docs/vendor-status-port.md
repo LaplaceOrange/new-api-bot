@@ -32,6 +32,7 @@
 | 查询阶段进度、10 秒停留刷新、撤回旧消息 | E12：`bot/vendor_progress.go`、`worker/statusmonitor/main.py` | 新步骤立即按序发送、重复阶段去重、心跳计时重置、上传期间刷新、群进度清理 |
 | 查询错误即时反馈与脱敏 | E12：`vendorstatus/redact.go`、`vendor_progress.go` | 来源/翻译部分失败不中断总览；致命错误、超时和上传失败回复；配置变更前后密钥均脱敏 |
 | 管理员三档进度模式 | E15：`config.go::ProgressMode`、`bot/vendor_progress_mode_test.go` | detailed/simple/off、配置校验、持久化重开、权限、重置、实际查询入口应用；off 成功时仅发图，所有模式保留错误提示 |
+| QQ 官方一基分片上传 | E16：`qq/client.go::sendFile`、`qq/file_upload_test.go` | 按 `(index-1)*block_size` 切片；单片/多片/乱序、群聊/C2C、MD5/尾片字节、数字/字符串索引、异常响应提前拒绝 |
 | 双语/中文/英文、五种主题 | E5：`renderer.py` | `test_renderer.py`、五主题实际 PNG 渲染 |
 | 本地 SVG、中文字体、秒级时区 | E5：`renderer.py`、Docker Noto CJK | SVG、厂商图标、时区、长正文布局测试 |
 | AI 翻译批次、缓存、失败降级 | E6：`translation.py`、`worker.py::ChatProvider` | 缓存、模型选择、指纹隔离、专用凭据测试 |
@@ -91,6 +92,22 @@ go build ./...
 该目录是本地任务证据，不进入 Docker 镜像；可按上述命令独立复现。
 
 ## 待验证 / 运维 Backlog
+
+### QQ 分片编号协议修复
+
+- E16：依据腾讯官方 `qqbot-nodejs` 提交 `ca55d9c395b582b7fcfad0ec27209c35dd04e0b3`
+  中 `src/protocol/api/media-chunked.ts` 第 159–175 行，分片编号从 1 开始；
+  偏移是 `(part.index - 1) * block_size`。此前客户端错误地按 0 起算，
+  对小于分片大小的总览 PNG，第一片 `index=1` 就会被误判越界。
+- 已用官方结构的单片和多片 Mock 复现同一报错并验证修复；
+  QQ 包 race 连续 20 轮、全量 Go race、vet 和 build 均通过。
+  本地证据：`.codex/qq-upload-evidence/`。
+- 同时匹配官方 SDK 的数字型 `file_size/block_size` 请求与仅带 `upload_id`
+  的合并请求；保留分片完成通知的官方原始编号、每片实际长度和 MD5。
+- 上传之前检查整组分片，拒绝重复/越界/缺失编号、无效长度和地址，
+  但不会因拒绝逻辑修改有效的 1 基索引。
+- 未执行真实 QQ 上传；需部署后复测。上传错误按当前流程取消查询并清理进度；
+  暂无单独取消手动查询的命令，关闭翻译只影响新查询。
 
 ### 查询进度本地验证
 
