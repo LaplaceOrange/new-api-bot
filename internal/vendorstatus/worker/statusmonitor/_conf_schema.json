@@ -1,0 +1,266 @@
+{
+  "enabled": {
+    "description": "启用自动状态监控",
+    "type": "bool",
+    "default": true
+  },
+  "platform_type": {
+    "description": "推送平台类型",
+    "type": "string",
+    "options": [
+      "aiocqhttp",
+      "qq_official"
+    ],
+    "labels": [
+      "OneBot (aiocqhttp)",
+      "QQ 官方机器人 (WebSocket)"
+    ],
+    "default": "aiocqhttp",
+    "hint": "选择用于主动推送告警的平台适配器类型。qq_official 使用 WebSocket 接口，群 ID 为 group_openid。"
+  },
+  "platform_id": {
+    "description": "平台实例 ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空时自动选择对应类型下唯一的活跃实例。"
+  },
+  "group_whitelist": {
+    "description": "接收主动告警的目标白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "支持三种格式：纯数字群号（aiocqhttp）、group_openid（qq_official）、完整 UMO（如 platform_id:GroupMessage:session_id，任意平台）。列表为空时不会主动发送任何消息。"
+  },
+  "poll_interval_seconds": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "最低为 60 秒，低于 60 的值会自动按 60 秒处理。"
+  },
+  "notify_maintenance": {
+    "description": "将计划维护也视为异常并推送",
+    "type": "bool",
+    "default": false
+  },
+  "history_lookback_hours": {
+    "description": "已恢复事件补报窗口（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "范围 0–168，0 关闭补报；首次采集只建立历史基线。"
+  },
+  "notify_source_failures": {
+    "description": "通知状态源采集异常及恢复",
+    "type": "bool",
+    "default": true
+  },
+  "source_failure_threshold": {
+    "description": "连续采集异常通知阈值",
+    "type": "int",
+    "default": 3
+  },
+  "source_failure_cooldown_seconds": {
+    "description": "采集异常提醒间隔（秒）",
+    "type": "int",
+    "default": 3600,
+    "hint": "同一来源按接收目标限频；只有发送成功才计入间隔。"
+  },
+  "notify_existing_on_first_startup": {
+    "description": "首次启动时推送已有异常",
+    "type": "bool",
+    "default": true,
+    "hint": "开启时首次成功查询会立即推送厂商当前已有的异常；关闭时将其记录为初始基线，不发送存量异常，后续更新和恢复仍会通知。"
+  },
+  "display_language": {
+    "description": "状态图片显示语言",
+    "type": "string",
+    "options": [
+      "bilingual",
+      "zh-CN",
+      "en-US"
+    ],
+    "labels": [
+      "中英双语",
+      "简体中文",
+      "English"
+    ],
+    "default": "bilingual",
+    "hint": "双语模式优先显示中文译文，并在下方保留官方英文原文。"
+  },
+  "card_theme": {
+    "description": "状态图片主题",
+    "type": "string",
+    "options": [
+      "paper",
+      "midnight",
+      "porcelain",
+      "terminal",
+      "liquid_glass"
+    ],
+    "labels": [
+      "纸质公报",
+      "午夜蓝图",
+      "青瓷云笺",
+      "荧光终端",
+      "液态玻璃"
+    ],
+    "default": "paper",
+    "hint": "同时应用于厂商异常告警卡和 /厂商状态 总览图。"
+  },
+  "timezone": {
+    "description": "状态图片时间时区",
+    "type": "string",
+    "default": "",
+    "hint": "控制总览图和告警卡内所有时间。填写 IANA 时区名称，例如 Asia/Shanghai；留空时跟随 AstrBot 全局“时区”设置，两处都为空时使用系统本地时区。"
+  },
+  "enable_ai_translation": {
+    "description": "使用对话模型翻译官方英文内容",
+    "type": "bool",
+    "default": true,
+    "hint": "译文会持久化缓存；模型不可用时自动显示英文原文，不会阻断告警。"
+  },
+  "translation_provider_id": {
+    "description": "翻译模型（可选）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空使用 AstrBot 默认对话模型；仅在希望翻译使用单独模型时选择。"
+  },
+  "sources": {
+    "description": "内置状态来源",
+    "type": "object",
+    "items": {
+      "openai": {
+        "description": "OpenAI",
+        "type": "bool",
+        "default": true
+      },
+      "openrouter": {
+        "description": "OpenRouter",
+        "type": "bool",
+        "default": true
+      },
+      "claude": {
+        "description": "Claude / Anthropic",
+        "type": "bool",
+        "default": true
+      },
+      "gemini_developer": {
+        "description": "Gemini Developer API / Google AI Studio（独立来源）",
+        "type": "bool",
+        "default": true
+      },
+      "google_vertex_gemini": {
+        "description": "Google Vertex AI / Gemini",
+        "type": "bool",
+        "default": true
+      },
+      "groq": {
+        "description": "Groq",
+        "type": "bool",
+        "default": true
+      },
+      "cohere": {
+        "description": "Cohere",
+        "type": "bool",
+        "default": true
+      },
+      "moonshot": {
+        "description": "Moonshot AI / Kimi",
+        "type": "bool",
+        "default": true
+      },
+      "minimax": {
+        "description": "MiniMax",
+        "type": "bool",
+        "default": true
+      },
+      "fireworks": {
+        "description": "Fireworks AI",
+        "type": "bool",
+        "default": true
+      },
+      "novita": {
+        "description": "Novita AI",
+        "type": "bool",
+        "default": true
+      },
+      "xai": {
+        "description": "xAI",
+        "type": "bool",
+        "default": true
+      },
+      "deepseek": {
+        "description": "DeepSeek",
+        "type": "bool",
+        "default": true
+      },
+      "cursor": {
+        "description": "Cursor",
+        "type": "bool",
+        "default": true
+      },
+      "cerebras": {
+        "description": "Cerebras",
+        "type": "bool",
+        "default": true
+      },
+      "aws": {
+        "description": "Amazon Web Services",
+        "type": "bool",
+        "default": true
+      },
+      "azure": {
+        "description": "Microsoft Azure",
+        "type": "bool",
+        "default": true
+      },
+      "github": {
+        "description": "GitHub",
+        "type": "bool",
+        "default": true
+      },
+      "vercel": {
+        "description": "Vercel",
+        "type": "bool",
+        "default": true
+      },
+      "cloudflare": {
+        "description": "Cloudflare",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "custom_statuspage_sources": {
+    "description": "自定义 Statuspage JSON 状态源",
+    "type": "template_list",
+    "default": [],
+    "templates": {
+      "statuspage": {
+        "name": "Statuspage 状态页",
+        "hint": "兼容 /api/v2/summary.json 和 /api/v2/incidents.json 的状态页。",
+        "display_item": "name",
+        "items": {
+          "name": {
+            "description": "厂商名称",
+            "type": "string",
+            "default": ""
+          },
+          "base_url": {
+            "description": "状态页根地址",
+            "type": "string",
+            "default": "",
+            "hint": "例如 https://status.example.com，不要填写 /api/v2 路径。"
+          },
+          "enabled": {
+            "description": "启用该来源",
+            "type": "bool",
+            "default": true
+          }
+        }
+      }
+    }
+  }
+}

@@ -27,6 +27,7 @@ import (
 	"github.com/fsykk/new-api-bot/internal/resetradar"
 	"github.com/fsykk/new-api-bot/internal/secure"
 	"github.com/fsykk/new-api-bot/internal/store"
+	"github.com/fsykk/new-api-bot/internal/vendorstatus"
 )
 
 type NewAPI interface {
@@ -120,6 +121,12 @@ type Service struct {
 	now                     func() time.Time
 	randomCheckinMultiplier func() (int64, error)
 	randomCheckinMaxCredit  func() (int64, error)
+	vendorRunner            vendorstatus.Runner
+	vendorSemaphore         chan struct{}
+	vendorConfigMu          sync.Mutex
+	vendorConfigWake        chan struct{}
+	vendorPollMu            sync.Mutex
+	vendorPollCancel        context.CancelFunc
 }
 
 func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI, qqAPI QQAPI, sender mailer.Sender, logger *slog.Logger) *Service {
@@ -136,6 +143,9 @@ func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI
 	if cfg.ResetEnabled {
 		service.resetRadar = resetradar.NewScanner(cfg.ResetHTTPTimeout, cfg.ResetSignalMaxAge)
 	}
+	service.vendorRunner = vendorstatus.PythonRunner{}
+	service.vendorSemaphore = make(chan struct{}, 1)
+	service.vendorConfigWake = make(chan struct{}, 1)
 	return service
 }
 
@@ -170,6 +180,13 @@ func (s *Service) Start(ctx context.Context) {
 			s.runQuotaNotifier(ctx)
 		}()
 	}
+	// Keep a dormant scheduler even when monitoring is disabled, so an
+	// administrator can enable it at runtime without restarting the service.
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		s.runVendorStatusWorker(ctx)
+	}()
 	s.workers.Add(1)
 	go func() {
 		defer s.workers.Done()
@@ -409,7 +426,11 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		return
 	}
 	// 兼容用户按帮助文本输入 <参数> 且未额外添加空格的情况。
-	content = strings.TrimSpace(strings.NewReplacer("<", " ", ">", " ").Replace(content))
+	rawFields := strings.Fields(content)
+	rawCommand := strings.ToLower(rawFields[0])
+	if rawCommand != "/vendor_config" {
+		content = strings.TrimSpace(strings.NewReplacer("<", " ", ">", " ").Replace(content))
+	}
 	fields := strings.Fields(content)
 	if len(fields) == 0 {
 		return
@@ -456,6 +477,12 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		}
 	case "/bind":
 		err = s.handleBind(ctx, event, canonical, fields)
+	case "/vendor_status":
+		err = s.handleVendorStatus(ctx, event, fields)
+	case "/vendor_subscribe":
+		err = s.handleVendorSubscription(ctx, event, identity, fields)
+	case "/vendor_config":
+		err = s.handleVendorConfig(ctx, event, identity, content)
 	case "/hongbao":
 		err = s.handleHongbao(ctx, event, canonical, identity, fields)
 	case "/reset":
@@ -1596,11 +1623,13 @@ func readOnlyAdminWriteCommand(command string, fields []string) bool {
 		arg = strings.ToLower(strings.TrimSpace(fields[1]))
 	}
 	switch command {
+	case "/vendor_config":
+		return vendorConfigWriteCommand(fields)
 	case "/enable", "/disable":
 		return arg != "list"
 	case "/bind":
 		return arg != "status"
-	case "/unbind", "/checkin", "/notify", "/welcome", "/benefit", "/hongbao", "/recall":
+	case "/unbind", "/checkin", "/notify", "/welcome", "/benefit", "/hongbao", "/recall", "/vendor_subscribe":
 		if command == "/notify" && arg == "status" {
 			return false
 		}
@@ -1968,6 +1997,9 @@ func helpText(cfg config.Config) string {
 		"管理员：/join on|off|status、/join limit <QQ等级>、/join check \"<匹配字符串>\" - 配置入群自动审批",
 		"管理员：/mute <@成员> <时长>、/mute off <@成员>、/mute status",
 		"/bot status - 查看机器人与群聊状态",
+		"/vendor_status - 查询全部启用厂商的最新状态总览，无需绑定",
+		"管理员：/vendor_subscribe on|off - 持久化开启或关闭本群厂商告警，无需绑定",
+		"管理员：/vendor_config - 查看、修改、重置全部厂商监控配置；/vendor_config help 查看完整选项",
 	}
 	if cfg.UsageChartEnabled {
 		lines = append(lines, "/usage chart <时间长度> [@用户|用户ID|all] - 生成用量图表；指定用户仅管理员可用，all 汇总本群已绑定成员")

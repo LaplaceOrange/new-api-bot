@@ -58,6 +58,7 @@ var buckets = [][]byte{
 	[]byte("hongbao"),
 	[]byte("command_rules"),
 	[]byte("runtime_settings"),
+	[]byte("vendor_status"),
 	[]byte("reset_settings"),
 	[]byte("reset_signals"),
 	[]byte("reset_signal_deliveries"),

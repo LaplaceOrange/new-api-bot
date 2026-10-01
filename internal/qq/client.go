@@ -304,12 +304,20 @@ func (c *Client) SetGroupMemberMute(ctx context.Context, group, member, operatio
 }
 
 func (c *Client) SendGroupFile(ctx context.Context, group, replyTo, fileName string, fileType int, data []byte) (SentMessage, error) {
+	return c.sendFile(ctx, "/v2/groups/"+url.PathEscape(group), replyTo, fileName, fileType, data)
+}
+
+func (c *Client) SendC2CFile(ctx context.Context, user, replyTo, fileName string, fileType int, data []byte) (SentMessage, error) {
+	return c.sendFile(ctx, "/v2/users/"+url.PathEscape(user), replyTo, fileName, fileType, data)
+}
+
+func (c *Client) sendFile(ctx context.Context, basePath, replyTo, fileName string, fileType int, data []byte) (SentMessage, error) {
 	if len(data) == 0 {
 		return SentMessage{}, errors.New("上传文件内容为空")
 	}
 	md5sum := md5.Sum(data)
 	sha1sum := sha1.Sum(data)
-	md5Ten := md5.Sum(data[:min(len(data), 10<<20)])
+	md5Ten := md5.Sum(data[:min(len(data), 10002432)])
 	body := map[string]any{"file_type": fileType, "file_size": strconv.Itoa(len(data)), "file_name": fileName, "md5": fmt.Sprintf("%x", md5sum), "sha1": fmt.Sprintf("%x", sha1sum), "md5_10m": fmt.Sprintf("%x", md5Ten)}
 	var prep struct {
 		UploadID string `json:"upload_id"`
@@ -321,26 +329,31 @@ func (c *Client) SendGroupFile(ctx context.Context, group, replyTo, fileName str
 			BlockSize    flexInt `json:"block_size"`
 		} `json:"parts"`
 	}
-	if err := c.request(ctx, http.MethodPost, "/v2/groups/"+url.PathEscape(group)+"/upload_prepare", body, &prep); err != nil {
+	if err := c.request(ctx, http.MethodPost, basePath+"/upload_prepare", body, &prep); err != nil {
 		return SentMessage{}, err
 	}
 	blockSize := int(prep.BlockSize)
-	if blockSize <= 0 {
+	if blockSize <= 0 || prep.UploadID == "" {
 		return SentMessage{}, errors.New("QQ 上传分片大小无效")
 	}
+	// Official indexes are zero-based. Reject malformed/duplicate indexes
+	// instead of silently uploading the wrong portion of the image.
+	seen := make(map[int]bool)
 	for _, part := range prep.Parts {
-		start := part.Index * blockSize
-		if start >= len(data) && part.Index > 0 {
-			start = (part.Index - 1) * blockSize
-		}
-		if start < 0 || start >= len(data) {
+		if part.Index < 0 || part.Index > (len(data)-1)/blockSize || seen[part.Index] {
 			return SentMessage{}, errors.New("QQ 上传分片索引无效")
 		}
+		seen[part.Index] = true
+		start := part.Index * blockSize
 		size := int(part.BlockSize)
 		if size <= 0 {
 			size = blockSize
 		}
-		end := min(start+size, len(data))
+		expectedSize := min(blockSize, len(data)-start)
+		if size != blockSize && size != expectedSize {
+			return SentMessage{}, errors.New("QQ 上传分片大小不匹配")
+		}
+		end := start + min(size, len(data)-start)
 		chunk := data[start:end]
 		req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.PresignedURL, bytes.NewReader(chunk))
 		if err != nil {
@@ -356,15 +369,18 @@ func (c *Client) SendGroupFile(ctx context.Context, group, replyTo, fileName str
 			return SentMessage{}, fmt.Errorf("QQ 文件分片上传失败（HTTP %d）", resp.StatusCode)
 		}
 		finish := map[string]any{"upload_id": prep.UploadID, "part_index": part.Index, "block_size": strconv.Itoa(len(chunk)), "md5": fmt.Sprintf("%x", md5.Sum(chunk))}
-		if err := c.request(ctx, http.MethodPost, "/v2/groups/"+url.PathEscape(group)+"/upload_part_finish", finish, nil); err != nil {
+		if err := c.request(ctx, http.MethodPost, basePath+"/upload_part_finish", finish, nil); err != nil {
 			return SentMessage{}, err
 		}
 	}
 	var complete struct {
 		FileInfo string `json:"file_info"`
 	}
-	if err := c.request(ctx, http.MethodPost, "/v2/groups/"+url.PathEscape(group)+"/files", map[string]any{"file_type": fileType, "srv_send_msg": false, "file_name": fileName, "upload_id": prep.UploadID}, &complete); err != nil {
+	if err := c.request(ctx, http.MethodPost, basePath+"/files", map[string]any{"file_type": fileType, "srv_send_msg": false, "file_name": fileName, "upload_id": prep.UploadID}, &complete); err != nil {
 		return SentMessage{}, err
+	}
+	if complete.FileInfo == "" {
+		return SentMessage{}, errors.New("QQ 文件合并响应缺少 file_info")
 	}
 	msg := map[string]any{"msg_type": 7, "media": map[string]any{"file_info": complete.FileInfo}}
 	if replyTo != "" {
@@ -372,7 +388,10 @@ func (c *Client) SendGroupFile(ctx context.Context, group, replyTo, fileName str
 		msg["msg_seq"] = 1
 	}
 	var sent SentMessage
-	err := c.request(ctx, http.MethodPost, "/v2/groups/"+url.PathEscape(group)+"/messages", msg, &sent)
+	err := c.request(ctx, http.MethodPost, basePath+"/messages", msg, &sent)
+	if err == nil && sent.ID == "" {
+		return SentMessage{}, errors.New("QQ 图片发送响应缺少消息 ID")
+	}
 	return sent, err
 }
 

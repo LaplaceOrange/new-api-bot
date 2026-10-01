@@ -1,0 +1,4 @@
+aiohttp>=3.11,<4
+Pillow>=10.4,<13
+curl_cffi>=0.13,<0.15
+tzdata>=2024.2

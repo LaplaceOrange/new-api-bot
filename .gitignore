@@ -10,3 +10,8 @@
 coverage.out
 # 忽略 Windows 可执行文件。
 *.exe
+# Python 状态核心的本地环境和测试缓存。
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/

@@ -20,6 +20,7 @@
 - 支持 QQ 2026-08-10 新增的入群申请事件与审批接口；可按群开启 New API 邮箱/用户 ID 自动核验。
 - 支持 QQ 官方群成员禁言状态查询、定时禁言和解除禁言接口。
 - 低资源监测 Codex 重置信号，并按群发起可恢复的用量补偿抽奖。
+- 完整接入全球厂商状态监控：20 个官方状态源、自定义 Statuspage、历史补报、按群重试、采集健康通知、五主题 PNG 和可缓存的 AI 双语翻译。
 - bbolt 单文件持久化、AES-256-GCM 敏感数据加密、JSON 结构化日志。
 - `/healthz` 和 `/readyz` 健康检查。
 
@@ -54,6 +55,13 @@
 | `/notify status` | 已绑定用户 | 查看自己的额度提醒状态 |
 | `/bot status` | 已绑定用户 | 诊断 Gateway、QQ Token、New API 及当前群状态 |
 | `/whoami` | 任意 | 查看可写入管理员名单的 OpenID |
+| `/vendor_status` | 任意群聊/单聊 | 立即查询全部启用厂商并发送最新状态总览 PNG，无需绑定 |
+| `/vendor_subscribe on` | 管理员群聊 | 持久化开启当前群的厂商异常、更新、恢复及采集健康通知，无需绑定 |
+| `/vendor_subscribe off` | 管理员群聊 | 持久化关闭当前群的厂商自动推送，无需绑定 |
+| `/vendor_config` | 管理员 | 查看当前有效厂商配置，密钥不回显，无需绑定 |
+| `/vendor_config <key> <value>` | 管理员 | 持久化修改任一适用配置并热加载；只读管理员不能修改 |
+| `/vendor_config help` | 管理员 | 查看全部配置键、参数和自定义源管理用法 |
+| `/vendor_config reset <key\|all>` | 管理员 | 清除命令覆盖，恢复部署默认；不会清除事故送达状态 |
 | `/help` | 任意 | 查看指令说明 |
 | `/enable list`、`/disable list` | 任意 | 查看明确启用或禁用的命令关键词 |
 | `/enable "<关键词>"` | 管理员 | 恢复包含指定关键词的命令 |
@@ -97,7 +105,7 @@
 | `/reset set lookback <时长>` | 管理员 | 设置获奖者在活动开始前的用量补偿回溯时间，默认 `24h` |
 | `/reset proxy <代理链接或off>` | 管理员 | 设置仅用于访问 Codex Reset timeline API 的 HTTP/SOCKS5 代理，凭据加密保存 |
 
-除 `/help`、`/whoami`、`/bind`、`/reset check`、`/reset last`、`/enable list`、`/disable list` 以及管理员的 `/enable`、`/disable`、`/checkin reset`、`/hongbao new`、`/hongbao stop` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
+除 `/help`、`/whoami`、`/bind`、`/vendor_status`、`/reset check`、`/reset last`、`/enable list`、`/disable list` 以及管理员的 `/vendor_config`、`/vendor_subscribe`、`/enable`、`/disable`、`/checkin reset`、`/hongbao new`、`/hongbao stop` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
 
 ### 额度红包
 
@@ -116,6 +124,147 @@
 所有以“用户ID”为目标的管理指令均可在群聊中使用 `@群成员` 代替数字 New API 用户 ID；机器人会读取该群成员已经建立的绑定。`/bind <邮箱或用户ID>` 是例外，只接受邮箱或数字 New API 用户 ID，不能使用 `@群成员`。
 
 用量时间长度支持 `30m`、`24h`、`7d`、`4w`、`today`、`week` 和 `month` 等格式，最长查询 31 天。`/usage 7d all` 只返回最近 7 天的全站汇总；`/usage 7d 10` 返回按消耗额度从高到低排列的前 10 名用户。排行榜数量范围为 1 到 100，`10`、`top10`、`前10名` 三种写法均可。全站汇总和排行榜对所有已绑定用户开放。
+
+## 全球厂商状态监控
+
+移植自 `Futureppo/astrbot_plugin_global_status` **1.2.2**，固定源提交
+`38822b2e35ad60a12392a7b12d211e748ed76e34`。Go 服务负责 QQ 命令、权限、
+生命周期和 bbolt；Python 核心负责官方来源解析、事件协调、翻译和图片渲染。
+Python 源码和 SVG 图标已嵌入 Go 二进制，**不需要安装 AstrBot 或另行下载插件**。
+
+### 启用与部署
+
+Docker 镜像已包含 Python 3.12、Pillow、aiohttp、curl_cffi、时区数据和 Noto CJK
+中文字体，重新构建镜像即可。运行本机 Go 二进制时需要 Python **3.11+**：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r internal/vendorstatus/requirements.txt
+# .env 中填入这个解释器的绝对路径：
+# VENDOR_STATUS_PYTHON=D:\code\Github\new-api-bot\.venv\Scripts\python.exe
+```
+
+Linux：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r internal/vendorstatus/requirements.txt
+# VENDOR_STATUS_PYTHON 填写 .venv/bin/python 的绝对路径。
+# 系统还需安装中文字体，例如 Debian 的 fonts-noto-cjk。
+```
+
+默认每 **5 分钟**轮询，自动监控开启，但初始群白名单为空，不主动向任何群发送。
+管理员在目标群执行 `/vendor_subscribe on` 即可订阅；查询使用 `/vendor_status`，
+无需绑定 New API 账户，群聊和单聊均支持。
+订阅参数仅接受 `on` / `off`，不接受中文参数；只读管理员不能修改订阅。
+所有命令继续遵循 `/enable`、`/disable` 关键词控制。
+
+也可配置 `VENDOR_STATUS_GROUP_WHITELIST=GROUP_OPENID_1,GROUP_OPENID_2`。
+命令开启/关闭的覆盖设置与状态、逐目标送达记录、翻译缓存一起存入原有 bbolt，
+**关闭环境白名单中的群后，重启不会重新订阅**。订阅变更会在每次实际投递前再次检查。
+`VENDOR_STATUS_ENABLED=false` 仅关闭后台监控，查询仍可用，订阅仍可保存。
+
+### 用命令配置全部选项
+
+管理员可直接在群聊/单聊中使用 `/vendor_config`，无需修改 `.env`：
+
+```text
+/vendor_config help
+/vendor_config show
+/vendor_config card_theme liquid_glass
+/vendor_config display_language zh-CN
+/vendor_config poll_interval_seconds 5m
+/vendor_config notify_maintenance on
+/vendor_config history_lookback_hours 48
+/vendor_config sources.openai off
+/vendor_config custom add "我的状态页" https://status.example.com
+/vendor_config custom set "我的状态页" enabled off
+/vendor_config enabled off
+/vendor_config enabled on
+/vendor_config reset card_theme
+```
+
+**配置全局生效**，不是仅对执行命令的群生效。每个键都支持
+`/vendor_config <key>` 查询和 `/vendor_config <key> <value>` 修改；布尔值可用
+`true/false`、`on/off`、`1/0`。含空格的名称或路径使用引号，`""` 表示空值。
+秒数配置支持整数秒或 Go duration（例如 `300`、`5m`）。
+厂商功能仅支持英文命令、子命令、配置键和枚举值，不保留中文别名。
+回复说明及自定义源名称等自由文本仍可使用中文；图片语言依旧可设为 `zh-CN`。
+
+命令覆盖保存到原 bbolt 数据库，优先级为 **命令覆盖 > 环境变量 > JSON > 内置默认**。
+设置后新查询采用新配置，后台正在进行的轮询会取消并按新配置重新调度；
+`enabled` 支持即时启停，即使启动时设为 `false` 也可用命令开启，无需重启。
+已进行的查询沿用原快照，已发出的通知不会因关闭配置被撤回。
+只读管理员可以查询和查看帮助，不能修改或重置。
+
+`/vendor_config reset <key>` 清除指定覆盖，恢复本次启动加载的部署配置；
+`reset all` 清除所有命令设置和群订阅覆盖，但不清除事故、送达或翻译缓存。
+整体替换/清空 `group_whitelist` 会同时清除旧的单群订阅覆盖，确保实际目标与列表一致。
+
+全部原配置、20 个来源开关、自定义字段及新增运行参数的逐项命令表见
+**`docs/vendor-status-config-commands.md`**。其中 `platform_type` 和 `platform_id`
+对应固定 QQ 官方平台与当前 AppID，只支持查询；不能用状态插件命令切换宿主身份。
+原 `translation_provider_id` 命令键映射到本项目的翻译模型名称。
+
+### 状态源、主题和高级配置
+
+保留全部 20 个来源：OpenAI、OpenRouter、Claude/Anthropic、Google Vertex AI/Gemini、
+Gemini Developer API/AI Studio、Groq、Cohere、Moonshot/Kimi、MiniMax、Fireworks、
+Novita、xAI、DeepSeek、Cursor、Cerebras、AWS、Azure、GitHub、Vercel、Cloudflare。
+支持 Statuspage、Google Cloud、AI Studio、FlashDuty、Better Stack、Datadog 和 RSS/Atom。
+
+复制 `vendor-status.example.json` 到 `data/vendor-status.json`，设置
+`VENDOR_STATUS_CONFIG_PATH=/data/vendor-status.json`（Docker）或本机绝对路径。
+可在 `sources` 中单独停用来源，并添加自定义 Statuspage：
+
+```json
+{
+  "sources": {"openai": false},
+  "custom_statuspage_sources": [
+    {"name": "我的服务", "base_url": "https://status.example.com", "enabled": true}
+  ]
+}
+```
+
+JSON 在默认配置上增量覆盖；已明确设置的 `VENDOR_STATUS_*` 环境变量优先于 JSON，
+数据库中的命令覆盖优先于两者。
+若需用 JSON 控制语言、主题等设置，应从 `.env` 移除对应环境变量行。
+沿用上游配置字段名；旧 JSON 的 `platform_type`、`platform_id`、`translation_provider_id`
+不参与部署配置。命令可查询固定平台信息、用 `translation_provider_id` 设置翻译模型；
+本项目 JSON 的模型配置使用 `translation.model`。
+当前项目只有 QQ 官方平台，白名单必须为 `group_openid`，不接受 AstrBot UMO。
+
+- 图片主题：`paper`（纸质公报）、`midnight`（午夜蓝图）、`porcelain`（青瓷云笺）、
+  `terminal`（荧光终端）、`liquid_glass`（液态玻璃）。
+- 显示语言：`bilingual`、`zh-CN`、`en-US`；图片时间精确到秒并标注 UTC 偏移。
+- 翻译：单独配置 `VENDOR_STATUS_TRANSLATION_BASE_URL`（包含 `/v1`）、
+  `VENDOR_STATUS_TRANSLATION_API_KEY` 和 `VENDOR_STATUS_TRANSLATION_MODEL`。
+  不使用管理令牌调用模型；翻译失败或未配置模型时继续显示原文，缓存最多 2000 条，
+  翻译变化不会触发新告警。命令设置的模型密钥使用 `BOT_DATA_KEY` 加密保存，
+  不混入事故状态或翻译缓存；配置查询、成功回复和审计都不回显密钥。
+  `translation.api_key` 仅允许管理员在机器人单聊中设置。
+- 代理：公开状态请求沿用 `HTTP_PROXY` / `HTTPS_PROXY` 环境配置；不使用仅属于
+  Codex Reset 检测的 `/reset proxy` 设置。
+- 字体：可通过 `VENDOR_STATUS_FONT_PATH` 指定中文字体绝对路径；默认自动寻找
+  微软雅黑、Noto CJK 或苹方。Docker 已包含中文字体。
+
+### 通知和可靠性
+
+保留首次存量告警选项、维护开关、去重、官方内容更新通知、明确恢复通知、
+0–168 小时历史补报、连续采集异常阈值和逐目标冷却。
+事件从 Feed 消失不视为恢复；结构异常或部分请求失败不会误报正常。
+查询不会改变自动告警去重和送达状态。
+
+每图最多 **5 条**，每轮每源/目标最多 **20 条**；未发送部分在后续轮次继续。
+发送前等待 Go 将基线提交到 bbolt，每批成功后立即提交送达记录；失败群单独重试。
+每次 QQ 投递最多等待 **30 秒**；整个 worker 默认 **10 分钟**，停机时取消后台 worker。
+QQ 已接收消息但响应超时、或发送成功后检查点写入前进程崩溃，仍可能重复一次。
+损坏的送达状态不会被静默丢弃并重新群发，而是让该轮失败并记录错误。
+主动消息仍受 QQ 官方 API 权限、配额和群主动消息设置限制。
+
+完整功能覆盖、验证命令和未验证项见 `docs/vendor-status-port.md`；
+配置命令逐项映射见 `docs/vendor-status-config-commands.md`；上游出处和
+图标许可见 `internal/vendorstatus/THIRD_PARTY.md`。
 
 ## 准备 QQ 机器人
 
@@ -392,6 +541,20 @@ go test -race ./...
 go build ./...
 ```
 
+厂商状态核心及嵌入式 worker 端到端测试（仅访问本地 Mock，不向 QQ 发消息）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r internal/vendorstatus/requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest internal/vendorstatus/worker -q
+$env:VENDOR_STATUS_TEST_PYTHON = (Resolve-Path .\.venv\Scripts\python.exe).Path
+go test ./...
+```
+
+Linux 使用 `.venv/bin/python`；设置
+`VENDOR_STATUS_TEST_PYTHON="$(pwd)/.venv/bin/python"` 后运行 Go 测试。
+未配置测试解释器时仅跳过跨进程 Python 集成测试，协议、存储、命令等 Go 测试仍运行。
+Python 在线状态接口测试默认跳过，显式设置 `GLOBAL_STATUS_LIVE=1` 才访问厂商官方端点。
+
 只读检查公开测试实例：
 
 ```bash
@@ -411,6 +574,12 @@ GOMAXPROCS=2
 ```
 
 服务使用两个命令工作协程、长度 64 的有界内存队列、最多四个每主机 HTTP 连接，并将用量图表生成限制为单任务执行；第二个图表请求会立即返回忙碌提示，不占用另一个 worker 等待。非 `/` 消息在进入队列和 bbolt 去重前直接忽略，超过 4096 字节的指令只保留必要元数据并回复长度错误。QQ HTTP/WebSocket 响应限制为 1 MiB，New API 响应限制为 8 MiB，并使用流式受限解码降低峰值内存。
+
+全球厂商状态任务共用一个可取消的单任务槽位。Python worker 仅在查询/轮询时启动，
+完成即退出，不常驻等待；但图片渲染会增加瞬时内存，**`GOMEMLIMIT` 只约束 Go，
+不包含 Python 子进程**。需要保持原有纯 Go 运行资源占用时，可关闭
+`VENDOR_STATUS_ENABLED`，并避免执行厂商状态查询；新 Docker 镜像因包含 Python 和
+中文字体而比原 distroless 镜像大。
 
 Gateway 序号最多每秒持久化一次，并在断线时强制保存；健康连接建立后会重置重连退避。待处理事件会使用 `BOT_DATA_KEY` 加密，并与去重状态在同一个 bbolt 事务中写入持久化收件箱；内存队列满时事件仍可落盘并由后台调度，进程异常退出后也会恢复处理。持久化待处理事件固定上限为 512 条；达到上限时 Gateway 才会退避重连，避免无界占用磁盘或内存。
 

@@ -21,8 +21,19 @@ COPY . .
 # 构建不依赖 CGO 的精简 Linux 可执行文件。
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/new-api-bot ./cmd/bot
 
-# 使用仅包含 CA 证书的精简运行时镜像。
-FROM gcr.io/distroless/static-debian12:latest
+# 状态采集/五主题渲染核心需要 Python；Go 主服务仍为静态二进制。
+FROM python:3.12-slim-bookworm
+
+# 中文字体和时区内置，不在运行时下载图片、图标或字体。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates fonts-noto-cjk tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY internal/vendorstatus/requirements.txt /tmp/vendor-status-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/vendor-status-requirements.txt \
+    && rm /tmp/vendor-status-requirements.txt
+
+ENV PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1 VENDOR_STATUS_PYTHON=python
 
 # 设置容器工作目录。
 WORKDIR /app

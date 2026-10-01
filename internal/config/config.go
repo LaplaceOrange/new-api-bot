@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/fsykk/new-api-bot/internal/vendorstatus"
 )
 
 type Config struct {
@@ -70,6 +72,7 @@ type Config struct {
 	ResetDefaultDuration       time.Duration
 	ResetDefaultWinners        int
 	ResetDefaultLookback       time.Duration
+	VendorStatus               vendorstatus.Config
 }
 
 func Load() (Config, error) {
@@ -229,6 +232,10 @@ func Load() (Config, error) {
 		loc = time.UTC
 	}
 	c.CheckinTimezone = loc
+	c.VendorStatus, err = loadVendorStatusConfig(c.CheckinTimezoneName)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("厂商状态配置无效: %w", err))
+	}
 
 	level, err := parseLogLevel(envString("LOG_LEVEL", "info"))
 	if err != nil {

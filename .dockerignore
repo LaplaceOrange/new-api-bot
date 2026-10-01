@@ -12,3 +12,11 @@ bin
 .idea
 # 排除 Visual Studio Code 配置。
 .vscode
+# 排除本地 Python 虚拟环境、测试缓存、任务记录和临时文件。
+.codex
+.gotmp
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+work
