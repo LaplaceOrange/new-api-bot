@@ -164,6 +164,7 @@ type Hongbao struct {
 	Claims         map[int]HongbaoClaim `json:"claims"`
 	CreatedAt      time.Time            `json:"created_at"`
 	CompletedAt    time.Time            `json:"completed_at,omitempty"`
+	StoppedAt      time.Time            `json:"stopped_at,omitempty"`
 	SummarySent    bool                 `json:"summary_sent"`
 }
 

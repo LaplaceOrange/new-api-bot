@@ -24,7 +24,7 @@ func TestHongbaoNoticesRecallReplyAndCommandAfterThirtySeconds(t *testing.T) {
 	if hongbaoNoticeRecallAfter != 30*time.Second {
 		t.Fatalf("notice recall delay = %s, want 30s", hongbaoNoticeRecallAfter)
 	}
-	for _, mode := range []string{"unauthorized", "readonly", "group-denied", "duplicate-active", "duplicate-completed", "duplicate-pending", "create-success", "claim-success"} {
+	for _, mode := range []string{"unauthorized", "unauthorized-stop", "readonly", "readonly-stop", "group-denied", "duplicate-active", "duplicate-completed", "duplicate-pending", "create-success", "claim-success"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
 			service, storage, api, qqAPI, _ := testService(t)
@@ -38,6 +38,8 @@ func TestHongbaoNoticesRecallReplyAndCommandAfterThirtySeconds(t *testing.T) {
 			wantText := "仅具备完整管理权限"
 			wantSent := 1
 			switch mode {
+			case "unauthorized-stop":
+				event = groupEvent("g", "visitor", "/hongbao stop")
 			case "group-denied":
 				service.cfg.QQAdminOpenIDs["member:g:admin"] = struct{}{}
 				service.process(context.Background(), groupEvent("g", "admin", "/hongbao new 1 1 gpt-cheap gpt-smart"))
@@ -48,10 +50,13 @@ func TestHongbaoNoticesRecallReplyAndCommandAfterThirtySeconds(t *testing.T) {
 				api.user.Group = "default"
 				event = groupEvent("g", "visitor", "/hongbao")
 				wantText = "无权限领取本轮红包"
-			case "readonly":
+			case "readonly", "readonly-stop":
 				service.cfg.QQReadOnlyAdminOpenIDs = map[string]struct{}{"member:g:visitor": {}}
 				service.cfg.CheckinAutoRecallAfter = time.Millisecond
 				wantText = "只读管理员"
+				if mode == "readonly-stop" {
+					event = groupEvent("g", "visitor", "/hongbao stop")
+				}
 			case "duplicate-active", "duplicate-completed", "duplicate-pending", "claim-success":
 				count := "2"
 				if mode == "duplicate-completed" || mode == "claim-success" {

@@ -46,7 +46,7 @@ func (s *Store) ListPendingHongbaoSummaries() ([]model.Hongbao, error) {
 			if err := json.Unmarshal(data, &packet); err != nil {
 				return err
 			}
-			if !packet.CompletedAt.IsZero() && !packet.SummarySent {
+			if !packet.CompletedAt.IsZero() && packet.StoppedAt.IsZero() && !packet.SummarySent {
 				packets = append(packets, packet)
 			}
 			return nil

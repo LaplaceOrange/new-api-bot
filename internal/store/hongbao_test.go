@@ -83,3 +83,37 @@ func TestHongbaoRejectsInvalidState(t *testing.T) {
 		t.Fatal("negative remaining quota accepted")
 	}
 }
+
+func TestHongbaoStoppedPacketPersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stopped.db")
+	storage, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	packet := model.Hongbao{
+		ID: "stopped", GroupOpenID: "g", Actor: "admin", QuotaPerUnit: 500000,
+		TotalQuota: 500000, TotalCount: 2, RemainingQuota: 250000, RemainingCount: 1, GrantedCount: 1,
+		Claims:    map[int]model.HongbaoClaim{42: {CanonicalID: "member:g:alice", RawQuota: 250000, Status: "granted"}},
+		CreatedAt: now, StoppedAt: now.Add(time.Second),
+	}
+	if err := storage.PutHongbao(packet); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	storage, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	got, err := storage.GetHongbao("g")
+	if err != nil || !reflect.DeepEqual(got, packet) {
+		t.Fatalf("stopped packet=%+v err=%v", got, err)
+	}
+	pending, err := storage.ListPendingHongbaoSummaries()
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("stopped packet queued a summary: pending=%v err=%v", pending, err)
+	}
+}

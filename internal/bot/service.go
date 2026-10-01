@@ -419,7 +419,7 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	identity := identityFromEvent(event)
 	if s.isReadOnlyAdmin(identity) && readOnlyAdminWriteCommand(command, fields) {
 		reply := s.reply
-		if command == "/hongbao" && len(fields) > 1 && strings.EqualFold(fields[1], "new") {
+		if command == "/hongbao" && len(fields) > 1 && (strings.EqualFold(fields[1], "new") || strings.EqualFold(fields[1], "stop")) {
 			reply = s.replyHongbaoNotice
 		}
 		if err := reply(ctx, event, "只读管理员仅可执行查询类指令。"); err != nil {
@@ -1948,6 +1948,7 @@ func helpText(cfg config.Config) string {
 		"/checkin status - 查看签到状态",
 		"/hongbao - 领取当前群红包，每个账户每轮限领一次",
 		"管理员：/hongbao new <总额度> <数量> [分组限制 ...] - 发放拼手气额度红包，多个分组以空格分隔",
+		"管理员：/hongbao stop - 停止当前群红包，已发放额度不受影响",
 		"管理员：/checkin reset - 重置当前周期所有用户的签到状态",
 		"/me - 查看账户与额度",
 		"/usage [时间长度] - 查看自己的用量，例如 /usage 7d",

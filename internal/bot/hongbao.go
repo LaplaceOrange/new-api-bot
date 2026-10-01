@@ -28,18 +28,25 @@ func (s *Service) replyHongbaoNotice(ctx context.Context, event qq.MessageEvent,
 }
 
 func hongbaoUsage() string {
-	return "🧧 使用方式：/hongbao 领取当前群红包；管理员可使用 /hongbao new <总额度> <数量> [分组限制 ...] 发放红包。总额度以站点显示额度为单位，多个分组名称以空格分隔；不填写分组时不限制。"
+	return "🧧 使用方式：/hongbao 领取当前群红包；管理员可使用 /hongbao new <总额度> <数量> [分组限制 ...] 发放红包，或使用 /hongbao stop 停止当前群红包。总额度以站点显示额度为单位，多个分组名称以空格分隔；不填写分组时不限制。"
 }
 
 func (s *Service) handleHongbao(ctx context.Context, event qq.MessageEvent, canonical string, identity model.QQIdentity, fields []string) error {
 	if event.Message.GroupOpenID == "" || event.EventType == "C2C_MESSAGE_CREATE" {
 		return s.reply(ctx, event, "🧧 红包功能仅限群聊使用。")
 	}
-	if len(fields) != 1 && (len(fields) < 4 || !strings.EqualFold(fields[1], "new")) {
+	stopping := len(fields) == 2 && strings.EqualFold(fields[1], "stop")
+	if len(fields) != 1 && !stopping && (len(fields) < 4 || !strings.EqualFold(fields[1], "new")) {
 		return s.reply(ctx, event, hongbaoUsage())
 	}
 	unlock := s.hongbaoGroups.Lock(event.Message.GroupOpenID)
 	defer unlock()
+	if stopping {
+		if !s.isAdmin(identity) || s.isReadOnlyAdmin(identity) {
+			return s.replyHongbaoNotice(ctx, event, "🧧 仅具备完整管理权限的管理员可以停止红包。")
+		}
+		return s.stopHongbao(ctx, event, identity)
+	}
 	if len(fields) >= 4 {
 		if !s.isAdmin(identity) || s.isReadOnlyAdmin(identity) {
 			return s.replyHongbaoNotice(ctx, event, "🧧 仅具备完整管理权限的管理员可以发放红包。")
@@ -76,8 +83,11 @@ func (s *Service) createHongbao(ctx context.Context, event qq.MessageEvent, iden
 		if existing.ID == id {
 			return s.reply(ctx, event, "🧧 本次红包发放请求已处理，请勿重复提交。")
 		}
-		if existing.CompletedAt.IsZero() {
+		if existing.CompletedAt.IsZero() && existing.StoppedAt.IsZero() {
 			return s.reply(ctx, event, "🧧 当前群仍有未结束的红包，请待本轮领取及额度确认完成后再发放。")
+		}
+		if !existing.StoppedAt.IsZero() && hongbaoHasPendingClaims(existing) {
+			return s.reply(ctx, event, "🧧 上一轮红包已停止，但仍有待确认的额度发放，请核查后再发放新红包。")
 		}
 		if !existing.SummarySent {
 			if err := s.announceHongbaoSummary(ctx, existing, event.Message.ID); err != nil {
@@ -106,6 +116,46 @@ func (s *Service) createHongbao(ctx context.Context, event qq.MessageEvent, iden
 	return s.reply(ctx, event, fmt.Sprintf("🧧 红包已发放\n总额度：%s\n红包数量：%d 个\n%s已绑定账户可发送 /hongbao 领取，每个账户本轮限领一次。", newapi.QuotaToDisplay(total, packet.QuotaPerUnit), count, groupText))
 }
 
+func hongbaoHasPendingClaims(packet model.Hongbao) bool {
+	for _, claim := range packet.Claims {
+		if claim.Status != "granted" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) stopHongbao(ctx context.Context, event qq.MessageEvent, identity model.QQIdentity) error {
+	packet, err := s.store.GetHongbao(event.Message.GroupOpenID)
+	if errors.Is(err, store.ErrNotFound) {
+		return s.reply(ctx, event, "🧧 当前群暂无正在发放的红包。")
+	}
+	if err != nil {
+		return s.reply(ctx, event, "🧧 读取红包状态失败，请稍后重试。")
+	}
+	if !packet.StoppedAt.IsZero() {
+		return s.reply(ctx, event, "🧧 本轮红包已停止领取，无需重复操作。")
+	}
+	if !packet.CompletedAt.IsZero() {
+		return s.reply(ctx, event, "🧧 本轮红包已全部领取，无需停止。")
+	}
+	packet.StoppedAt = s.now()
+	if err := s.store.PutHongbao(packet); err != nil {
+		return s.reply(ctx, event, "🧧 保存红包停止状态失败，请稍后重试。")
+	}
+	_ = s.store.AddAudit(model.AuditRecord{
+		At: packet.StoppedAt, Actor: commandRuleActor(identity), Action: "hongbao.stop", Target: packet.ID, Success: true,
+		Metadata: map[string]any{"group": packet.GroupOpenID, "granted_count": packet.GrantedCount,
+			"remaining_count": packet.RemainingCount, "remaining_quota": packet.RemainingQuota},
+	})
+	text := fmt.Sprintf("🧧 本轮红包已停止领取\n已领取红包：%d 个\n剩余红包：%d 个\n剩余额度：%s\n已发放额度不受影响。",
+		packet.GrantedCount, packet.RemainingCount, newapi.QuotaToDisplay(packet.RemainingQuota, packet.QuotaPerUnit))
+	if hongbaoHasPendingClaims(packet) {
+		text += "\n尚有额度发放结果待确认，请管理员核查；核查完成前不能发放新红包。"
+	}
+	return s.reply(ctx, event, text)
+}
+
 func uniqueHongbaoGroups(groups []string) []string {
 	var result []string
 	seen := make(map[string]struct{}, len(groups))
@@ -130,6 +180,9 @@ func (s *Service) claimHongbao(ctx context.Context, event qq.MessageEvent, canon
 	}
 	if err != nil {
 		return s.reply(ctx, event, "🧧 读取红包状态失败，请稍后重试。")
+	}
+	if !packet.StoppedAt.IsZero() {
+		return s.reply(ctx, event, "🧧 本轮红包已停止领取，请等待下一轮发放。")
 	}
 	if len(packet.AllowedGroups) > 0 {
 		user, err := s.newAPI.GetUser(ctx, binding.NewAPIID)
@@ -239,7 +292,7 @@ func hongbaoClaimText(packet model.Hongbao, quota int64, repeated bool) string {
 }
 
 func (s *Service) announceHongbaoSummary(ctx context.Context, packet model.Hongbao, replyTo string) error {
-	if packet.CompletedAt.IsZero() || packet.SummarySent {
+	if packet.CompletedAt.IsZero() || !packet.StoppedAt.IsZero() || packet.SummarySent {
 		return nil
 	}
 	elapsed := packet.CompletedAt.Sub(packet.CreatedAt).Seconds()
