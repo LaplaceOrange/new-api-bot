@@ -40,6 +40,7 @@ var Options = []Option{
 	{Key: "sources", Label: "20 个内置状态源", Kind: "sources", Example: `openai on|off | {"openai":false}`},
 	{Key: "custom_statuspage_sources", Label: "自定义状态源", Kind: "custom", Example: `add "My Service" https://status.example.com`, Aliases: []string{"custom"}},
 	{Key: "python", Label: "Python 可执行文件", Kind: "string", Example: `"<absolute_path>"|python`},
+	{Key: "proxy", Label: "状态采集代理（隐藏凭据）", Kind: "string", Example: `"socks5h://user:password@host:1080"|off`, Secret: true},
 	{Key: "http_timeout_seconds", Label: "状态 HTTP 超时", Kind: "seconds", Example: "15|15s"},
 	{Key: "worker_timeout_seconds", Label: "任务总超时", Kind: "seconds", Example: "600|10m"},
 	{Key: "font_path", Label: "中文字体文件", Kind: "string", Example: `"<absolute_path>"|auto|""`},

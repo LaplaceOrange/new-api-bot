@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -28,6 +29,7 @@ type Config struct {
 	Sources                      map[string]bool   `json:"sources"`
 	CustomStatuspageSources      []CustomSource    `json:"custom_statuspage_sources"`
 	Python                       string            `json:"python"`
+	Proxy                        string            `json:"proxy"`
 	HTTPTimeoutSeconds           int               `json:"http_timeout_seconds"`
 	WorkerTimeoutSeconds         int               `json:"worker_timeout_seconds"`
 	FontPath                     string            `json:"font_path"`
@@ -108,6 +110,7 @@ func (c Config) Validate() error {
 		}
 	}
 	check(strings.TrimSpace(c.Python) != "", "python 不能为空")
+	errs = append(errs, ValidateProxy(c.Proxy))
 	check(c.PollIntervalSeconds >= 60, "poll_interval_seconds 不能小于 60")
 	check(c.HistoryLookbackHours >= 0 && c.HistoryLookbackHours <= 168, "history_lookback_hours 必须为 0–168")
 	check(c.SourceFailureThreshold >= 1 && c.SourceFailureThreshold <= 100, "source_failure_threshold 必须为 1–100")
@@ -142,4 +145,21 @@ func (c Config) Validate() error {
 		check(validateURL(c.Translation.BaseURL) && c.Translation.APIKey != "" && c.Translation.Model != "", "翻译配置需要有效 base_url、api_key 和 model")
 	}
 	return errors.Join(errs...)
+}
+
+func ValidateProxy(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u == nil || (u.Scheme != "socks5" && u.Scheme != "socks5h") ||
+		u.Hostname() == "" || u.RawQuery != "" || u.Fragment != "" ||
+		(u.Path != "" && u.Path != "/") {
+		return errors.New("proxy 必须是 socks5:// 或 socks5h://[username:password@]host:port")
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("proxy 端口必须为 1–65535")
+	}
+	return nil
 }

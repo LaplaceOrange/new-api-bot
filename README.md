@@ -245,8 +245,12 @@ JSON 在默认配置上增量覆盖；已明确设置的 `VENDOR_STATUS_*` 环�
   翻译变化不会触发新告警。命令设置的模型密钥使用 `BOT_DATA_KEY` 加密保存，
   不混入事故状态或翻译缓存；配置查询、成功回复和审计都不回显密钥。
   `translation.api_key` 仅允许管理员在机器人单聊中设置。
-- 代理：公开状态请求沿用 `HTTP_PROXY` / `HTTPS_PROXY` 环境配置；不使用仅属于
-  Codex Reset 检测的 `/reset proxy` 设置。
+- 代理：可用 `/vendor_config proxy "socks5h://username:password@host:1080"`
+  设置厂商状态专用代理，支持 `socks5://`（本地 DNS）和 `socks5h://`（代理 DNS），
+  可包含认证；`/vendor_config proxy off` 关闭。命令设置加密保存，不回显凭据；
+  带密码时建议私聊设置。仅影响手动查询及后台厂商采集（含 DeepSeek/AI Studio），
+  不改变 QQ、New API 或翻译请求，也不使用 `/reset proxy`。
+  未设置专用代理时沿用原有环境代理；新增依赖 `aiohttp-socks`，Docker 需重新构建。
 - 字体：可通过 `VENDOR_STATUS_FONT_PATH` 指定中文字体绝对路径；默认自动寻找
   微软雅黑、Noto CJK 或苹方。Docker 已包含中文字体。
 

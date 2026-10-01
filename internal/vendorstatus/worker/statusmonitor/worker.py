@@ -14,6 +14,7 @@ from typing import Any
 import aiohttp
 
 from .main import STATE_KEY, TRANSLATION_CACHE_KEY, GlobalStatusMonitor, Image, Plain
+from .proxy import status_connector, status_proxy
 
 MAX_INPUT_BYTES = 24 * 1024 * 1024
 
@@ -132,15 +133,20 @@ async def run(request: dict[str, Any], protocol: Protocol) -> None:
     if font_path:
         os.environ["VENDOR_STATUS_FONT_PATH"] = font_path
     timeout = aiohttp.ClientTimeout(total=config.get("http_timeout_seconds", 15))
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        trust_env=True,
-        connector=aiohttp.TCPConnector(limit=8),
-        headers={"User-Agent": "new-api-bot-Global-Status/1.2.2"},
-    ) as session:
+    proxy = config.get("proxy") or ""
+    status_proxy.set(proxy)
+    async with (
+        aiohttp.ClientSession(
+            timeout=timeout,
+            trust_env=not bool(proxy),
+            connector=status_connector(proxy),
+            headers={"User-Agent": "new-api-bot-Global-Status/1.2.2"},
+        ) as session,
+        aiohttp.ClientSession(timeout=timeout, trust_env=True) as translation_session,
+    ):
         translation = config.get("translation") or {}
         provider = (
-            ChatProvider(session, translation)
+            ChatProvider(translation_session, translation)
             if all(translation.get(key) for key in ("base_url", "api_key", "model"))
             else None
         )

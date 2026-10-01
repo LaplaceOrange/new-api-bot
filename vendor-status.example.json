@@ -13,6 +13,7 @@
   "timezone": "Asia/Shanghai",
   "enable_ai_translation": true,
   "python": "python",
+  "proxy": "",
   "http_timeout_seconds": 15,
   "worker_timeout_seconds": 600,
   "font_path": "",

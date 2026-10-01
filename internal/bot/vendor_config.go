@@ -131,7 +131,7 @@ func (s *Service) handleVendorConfig(ctx context.Context, event qq.MessageEvent,
 	if option.ReadOnly {
 		return s.reply(ctx, event, "本项目只有一个 QQ 官方实例：platform_type=qq_official，platform_id="+nonEmpty(s.cfg.QQAppID, "未配置 AppID")+"。不能通过厂商配置切换平台或更改 QQ 身份。")
 	}
-	if option.Secret && event.EventType != "C2C_MESSAGE_CREATE" {
+	if option.Key == "translation.api_key" && event.EventType != "C2C_MESSAGE_CREATE" {
 		return s.reply(ctx, event, "翻译密钥仅允许在机器人单聊中配置，群聊不会保存该项。")
 	}
 	s.vendorConfigMu.Lock()
@@ -146,13 +146,13 @@ func (s *Service) handleVendorConfig(ctx context.Context, event qq.MessageEvent,
 	s.vendorConfigMu.Unlock()
 	if err != nil {
 		if option.Secret {
-			return s.reply(ctx, event, "保存翻译密钥失败，请检查参数或数据库；密钥不会回显。")
+			return s.reply(ctx, event, "保存敏感配置失败，请检查格式或数据库；凭据不会回显。")
 		}
 		return s.reply(ctx, event, "厂商配置未修改："+err.Error()+"\n用法：/vendor_config "+option.Key+" "+option.Example)
 	}
 	s.vendorConfigChanged(identity, option.Key, "set")
 	if option.Secret {
-		return s.reply(ctx, event, "已保存翻译密钥设置（加密存储、不回显）。新查询和下一轮采集生效。")
+		return s.reply(ctx, event, "已保存 "+option.Key+"（加密存储、不回显）。新查询和下一轮采集生效。")
 	}
 	return s.reply(ctx, event, "已保存 "+option.Key+"，重启后保持。新查询使用新设置，已通知后台监控重新加载。")
 }
@@ -239,6 +239,9 @@ func parseVendorOptionValue(option vendorstatus.Option, args []string, cfg vendo
 		// restores unspecified sources to enabled rather than stale overrides.
 		return sources, nil
 	case "string":
+		if option.Key == "proxy" && (strings.EqualFold(raw, "off") || strings.EqualFold(raw, "direct")) {
+			return "", nil
+		}
 		if option.Key == "timezone" && (raw == "inherit" || raw == "default") {
 			return "", nil
 		}
@@ -420,7 +423,11 @@ func (s *Service) vendorOptionDisplay(cfg vendorstatus.Config, option vendorstat
 		return nonEmpty(s.cfg.QQAppID, "未配置 AppID") + "（固定）"
 	}
 	if option.Secret {
-		if cfg.Translation.APIKey == "" {
+		value := cfg.Translation.APIKey
+		if option.Key == "proxy" {
+			value = cfg.Proxy
+		}
+		if value == "" {
 			return "未设置"
 		}
 		return "已设置（隐藏）"

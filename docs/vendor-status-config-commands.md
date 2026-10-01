@@ -141,6 +141,7 @@ JSON 中未填写的来源遵循上游默认启用规则。
 | 配置键 | 命令示例 | 说明 |
 | --- | --- | --- |
 | `python` | `/vendor_config python "C:\Python\python.exe"` | Python 可执行文件；请使用存在的解释器，不校验机器上的安装状态 |
+| `proxy` | `/vendor_config proxy "socks5h://username:password@host:1080"` | 厂商采集专用代理；支持 socks5/socks5h、用户名密码、IPv6；加密保存，查询不回显；`off` 关闭，`reset proxy` 恢复部署值 |
 | `http_timeout_seconds` | `/vendor_config http_timeout_seconds 15s` | 单个状态 HTTP 超时，1–120 秒 |
 | `worker_timeout_seconds` | `/vendor_config worker_timeout_seconds 10m` | 查询/轮询总时限，30–3600 秒 |
 | `font_path` | `/vendor_config font_path "C:\Fonts\font.ttf"` | 字体路径；`""` 或 `auto` 恢复自动查找 |
@@ -151,6 +152,13 @@ JSON 中未填写的来源遵循上游默认启用规则。
 翻译三项可以逐项设置。未完整设置时不调用模型，按上游规则显示原文，不阻断告警。
 查询 API Key 只显示“已设置/未设置”；清空用 `""`，恢复部署密钥用
 `/vendor_config reset translation.api_key`。密钥不进入配置查询、成功回复或审计正文。
+
+代理支持 JSON `proxy`、环境变量 `VENDOR_STATUS_PROXY` 和命令覆盖。
+`socks5` 在本地解析目标 DNS；`socks5h` 在代理解析，适合目标域名本地不可解析的场景。
+用户名/密码含 `@`、`:`、`#`、`%` 时应百分号编码（例如 `p@ss:word` → `p%40ss%3Aword`）。
+代理只用于状态页查询和后台监控，不改变 QQ、New API、翻译 API 的网络路径。
+命令可在管理员群聊设置，但带凭据建议私聊，以避免原始指令暴露密码。
+本机重新安装 `internal/vendorstatus/requirements.txt`，Docker 重新构建镜像后使用。
 
 ## 优先级、生效与重置
 

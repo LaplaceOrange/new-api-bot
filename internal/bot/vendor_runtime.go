@@ -35,6 +35,18 @@ func (s *Service) vendorConfigFromRuntime(runtime store.VendorRuntimeConfig) (ve
 			}
 		}
 	}
+	if runtime.ProxyOverridden {
+		cfg.Proxy = ""
+		if runtime.EncryptedProxy != "" {
+			cfg.Proxy, err = s.secure.Decrypt(runtime.EncryptedProxy)
+			if err != nil {
+				return vendorstatus.Config{}, errors.New("解密厂商代理失败")
+			}
+		}
+	}
+	if err := vendorstatus.ValidateProxy(cfg.Proxy); err != nil {
+		return vendorstatus.Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -93,6 +105,9 @@ func (s *Service) setVendorConfigValue(key string, value any, reset bool) error 
 		} else if key == "translation.api_key" {
 			runtime.TranslationAPIKeyOverridden = false
 			runtime.EncryptedTranslationAPIKey = ""
+		} else if key == "proxy" {
+			runtime.ProxyOverridden = false
+			runtime.EncryptedProxy = ""
 		} else {
 			delete(runtime.Overrides, key)
 			if key == "sources" {
@@ -101,18 +116,29 @@ func (s *Service) setVendorConfigValue(key string, value any, reset bool) error 
 				}
 			}
 		}
-	} else if key == "translation.api_key" {
+	} else if key == "translation.api_key" || key == "proxy" {
 		secret, ok := value.(string)
 		if !ok {
 			return errors.New("翻译密钥类型无效")
 		}
-		runtime.TranslationAPIKeyOverridden = true
-		runtime.EncryptedTranslationAPIKey = ""
+		if key == "proxy" {
+			if err := vendorstatus.ValidateProxy(secret); err != nil {
+				return err
+			}
+		}
+		ciphertext := ""
 		if secret != "" {
-			runtime.EncryptedTranslationAPIKey, err = s.secure.Encrypt(secret)
+			ciphertext, err = s.secure.Encrypt(secret)
 			if err != nil {
 				return errors.New("加密翻译密钥失败")
 			}
+		}
+		if key == "proxy" {
+			runtime.ProxyOverridden = true
+			runtime.EncryptedProxy = ciphertext
+		} else {
+			runtime.TranslationAPIKeyOverridden = true
+			runtime.EncryptedTranslationAPIKey = ciphertext
 		}
 	} else {
 		if key == "sources" {

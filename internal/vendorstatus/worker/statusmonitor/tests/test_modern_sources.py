@@ -105,10 +105,14 @@ def test_public_frontend_configuration_prefers_verified_field_and_is_bounded():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("proxy", ["", "socks5h://user:password@proxy.test:1080"])
 async def test_modern_transport_closes_client_and_rotates_public_configuration(
     monkeypatch,
+    proxy,
 ):
     import curl_cffi.requests
+
+    from statusmonitor.proxy import status_proxy
 
     clients, calls = [], []
     keys = ["AIza" + "a" * 35, "AIza" + "b" * 35]
@@ -116,6 +120,7 @@ async def test_modern_transport_closes_client_and_rotates_public_configuration(
     class Client:
         def __init__(self, **kwargs):
             assert kwargs["impersonate"] == "chrome"
+            assert kwargs.get("proxy", "") == proxy
             self.closed = False
             clients.append(self)
 
@@ -136,9 +141,13 @@ async def test_modern_transport_closes_client_and_rotates_public_configuration(
 
     monkeypatch.setattr(curl_cffi.requests, "AsyncSession", Client)
     monkeypatch.setattr(modern_sources, "_request", request)
-    result = await modern_sources.fetch_modern_source(
-        spec("gemini_developer"), False, 24
-    )
+    token = status_proxy.set(proxy)
+    try:
+        result = await modern_sources.fetch_modern_source(
+            spec("gemini_developer"), False, 24
+        )
+    finally:
+        status_proxy.reset(token)
     assert result.complete and len(calls) == 3 and clients[0].closed
 
 

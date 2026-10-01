@@ -13,6 +13,9 @@ AstrBot 环境依赖。`main.py` 保留上游采集、状态协调、分批、�
 只读查询逻辑，平台调度、权限、订阅和 KV 存储接入本项目 Go 服务。
 `worker.py` 和 Go 集成是本次移植新增。
 
+后续专用 SOCKS 代理适配：新增 `proxy.py`，`modern_sources.py` 增加显式代理传递，
+普通状态源使用 aiohttp-socks；不改变上游事件解析算法。
+
 SVG 图标保留上游 LobeHub MIT 许可全文：
 `worker/statusmonitor/assets/icons/LOBEHUB_LICENSE.txt`。
 图片中保留上游项目署名。品牌和商标归各自权利人所有。

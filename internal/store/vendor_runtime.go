@@ -16,6 +16,8 @@ type VendorRuntimeConfig struct {
 	Overrides                   map[string]json.RawMessage `json:"overrides"`
 	TranslationAPIKeyOverridden bool                       `json:"translation_api_key_overridden"`
 	EncryptedTranslationAPIKey  string                     `json:"encrypted_translation_api_key,omitempty"`
+	ProxyOverridden             bool                       `json:"proxy_overridden"`
+	EncryptedProxy              string                     `json:"encrypted_proxy,omitempty"`
 }
 
 // VendorSettingsSnapshot reads runtime settings and subscription overrides in

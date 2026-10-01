@@ -257,7 +257,18 @@ async def fetch_modern_source(
     """Use isolated, short-lived browser TLS sessions without a browser or login state."""
     from curl_cffi.requests import AsyncSession
 
-    async with AsyncSession(impersonate="chrome", timeout=15, max_clients=3) as client:
+    from .proxy import status_proxy
+
+    kwargs = {}
+    if status_proxy.get():
+        from curl_cffi import CurlOpt
+
+        kwargs["proxy"] = status_proxy.get()
+        # Explicit status proxy must not be bypassed by inherited NO_PROXY.
+        kwargs["curl_options"] = {CurlOpt.NOPROXY: ""}
+    async with AsyncSession(
+        impersonate="chrome", timeout=15, max_clients=3, **kwargs
+    ) as client:
         if spec.kind == "flashduty":
             now = int(datetime.now(UTC).timestamp())
             # Notification lookback is separate from retrieval; keep long incidents visible.
