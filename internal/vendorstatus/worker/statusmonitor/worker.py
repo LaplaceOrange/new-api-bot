@@ -93,10 +93,29 @@ class ChatProvider:
 
 
 class HostContext:
-    def __init__(self, protocol: Protocol, provider: ChatProvider | None, config: dict):
+    def __init__(
+        self,
+        protocol: Protocol,
+        provider: ChatProvider | None,
+        config: dict,
+        operation="cycle",
+    ):
         self.protocol = protocol
         self.provider = provider
         self.config = config
+        self.operation = operation
+
+    async def progress(self, stage, text="", completed=0, total=0):
+        if self.operation == "query":
+            emit(
+                {
+                    "type": "progress",
+                    "stage": stage,
+                    "text": text,
+                    "completed": completed,
+                    "total": total,
+                }
+            )
 
     async def checkpoint(self, key, value):
         await self.protocol.checkpoint(key, value)
@@ -150,7 +169,10 @@ async def run(request: dict[str, Any], protocol: Protocol) -> None:
             if all(translation.get(key) for key in ("base_url", "api_key", "model"))
             else None
         )
-        monitor = GlobalStatusMonitor(HostContext(protocol, provider, config), config)
+        monitor = GlobalStatusMonitor(
+            HostContext(protocol, provider, config, request["operation"]), config
+        )
+        await monitor._report_progress("startup", "正在准备提供商状态采集……")
         stored = values.get(STATE_KEY)
         if stored is not None:
             if (
@@ -186,7 +208,7 @@ def main() -> None:
         logging.exception("Vendor status worker failed")
         # Diagnostic traceback is stderr-only; never put credentials or
         # status endpoint response bodies into the host protocol.
-        emit({"type": "error", "error": type(exc).__name__})
+        emit({"type": "error", "error": f"{type(exc).__name__}: {str(exc)[:1500]}"})
         raise SystemExit(1) from None
 
 

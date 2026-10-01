@@ -935,11 +935,32 @@ async def fetch_all_sources(
     specs: list[SourceSpec],
     notify_maintenance: bool,
     history_hours: int = 24,
+    progress: Any = None,
 ) -> list[SourceResult]:
     """Fetch enabled sources concurrently; cancellation remains owned by the caller."""
-    return await asyncio.gather(
-        *(
-            fetch_source(session, spec, notify_maintenance, history_hours)
-            for spec in specs
-        )
-    )
+    completed = 0
+    pending = {spec.source_id: spec.name for spec in specs}
+
+    async def fetch_one(spec):
+        nonlocal completed
+        result = await fetch_source(session, spec, notify_maintenance, history_hours)
+        completed += 1
+        pending.pop(spec.source_id, None)
+        if progress is not None:
+            if not result.success or not result.complete:
+                await progress(
+                    "warning",
+                    f"{spec.name} 采集失败或不完整：{result.error or 'Incomplete source data'}",
+                    completed,
+                    len(specs),
+                )
+            remaining = list(pending.values())
+            detail = (
+                "提供商信息收集已完成。"
+                if not remaining
+                else f"正在收集 {remaining[0]} 信息……"
+            )
+            await progress("fetch", detail, completed, len(specs))
+        return result
+
+    return await asyncio.gather(*(fetch_one(spec) for spec in specs))

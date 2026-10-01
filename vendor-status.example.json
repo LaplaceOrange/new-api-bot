@@ -9,6 +9,7 @@
   "source_failure_cooldown_seconds": 3600,
   "notify_existing_on_first_startup": true,
   "display_language": "bilingual",
+  "progress_mode": "detailed",
   "card_theme": "paper",
   "timezone": "Asia/Shanghai",
   "enable_ai_translation": true,

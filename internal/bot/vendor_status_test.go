@@ -27,9 +27,10 @@ func (f *fakeVendorRunner) Run(ctx context.Context, request vendorstatus.Request
 
 type vendorImageQQ struct {
 	*fakeQQ
-	scenes  []string
-	targets []string
-	replyTo []string
+	scenes    []string
+	targets   []string
+	replyTo   []string
+	sequences []int
 }
 
 func (f *vendorImageQQ) SendGroupFile(_ context.Context, group, replyTo, _ string, kind int, data []byte) (qq.SentMessage, error) {
@@ -37,6 +38,16 @@ func (f *vendorImageQQ) SendGroupFile(_ context.Context, group, replyTo, _ strin
 	f.targets = append(f.targets, group)
 	f.replyTo = append(f.replyTo, replyTo)
 	return qq.SentMessage{ID: "status-image"}, nil
+}
+
+func (f *vendorImageQQ) SendGroupFileWithSequence(ctx context.Context, group, replyTo, file string, kind int, data []byte, sequence int) (qq.SentMessage, error) {
+	f.sequences = append(f.sequences, sequence)
+	return f.SendGroupFile(ctx, group, replyTo, file, kind, data)
+}
+
+func (f *vendorImageQQ) SendC2CFileWithSequence(ctx context.Context, user, replyTo, file string, kind int, data []byte, sequence int) (qq.SentMessage, error) {
+	f.sequences = append(f.sequences, sequence)
+	return f.SendC2CFile(ctx, user, replyTo, file, kind, data)
 }
 
 func (f *vendorImageQQ) SendC2CFile(_ context.Context, user, replyTo, _ string, kind int, data []byte) (qq.SentMessage, error) {
@@ -65,6 +76,9 @@ func TestVendorQueryIsPublicAndSupportsGroupAndC2C(t *testing.T) {
 				}
 				if imageQQ.replyTo[0] != event.Message.ID {
 					t.Fatal(imageQQ.replyTo)
+				}
+				if imageQQ.sequences[0] <= 1 {
+					t.Fatal("image reused initial progress sequence", imageQQ.sequences)
 				}
 			})
 		}

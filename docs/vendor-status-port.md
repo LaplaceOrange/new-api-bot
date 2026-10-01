@@ -29,6 +29,9 @@
 | 写盘失败阻止发送 | E4：同步 checkpoint/ack 协议 | Python/Go 存储失败测试 |
 | 采集健康阈值、冷却及恢复 | E3：`plan_health_notices`、`mark_health_delivered` | `test_monitor_integration.py`、`test_monitor_state.py` |
 | 查询不改变告警状态 | E4：`vendor_status`、Go 协议拒绝查询写状态 | Python/Go 只读查询和 PNG 端到端 |
+| 查询阶段进度、10 秒停留刷新、撤回旧消息 | E12：`bot/vendor_progress.go`、`worker/statusmonitor/main.py` | 新步骤立即按序发送、重复阶段去重、心跳计时重置、上传期间刷新、群进度清理 |
+| 查询错误即时反馈与脱敏 | E12：`vendorstatus/redact.go`、`vendor_progress.go` | 来源/翻译部分失败不中断总览；致命错误、超时和上传失败回复；配置变更前后密钥均脱敏 |
+| 管理员三档进度模式 | E15：`config.go::ProgressMode`、`bot/vendor_progress_mode_test.go` | detailed/simple/off、配置校验、持久化重开、权限、重置、实际查询入口应用；off 成功时仅发图，所有模式保留错误提示 |
 | 双语/中文/英文、五种主题 | E5：`renderer.py` | `test_renderer.py`、五主题实际 PNG 渲染 |
 | 本地 SVG、中文字体、秒级时区 | E5：`renderer.py`、Docker Noto CJK | SVG、厂商图标、时区、长正文布局测试 |
 | AI 翻译批次、缓存、失败降级 | E6：`translation.py`、`worker.py::ChatProvider` | 缓存、模型选择、指纹隔离、专用凭据测试 |
@@ -77,8 +80,10 @@ go build ./...
   `bin/new-api-bot-vendor-status-linux`，实际 SHA256 保存在本地构建证据。
 - [已验证 E9] 五主题告警和 20 来源总览 PNG 已实际渲染并查看，中文、双语、
   来源图标与完整列表可见。图片使用演示数据，不是在线厂商状态。
-- [已验证 E10] 对五个采集/协调模块进行 AST 比较，与上游提交完全一致；
+- [已验证 E10] 首次移植验证时，对五个采集/协调模块进行 AST 比较，与上游提交完全一致；
   渲染器除字体查找外，其余 **27 个函数** AST 一致。
+  后续专用代理和查询进度修改了网络传输/并发调度，不再声称这些模块全文 AST 相同；
+  事件解析算法与渲染函数保持原实现，改动记录见 `THIRD_PARTY.md`。
 
 本地具体证据在 `.codex/vendor-status-evidence/`：
 `go-tests.txt`、`go-race.txt`、`python-tests.txt`、`build-sha256.txt`、
@@ -86,6 +91,22 @@ go build ./...
 该目录是本地任务证据，不进入 Docker 镜像；可按上述命令独立复现。
 
 ## 待验证 / 运维 Backlog
+
+### 查询进度本地验证
+
+- E12：`internal/bot/vendor_progress_test.go` 验证新步骤立即按序发送、相同步骤不重复触发、
+  10 秒停留刷新机制（测试注入短间隔）、步骤变化后重置计时、先发送新消息再撤回旧消息、
+  上传期间刷新、完成/失败清理、超时后使用独立回复上下文。
+- E13：`internal/vendorstatus/bridge_test.go` 的真实嵌入式 Python 测试确认采集、翻译、渲染、
+  编码阶段确实经协议上报；Python 进度测试确认部分来源错误与翻译失败立即产生诊断。
+- E14：`internal/vendorstatus/redact_test.go` 与查询测试确认 URL、认证信息、模型密钥、
+  代理密码和运行中更换配置前的凭据均不会进入公开进度/错误回复。
+- 本地全量 Go race、vet、build 已通过，Python **145 passed / 7 skipped**。
+  证据：`.codex/vendor-progress-evidence/`。真实 QQ 发送/撤回仍属下列待验证范围。
+- E15：管理员 `progress_mode=detailed|simple|off` 增量测试通过，包括模式对应的消息数量、
+  `simple` 固定提示及刷新、`off` 无进度且图片为首条回复、所有模式保留脱敏错误、
+  命令权限/校验/持久化/重置与实际查询入口应用。加入设置后再次通过全量 Go race、
+  vet、build 与 Python 回归；证据：`.codex/vendor-progress-mode-evidence/`。
 
 - [未验证] 真实 QQ 群/单聊图片、主动推送权限及配额：需要部署凭据；
   当前只通过本地协议、HTTP Mock 和客户端上传测试验证。

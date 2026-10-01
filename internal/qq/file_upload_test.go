@@ -95,3 +95,25 @@ func TestFileUploadUsesOfficialMD5PrefixAndRejectsEmptyMedia(t *testing.T) {
 		t.Fatal("empty file accepted")
 	}
 }
+
+func TestFileUploadReplySequenceDoesNotReuseProgressSequence(t *testing.T) {
+	for _, group := range []bool{true, false} {
+		transport := &fileUploadTransport{prepare: `{"upload_id":"upload","block_size":8,"parts":[]}`, fileInfo: "media"}
+		client := &Client{httpClient: &http.Client{Transport: transport}, token: "token", expiresAt: time.Now().Add(time.Hour)}
+		send := client.SendC2CFileWithSequence
+		if group {
+			send = client.SendGroupFileWithSequence
+		}
+		if _, err := send(context.Background(), "target", "incoming", "status.png", 1, []byte("png"), 3); err != nil {
+			t.Fatal(err)
+		}
+		last := transport.bodies[len(transport.bodies)-1]
+		if last["msg_seq"] != float64(3) || last["msg_id"] != "incoming" {
+			t.Fatal(last)
+		}
+		count := len(transport.paths)
+		if _, err := send(context.Background(), "target", "incoming", "status.png", 1, []byte("png"), 0); err == nil || len(transport.paths) != count {
+			t.Fatal("invalid sequence sent")
+		}
+	}
+}

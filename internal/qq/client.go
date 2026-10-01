@@ -203,12 +203,22 @@ func (c *Client) Gateway(ctx context.Context) (GatewayInfo, error) {
 }
 
 func (c *Client) ReplyC2C(ctx context.Context, userOpenID, messageID, content string) error {
+	_, err := c.SendC2CTextWithSequence(ctx, userOpenID, messageID, content, 1)
+	return err
+}
+
+func (c *Client) SendC2CTextWithSequence(ctx context.Context, userOpenID, messageID, content string, sequence int) (SentMessage, error) {
+	if sequence < 1 {
+		return SentMessage{}, errors.New("回复消息序号必须大于 0")
+	}
 	body := map[string]any{"msg_type": 0, "content": content}
 	if messageID != "" {
 		body["msg_id"] = messageID
-		body["msg_seq"] = 1
+		body["msg_seq"] = sequence
 	}
-	return c.request(ctx, http.MethodPost, "/v2/users/"+url.PathEscape(userOpenID)+"/messages", body, nil)
+	var sent SentMessage
+	err := c.request(ctx, http.MethodPost, "/v2/users/"+url.PathEscape(userOpenID)+"/messages", body, &sent)
+	return sent, err
 }
 
 func (c *Client) ReplyGroup(ctx context.Context, groupOpenID, messageID, content string) error {
@@ -304,14 +314,25 @@ func (c *Client) SetGroupMemberMute(ctx context.Context, group, member, operatio
 }
 
 func (c *Client) SendGroupFile(ctx context.Context, group, replyTo, fileName string, fileType int, data []byte) (SentMessage, error) {
-	return c.sendFile(ctx, "/v2/groups/"+url.PathEscape(group), replyTo, fileName, fileType, data)
+	return c.SendGroupFileWithSequence(ctx, group, replyTo, fileName, fileType, data, 1)
+}
+
+func (c *Client) SendGroupFileWithSequence(ctx context.Context, group, replyTo, fileName string, fileType int, data []byte, sequence int) (SentMessage, error) {
+	return c.sendFile(ctx, "/v2/groups/"+url.PathEscape(group), replyTo, fileName, fileType, data, sequence)
 }
 
 func (c *Client) SendC2CFile(ctx context.Context, user, replyTo, fileName string, fileType int, data []byte) (SentMessage, error) {
-	return c.sendFile(ctx, "/v2/users/"+url.PathEscape(user), replyTo, fileName, fileType, data)
+	return c.SendC2CFileWithSequence(ctx, user, replyTo, fileName, fileType, data, 1)
 }
 
-func (c *Client) sendFile(ctx context.Context, basePath, replyTo, fileName string, fileType int, data []byte) (SentMessage, error) {
+func (c *Client) SendC2CFileWithSequence(ctx context.Context, user, replyTo, fileName string, fileType int, data []byte, sequence int) (SentMessage, error) {
+	return c.sendFile(ctx, "/v2/users/"+url.PathEscape(user), replyTo, fileName, fileType, data, sequence)
+}
+
+func (c *Client) sendFile(ctx context.Context, basePath, replyTo, fileName string, fileType int, data []byte, sequence int) (SentMessage, error) {
+	if sequence < 1 {
+		return SentMessage{}, errors.New("回复消息序号必须大于 0")
+	}
 	if len(data) == 0 {
 		return SentMessage{}, errors.New("上传文件内容为空")
 	}
@@ -385,7 +406,7 @@ func (c *Client) sendFile(ctx context.Context, basePath, replyTo, fileName strin
 	msg := map[string]any{"msg_type": 7, "media": map[string]any{"file_info": complete.FileInfo}}
 	if replyTo != "" {
 		msg["msg_id"] = replyTo
-		msg["msg_seq"] = 1
+		msg["msg_seq"] = sequence
 	}
 	var sent SentMessage
 	err := c.request(ctx, http.MethodPost, basePath+"/messages", msg, &sent)

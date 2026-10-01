@@ -66,6 +66,11 @@ class GlobalStatusMonitor:
     async def put_kv_data(self, key: str, value: Any) -> None:
         await self.context.checkpoint(key, value)
 
+    async def _report_progress(self, stage, text="", completed=0, total=0):
+        callback = getattr(self.context, "progress", None)
+        if callback is not None:
+            await callback(stage, text, completed, total)
+
     def _targets(self, groups: list[str]) -> dict[str, str]:
         # Config/commands validate official QQ group_openid values in Go.
         return {group: group for group in groups}
@@ -128,11 +133,23 @@ class GlobalStatusMonitor:
             raise RuntimeError("Status monitor HTTP session is not available")
         async with self._fetch_lock:
             specs = self._source_specs()
+            await self._report_progress(
+                "fetch",
+                f"正在收集 {specs[0].name} 等提供商的信息……"
+                if specs
+                else "没有启用的提供商。",
+                0,
+                len(specs),
+            )
+            kwargs = {}
+            if getattr(self.context, "progress", None) is not None:
+                kwargs["progress"] = self._report_progress
             results = await fetch_all_sources(
                 self._session,
                 specs,
                 bool(self.config.get("notify_maintenance", False)),
                 self._history_hours(),
+                **kwargs,
             )
             self._last_results = [
                 presentation_result(result, self._state) for result in results
@@ -406,12 +423,17 @@ class GlobalStatusMonitor:
                 if result.success
                 for issue in result.issues.values()
             ]
+            await self._report_progress("translate", "正在整理事件信息及翻译缓存……")
             translations = await self._translator.translate_issues(
                 issues,
                 bool(self.config.get("enable_ai_translation", True))
                 and normalize_language(self.config.get("display_language", "bilingual"))
                 != "en-US",
                 str(self.config.get("translation_provider_id", "")).strip(),
+            )
+            await self._report_progress(
+                "render",
+                "正在生成状态总览图片……",
             )
             png = await asyncio.to_thread(
                 render_overview,
@@ -422,12 +444,16 @@ class GlobalStatusMonitor:
                 str(self.config.get("card_theme", "paper")),
             )
             if self._translator.dirty:
+                await self._report_progress("encode", "正在保存翻译缓存……")
                 await self.put_kv_data(
                     TRANSLATION_CACHE_KEY,
                     self._translator.dump_cache(),
                 )
                 self._translator.dirty = False
+            await self._report_progress("encode", "正在准备发送状态总览图片……")
             yield event.chain_result([Image.fromBytes(png)])
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to build on-demand vendor status overview.")
-            yield event.plain_result("厂商状态查询失败，请检查机器人日志和网络配置。")
+            yield event.plain_result(
+                f"厂商状态查询失败：{type(exc).__name__}: {str(exc)[:1500]}"
+            )

@@ -6,6 +6,23 @@ import (
 	"testing"
 )
 
+func TestVendorProgressModeEnvironment(t *testing.T) {
+	t.Setenv("VENDOR_STATUS_PROGRESS_MODE", "simple")
+	cfg, err := loadVendorStatusConfig("UTC")
+	if err != nil || cfg.ProgressMode != "simple" {
+		t.Fatal(cfg.ProgressMode, err)
+	}
+	t.Setenv("VENDOR_STATUS_PROGRESS_MODE", "off")
+	cfg, err = loadVendorStatusConfig("UTC")
+	if err != nil || cfg.ProgressMode != "off" {
+		t.Fatal(cfg.ProgressMode, err)
+	}
+	t.Setenv("VENDOR_STATUS_PROGRESS_MODE", "invalid")
+	if _, err := loadVendorStatusConfig("UTC"); err == nil {
+		t.Fatal("invalid environment mode accepted")
+	}
+}
+
 func TestVendorConfigDefaultsAndEnvironmentOverrides(t *testing.T) {
 	cfg, err := loadVendorStatusConfig("UTC")
 	if err != nil || !cfg.Enabled || cfg.Timezone != "UTC" || cfg.PollIntervalSeconds != 300 {

@@ -29,6 +29,7 @@ func TestVendorConfigScalarCommandsCoverEveryWritableScalar(t *testing.T) {
 		{"source_failure_cooldown_seconds", "2h", "7200"},
 		{"notify_existing_on_first_startup", "false", "false"},
 		{"display_language", "zh-CN", `"zh-CN"`},
+		{"progress_mode", "simple", `"simple"`},
 		{"card_theme", "liquid_glass", `"liquid_glass"`},
 		{"timezone", "UTC", `"UTC"`},
 		{"enable_ai_translation", "off", "false"},

@@ -17,25 +17,21 @@ type c2cFileAPI interface {
 }
 
 func (s *Service) handleVendorStatus(ctx context.Context, event qq.MessageEvent, fields []string) error {
+	return s.handleVendorStatusWithProgress(ctx, event, fields, 10*time.Second)
+}
+
+func (s *Service) handleVendorStatusWithProgress(ctx context.Context, event qq.MessageEvent, fields []string, interval time.Duration) error {
 	if len(fields) != 1 {
 		return s.reply(ctx, event, "用法：/vendor_status")
 	}
 	cfg, err := s.vendorConfigSnapshot()
 	if err != nil {
-		return s.reply(ctx, event, "读取厂商配置失败，请检查数据库或加密密钥。")
+		return s.reply(ctx, event, "读取厂商配置失败："+s.vendorSafeError(err, nil))
 	}
 	timeout := time.Duration(cfg.WorkerTimeoutSeconds) * time.Second
 	queryCtx, cancel := s.backgroundCommandContext(ctx, timeout+30*time.Second)
 	defer cancel()
-	packet, err := s.runVendorStatus(queryCtx, "query")
-	if err != nil {
-		s.logger.Error("厂商状态查询失败", "error", err)
-		return s.reply(queryCtx, event, "厂商状态查询失败，请检查机器人日志、Python 依赖和网络配置。")
-	}
-	if len(packet.PNG) == 0 {
-		return s.reply(queryCtx, event, nonEmpty(packet.Text, "厂商状态查询未返回图片。"))
-	}
-	return s.sendVendorImage(queryCtx, event, packet.PNG)
+	return s.runVendorQueryWithProgress(queryCtx, event, cfg, interval)
 }
 
 func (s *Service) handleVendorSubscription(ctx context.Context, event qq.MessageEvent, identity model.QQIdentity, fields []string) error {
@@ -84,6 +80,10 @@ func (s *Service) handleVendorSubscription(ctx context.Context, event qq.Message
 }
 
 func (s *Service) runVendorStatus(ctx context.Context, operation string) (vendorstatus.Packet, error) {
+	return s.runVendorStatusProgress(ctx, operation, nil)
+}
+
+func (s *Service) runVendorStatusProgress(ctx context.Context, operation string, progress func(vendorstatus.Packet)) (vendorstatus.Packet, error) {
 	select {
 	case s.vendorSemaphore <- struct{}{}:
 		defer func() { <-s.vendorSemaphore }()
@@ -97,6 +97,9 @@ func (s *Service) runVendorStatus(ctx context.Context, operation string) (vendor
 	if operation == "cycle" && !cfg.Enabled {
 		return vendorstatus.Packet{}, nil
 	}
+	if progress != nil {
+		progress(vendorstatus.Packet{Type: "progress", Stage: "startup", Text: "正在启动状态采集进程……"})
+	}
 	s.vendorDisplayTimezone(&cfg)
 	values, err := s.store.VendorStatusValues()
 	if err != nil {
@@ -104,8 +107,14 @@ func (s *Service) runVendorStatus(ctx context.Context, operation string) (vendor
 	}
 	workerCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.WorkerTimeoutSeconds)*time.Second)
 	defer cancel()
-	return s.vendorRunner.Run(workerCtx, vendorstatus.Request{Operation: operation, Config: cfg, Values: values}, vendorstatus.Callbacks{
+	packet, runErr := s.vendorRunner.Run(workerCtx, vendorstatus.Request{Operation: operation, Config: cfg, Values: values}, vendorstatus.Callbacks{
 		Checkpoint: s.store.PutVendorStatusValue,
+		Progress: func(packet vendorstatus.Packet) {
+			if progress != nil {
+				packet.Text = vendorstatus.Redact(packet.Text, cfg)
+				progress(packet)
+			}
+		},
 		Send: func(sendCtx context.Context, packet vendorstatus.Packet) error {
 			// Re-check the durable subscription at delivery time, not only at
 			// the beginning of a potentially long polling cycle.
@@ -140,23 +149,51 @@ func (s *Service) runVendorStatus(ctx context.Context, operation string) (vendor
 			return err
 		},
 	})
+	packet.Text = vendorstatus.Redact(packet.Text, cfg)
+	return packet, vendorstatus.RedactError(runErr, cfg)
 }
 
 func (s *Service) sendVendorImage(ctx context.Context, event qq.MessageEvent, data []byte) error {
+	return s.sendVendorImageWithSequence(ctx, event, data, 1)
+}
+
+type sequencedGroupFileAPI interface {
+	SendGroupFileWithSequence(context.Context, string, string, string, int, []byte, int) (qq.SentMessage, error)
+}
+
+type sequencedC2CFileAPI interface {
+	SendC2CFileWithSequence(context.Context, string, string, string, int, []byte, int) (qq.SentMessage, error)
+}
+
+func (s *Service) sendVendorImageWithSequence(ctx context.Context, event qq.MessageEvent, data []byte, sequence int) error {
 	if event.EventType == "C2C_MESSAGE_CREATE" {
+		user := firstNonEmpty(event.Message.Author.UserOpenID, event.Message.Author.ID)
+		if api, ok := s.qq.(sequencedC2CFileAPI); ok {
+			_, err := api.SendC2CFileWithSequence(ctx, user, event.Message.ID, "vendor-status.png", 1, data, sequence)
+			return err
+		}
 		api, ok := s.qq.(c2cFileAPI)
 		if !ok {
-			return s.reply(ctx, event, "当前 QQ 客户端不支持单聊图片上传。")
+			return errors.New("当前 QQ 客户端不支持单聊图片上传")
 		}
-		user := firstNonEmpty(event.Message.Author.UserOpenID, event.Message.Author.ID)
+		if sequence > 1 {
+			event.Message.ID = ""
+		}
 		_, err := api.SendC2CFile(ctx, user, event.Message.ID, "vendor-status.png", 1, data)
 		return err
 	}
-	api, ok := s.qq.(groupFileAPI)
-	if !ok {
+	var sent qq.SentMessage
+	var err error
+	if api, ok := s.qq.(sequencedGroupFileAPI); ok {
+		sent, err = api.SendGroupFileWithSequence(ctx, event.Message.GroupOpenID, event.Message.ID, "vendor-status.png", 1, data, sequence)
+	} else if api, ok := s.qq.(groupFileAPI); ok {
+		if sequence > 1 {
+			event.Message.ID = ""
+		}
+		sent, err = api.SendGroupFile(ctx, event.Message.GroupOpenID, event.Message.ID, "vendor-status.png", 1, data)
+	} else {
 		return errors.New("当前 QQ 客户端不支持群图片上传")
 	}
-	sent, err := api.SendGroupFile(ctx, event.Message.GroupOpenID, event.Message.ID, "vendor-status.png", 1, data)
 	if err == nil && sent.ID != "" {
 		if saveErr := s.store.PutSentBotMessage(model.SentBotMessage{
 			GroupOpenID: event.Message.GroupOpenID, MessageID: sent.ID,

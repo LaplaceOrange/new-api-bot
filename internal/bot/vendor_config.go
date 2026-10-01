@@ -214,6 +214,12 @@ func parseVendorOptionValue(option vendorstatus.Option, args []string, cfg vendo
 			return "en-US", nil
 		}
 		return nil, errors.New("语言只能是 bilingual、zh-CN、en-US")
+	case "progress_mode":
+		switch value := strings.ToLower(raw); value {
+		case "detailed", "simple", "off":
+			return value, nil
+		}
+		return nil, errors.New("进度模式只能是 detailed（详细）、simple（仅生成中）或 off（不显示进度）")
 	case "theme":
 		themes := map[string]string{
 			"paper": "paper", "midnight": "midnight", "porcelain": "porcelain",

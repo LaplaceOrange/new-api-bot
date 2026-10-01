@@ -53,3 +53,17 @@ func TestGroupTextReplySequence(t *testing.T) {
 		t.Fatal("invalid sequence was sent")
 	}
 }
+
+func TestC2CTextReplySequence(t *testing.T) {
+	transport := &messageSequenceTransport{}
+	client := &Client{httpClient: &http.Client{Transport: transport}, token: "token", expiresAt: time.Now().Add(time.Hour)}
+	if _, err := client.SendC2CTextWithSequence(context.Background(), "user", "incoming", "progress", 2); err != nil {
+		t.Fatal(err)
+	}
+	if transport.bodies[0]["msg_seq"] != float64(2) {
+		t.Fatal(transport.bodies)
+	}
+	if _, err := client.SendC2CTextWithSequence(context.Background(), "user", "incoming", "bad", 0); err == nil {
+		t.Fatal("bad sequence accepted")
+	}
+}

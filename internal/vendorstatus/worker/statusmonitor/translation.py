@@ -62,6 +62,11 @@ class TranslationService:
         self._lock = asyncio.Lock()
         self.dirty = False
 
+    async def _progress(self, stage, text, completed=0, total=0):
+        callback = getattr(self.context, "progress", None)
+        if callback is not None:
+            await callback(stage, text, completed, total)
+
     def load_cache(self, value: object) -> None:
         """Load validated translations from plugin KV data.
 
@@ -127,6 +132,7 @@ class TranslationService:
             if text not in translations and _needs_translation(text)
         ]
         if not enabled or not missing:
+            await self._progress("translate", "正在整理缓存译文及官方原文……")
             return translations
 
         async with self._lock:
@@ -155,10 +161,19 @@ class TranslationService:
                     logger.warning(
                         "Incident translation skipped because no chat provider is available."
                     )
+                    await self._progress(
+                        "translate", "未配置翻译模型，正在整理官方原文……"
+                    )
                     return translations
 
                 for offset in range(0, len(uncached), TRANSLATION_BATCH_SIZE):
                     batch = uncached[offset : offset + TRANSLATION_BATCH_SIZE]
+                    await self._progress(
+                        "translate",
+                        f"正在翻译事件信息（第 {offset // TRANSLATION_BATCH_SIZE + 1} 批）……",
+                        offset,
+                        len(uncached),
+                    )
                     request_items = [
                         {"id": _cache_key(text)[:16], "text": text[:5000]}
                         for text in batch
@@ -209,10 +224,20 @@ class TranslationService:
                         self._cache[key] = {"source": text, "zh_cn": translated}
                         translations[text] = translated
                         self.dirty = True
+                    await self._progress(
+                        "translate",
+                        "正在汇总已完成的译文……",
+                        min(offset + len(batch), len(uncached)),
+                        len(uncached),
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning(
                     "Incident translation failed; using original text: %s", exc
+                )
+                await self._progress(
+                    "warning",
+                    f"翻译失败，改用官方原文：{type(exc).__name__}: {str(exc)[:1000]}",
                 )
         return translations

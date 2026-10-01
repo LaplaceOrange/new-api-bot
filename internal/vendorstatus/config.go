@@ -23,6 +23,7 @@ type Config struct {
 	SourceFailureCooldownSeconds int               `json:"source_failure_cooldown_seconds"`
 	NotifyExistingOnFirstStartup bool              `json:"notify_existing_on_first_startup"`
 	DisplayLanguage              string            `json:"display_language"`
+	ProgressMode                 string            `json:"progress_mode"`
 	CardTheme                    string            `json:"card_theme"`
 	Timezone                     string            `json:"timezone"`
 	EnableAITranslation          bool              `json:"enable_ai_translation"`
@@ -59,7 +60,7 @@ func DefaultConfig() Config {
 		Enabled: true, PollIntervalSeconds: 300, HistoryLookbackHours: 24,
 		NotifySourceFailures: true, SourceFailureThreshold: 3,
 		SourceFailureCooldownSeconds: 3600, NotifyExistingOnFirstStartup: true,
-		DisplayLanguage: "bilingual", CardTheme: "paper", Timezone: "Asia/Shanghai",
+		DisplayLanguage: "bilingual", ProgressMode: "detailed", CardTheme: "paper", Timezone: "Asia/Shanghai",
 		EnableAITranslation: true, Python: "python", HTTPTimeoutSeconds: 15,
 		WorkerTimeoutSeconds: 600, Sources: map[string]bool{},
 	}
@@ -118,6 +119,7 @@ func (c Config) Validate() error {
 	check(c.HTTPTimeoutSeconds >= 1 && c.HTTPTimeoutSeconds <= 120, "http_timeout_seconds 必须为 1–120")
 	check(c.WorkerTimeoutSeconds >= 30 && c.WorkerTimeoutSeconds <= 3600, "worker_timeout_seconds 必须为 30–3600")
 	check(c.DisplayLanguage == "bilingual" || c.DisplayLanguage == "zh-CN" || c.DisplayLanguage == "en-US", "display_language 必须为 bilingual、zh-CN 或 en-US")
+	check(c.ProgressMode == "detailed" || c.ProgressMode == "simple" || c.ProgressMode == "off", "progress_mode 必须为 detailed、simple 或 off")
 	check(c.CardTheme == "paper" || c.CardTheme == "midnight" || c.CardTheme == "porcelain" || c.CardTheme == "terminal" || c.CardTheme == "liquid_glass", "card_theme 无效")
 	if c.Timezone != "" {
 		if _, err := time.LoadLocation(c.Timezone); err != nil {

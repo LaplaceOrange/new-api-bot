@@ -36,18 +36,22 @@ type Request struct {
 }
 
 type Packet struct {
-	Type  string          `json:"type"`
-	Key   string          `json:"key,omitempty"`
-	Value json.RawMessage `json:"value,omitempty"`
-	Group string          `json:"group,omitempty"`
-	PNG   []byte          `json:"png,omitempty"`
-	Text  string          `json:"text,omitempty"`
-	Error string          `json:"error,omitempty"`
+	Type      string          `json:"type"`
+	Key       string          `json:"key,omitempty"`
+	Value     json.RawMessage `json:"value,omitempty"`
+	Group     string          `json:"group,omitempty"`
+	PNG       []byte          `json:"png,omitempty"`
+	Text      string          `json:"text,omitempty"`
+	Error     string          `json:"error,omitempty"`
+	Stage     string          `json:"stage,omitempty"`
+	Completed int             `json:"completed,omitempty"`
+	Total     int             `json:"total,omitempty"`
 }
 
 type Callbacks struct {
 	Checkpoint func(string, json.RawMessage) error
 	Send       func(context.Context, Packet) error
+	Progress   func(Packet)
 }
 
 type Runner interface {
@@ -152,6 +156,18 @@ func consumePackets(ctx context.Context, output io.Reader, encoder *json.Encoder
 			return Packet{}, fmt.Errorf("厂商状态 worker 协议错误: %w", err)
 		}
 		switch packet.Type {
+		case "progress":
+			if operation != "query" || packet.Completed < 0 || packet.Total < 0 || packet.Completed > packet.Total {
+				return Packet{}, errors.New("无效的查询进度消息")
+			}
+			switch packet.Stage {
+			case "startup", "fetch", "translate", "render", "encode", "warning":
+			default:
+				return Packet{}, errors.New("未知查询进度阶段")
+			}
+			if callbacks.Progress != nil {
+				callbacks.Progress(packet)
+			}
 		case "checkpoint":
 			if packet.Key != StateKey && packet.Key != TranslationKey {
 				return Packet{}, errors.New("worker 请求写入未知数据键")

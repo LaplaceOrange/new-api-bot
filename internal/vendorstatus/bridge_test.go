@@ -211,9 +211,25 @@ func TestEmbeddedPythonWorkerEndToEnd(t *testing.T) {
 		t.Fatal(sent)
 	}
 	before := append([]byte(nil), values[StateKey]...)
+	var stages []string
+	callbacks.Progress = func(packet Packet) {
+		stages = append(stages, packet.Stage)
+	}
 	result := run("query")
 	if _, err := png.DecodeConfig(bytes.NewReader(result.PNG)); err != nil || !bytes.Equal(before, values[StateKey]) {
 		t.Fatal("query mutated the monitor state or returned no PNG", err)
+	}
+	for _, stage := range []string{"startup", "fetch", "translate", "render", "encode"} {
+		found := false
+		for _, seen := range stages {
+			if stage == seen {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatal("real embedded worker missing progress stage", stage, stages)
+		}
 	}
 	active.Store(false)
 	sent = nil
@@ -225,5 +241,30 @@ func TestEmbeddedPythonWorkerEndToEnd(t *testing.T) {
 	run("cycle")
 	if len(sent) != 0 {
 		t.Fatal("recovery duplicated", sent)
+	}
+}
+
+func TestProtocolProgressDoesNotRequireAnAcknowledgement(t *testing.T) {
+	var input bytes.Buffer
+	var progress []Packet
+	output := strings.NewReader(`{"type":"progress","stage":"fetch","text":"OpenAI","completed":1,"total":20}` + "\n" +
+		`{"type":"progress","stage":"warning","text":"TimeoutError"}` + "\n" + `{"type":"done"}` + "\n")
+	_, err := consumePackets(context.Background(), output, json.NewEncoder(&input), "query", Callbacks{
+		Progress: func(packet Packet) { progress = append(progress, packet) },
+	})
+	if err != nil || len(progress) != 2 || input.Len() != 0 {
+		t.Fatal(err, progress, input.String())
+	}
+	for _, line := range []string{
+		`{"type":"progress","stage":"fetch","completed":21,"total":20}`,
+		`{"type":"progress","stage":"unknown"}`,
+		`{"type":"progress","stage":"fetch","completed":-1}`,
+	} {
+		if _, err := consumePackets(context.Background(), strings.NewReader(line+"\n"), json.NewEncoder(&input), "query", Callbacks{}); err == nil {
+			t.Fatal("invalid progress accepted", line)
+		}
+	}
+	if _, err := consumePackets(context.Background(), strings.NewReader(`{"type":"progress","stage":"fetch"}`+"\n"), json.NewEncoder(&input), "cycle", Callbacks{}); err == nil {
+		t.Fatal("background worker attempted user progress")
 	}
 }

@@ -16,6 +16,10 @@ AstrBot 环境依赖。`main.py` 保留上游采集、状态协调、分批、�
 后续专用 SOCKS 代理适配：新增 `proxy.py`，`modern_sources.py` 增加显式代理传递，
 普通状态源使用 aiohttp-socks；不改变上游事件解析算法。
 
+后续查询进度适配：`sources.py` 的并发采集调度增加进度回调，
+`main.py`、`translation.py` 增加阶段/错误通知；解析算法和渲染函数不变。
+Go 查询控制器负责立即更新步骤、10 秒无变化刷新、群消息撤回及诊断脱敏。
+
 SVG 图标保留上游 LobeHub MIT 许可全文：
 `worker/statusmonitor/assets/icons/LOBEHUB_LICENSE.txt`。
 图片中保留上游项目署名。品牌和商标归各自权利人所有。

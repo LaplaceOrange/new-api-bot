@@ -142,6 +142,7 @@ JSON 中未填写的来源遵循上游默认启用规则。
 | --- | --- | --- |
 | `python` | `/vendor_config python "C:\Python\python.exe"` | Python 可执行文件；请使用存在的解释器，不校验机器上的安装状态 |
 | `proxy` | `/vendor_config proxy "socks5h://username:password@host:1080"` | 厂商采集专用代理；支持 socks5/socks5h、用户名密码、IPv6；加密保存，查询不回显；`off` 关闭，`reset proxy` 恢复部署值 |
+| `progress_mode` | `/vendor_config progress_mode detailed` | `detailed` 显示详细步骤（默认）；`simple` 仅显示“正在生成中……”并每 10 秒刷新；`off` 不显示进度、直接发图；错误仍脱敏提示 |
 | `http_timeout_seconds` | `/vendor_config http_timeout_seconds 15s` | 单个状态 HTTP 超时，1–120 秒 |
 | `worker_timeout_seconds` | `/vendor_config worker_timeout_seconds 10m` | 查询/轮询总时限，30–3600 秒 |
 | `font_path` | `/vendor_config font_path "C:\Fonts\font.ttf"` | 字体路径；`""` 或 `auto` 恢复自动查找 |
@@ -161,6 +162,10 @@ JSON 中未填写的来源遵循上游默认启用规则。
 本机重新安装 `internal/vendorstatus/requirements.txt`，Docker 重新构建镜像后使用。
 
 ## 优先级、生效与重置
+
+进度模式仅限管理员修改；只读管理员可查询。`progress_mode` 与其他配置一样重启后保持，
+但正在执行的手动查询继续使用启动时的模式；新查询采用新设置。
+可使用 `/vendor_config progress_mode` 查询、`/vendor_config reset progress_mode` 恢复部署默认。
 
 1. 启动时读取：内置默认 → JSON → 环境变量。
 2. 每次查询/轮询读取：以上部署配置 → bbolt 命令覆盖 → 单群订阅覆盖。

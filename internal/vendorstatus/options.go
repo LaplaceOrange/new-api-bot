@@ -33,6 +33,7 @@ var Options = []Option{
 	{Key: "source_failure_cooldown_seconds", Label: "采集异常通知冷却", Kind: "seconds", Example: "3600|1h"},
 	{Key: "notify_existing_on_first_startup", Label: "首次已有异常通知", Kind: "bool", Example: "on|off"},
 	{Key: "display_language", Label: "图片语言", Kind: "language", Example: "bilingual|zh-CN|en-US", Aliases: []string{"language"}},
+	{Key: "progress_mode", Label: "查询进度显示模式", Kind: "progress_mode", Example: "detailed|simple|off"},
 	{Key: "card_theme", Label: "图片主题", Kind: "theme", Example: "paper|midnight|porcelain|terminal|liquid_glass", Aliases: []string{"theme"}},
 	{Key: "timezone", Label: "图片时区", Kind: "string", Example: `Asia/Shanghai|inherit|""`},
 	{Key: "enable_ai_translation", Label: "AI 翻译", Kind: "bool", Example: "on|off"},
