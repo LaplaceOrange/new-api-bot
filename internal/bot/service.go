@@ -438,6 +438,27 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	command := strings.ToLower(fields[0])
 	s.logger.Debug("开始处理 QQ 命令", "event", event.EventType, "command", command)
 	identity := identityFromEvent(event)
+	// Help is a query at any depth, before binding checks or write guards.
+	// Resolve registry paths only; help queries never execute command handlers.
+	if command == "/help" || len(fields) > 1 && strings.EqualFold(fields[len(fields)-1], "help") {
+		if _, blocked := s.matchDisabledCommand(content); blocked && command != "/enable" && command != "/disable" {
+			return
+		}
+		text := ""
+		if command == "/help" {
+			if len(fields) != 1 {
+				text = "格式错误。正确用法：/help"
+			} else {
+				text = s.helpTextFor(identity, "")
+			}
+		} else {
+			text = s.helpTextFor(identity, strings.Join(fields[:len(fields)-1], " "))
+		}
+		if err := s.replyHelp(ctx, event, text); err != nil {
+			s.logger.Error("回复命令帮助失败", "command", command, "error", err)
+		}
+		return
+	}
 	if s.isReadOnlyAdmin(identity) && readOnlyAdminWriteCommand(command, fields) {
 		reply := s.reply
 		if command == "/hongbao" && len(fields) > 1 && (strings.EqualFold(fields[1], "new") || strings.EqualFold(fields[1], "stop")) {
@@ -463,12 +484,6 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 	switch command {
 	case "/__command_too_long":
 		err = s.replyWithAutoRecall(ctx, event, "指令内容过长，请缩短到 4096 字节以内后重试。")
-	case "/help":
-		if len(fields) != 1 {
-			err = s.replyWithAutoRecall(ctx, event, "格式错误。正确用法：/help")
-		} else {
-			err = s.replyWithAutoRecall(ctx, event, s.filteredHelpText())
-		}
 	case "/whoami":
 		if len(fields) != 1 {
 			err = s.reply(ctx, event, "格式错误。正确用法：/whoami")
@@ -1964,71 +1979,4 @@ func userStatusText(status int) string {
 	default:
 		return fmt.Sprintf("状态码 %d", status)
 	}
-}
-
-func helpText(cfg config.Config) string {
-	lines := []string{
-		"可用指令：",
-		"/bind <邮箱或用户ID> - 在当前群发送绑定验证码",
-		"/bind verify <验证码> - 在当前群完成绑定",
-		"/bind status - 查看当前绑定信息",
-		"/unbind - 解除当前 QQ 身份绑定",
-		"/checkin - 签到并直接增加绑定账户额度",
-		"/checkin status - 查看签到状态",
-		"/hongbao - 领取当前群红包，每个账户每轮限领一次",
-		"管理员：/hongbao new <总额度> <数量> [分组限制 ...] - 发放拼手气额度红包，多个分组以空格分隔",
-		"管理员：/hongbao stop - 停止当前群红包，已发放额度不受影响",
-		"管理员：/checkin reset - 重置当前周期所有用户的签到状态",
-		"/me - 查看账户与额度",
-		"/usage [时间长度] - 查看自己的用量，例如 /usage 7d",
-		"/usage <时间长度> all - 查看全站请求、Token 与额度汇总",
-		"/usage <时间长度> <前N名> - 查看用量排行榜，例如 /usage 7d 10",
-		"/logs [数量] - 查看自己的最近调用记录",
-		"/models [用户ID或@用户] - 查看用户分组可用模型",
-		"/plan view - 查看自己的全部订阅",
-		"/whoami - 查看当前 OpenID",
-		"/enable list、/disable list - 查看命令关键词状态；管理员可启用或禁用关键词",
-		"管理员：/credit add、/credit sub、/credit show（用户ID可替换为@群成员）",
-		"管理员：/plan add、/plan sub、/plan view <用户ID或@群成员>",
-		"管理员：/admin bindings、/admin unbind <用户ID或@群成员>",
-		"管理员：/admin checkin - 查看今日签到统计与动态发放规则",
-		"管理员：/admin report [时间长度] - 查看全站用量摘要",
-		"管理员：/welcome on|off|set <欢迎语>、/recall",
-		"管理员：/join on|off|status、/join limit <QQ等级>、/join check \"<匹配字符串>\" - 配置入群自动审批",
-		"管理员：/mute <@成员> <时长>、/mute off <@成员>、/mute status",
-		"/bot status - 查看机器人与群聊状态",
-		"/vendor_status - 查询全部启用厂商的最新状态总览，无需绑定",
-		"管理员：/vendor_subscribe on|off - 持久化开启或关闭本群厂商告警，无需绑定",
-		"管理员：/vendor_config - 查看、修改、重置全部厂商监控配置；/vendor_config help 查看完整选项",
-	}
-	if cfg.UsageChartEnabled {
-		lines = append(lines, "/usage chart <时间长度> [@用户|用户ID|all] - 生成用量图表；指定用户仅管理员可用，all 汇总本群已绑定成员")
-	}
-	if cfg.NotifyEnabled {
-		lines = append(lines, "/notify quota <额度>|off、/notify daily on|off、/notify status")
-	}
-	if cfg.AdminReportExportEnabled {
-		lines = append(lines, "管理员：/admin report export [时间长度] - 导出 CSV")
-	}
-	if cfg.AdminUserManagementEnabled {
-		lines = append(lines, "管理员：/admin user status|enable|disable|reset2fa|resetpasskey <用户>")
-	}
-	if cfg.BenefitEnabled {
-		lines = append(lines, "管理员：/benefit <面额> <数量> <有效期(h)> <封禁时间(day)> - 发放限领福利")
-	}
-	if cfg.ResetEnabled {
-		lines = append(lines,
-			"/reset check - 查看当前群的重置状态",
-			"/reset last - 查看 Codex Reset API 最新重置事件及状态",
-			"/reset join - 参加当前群正在进行的重置补偿抽奖",
-			"管理员：/reset new - 按当前群设置手动开启新活动",
-			"管理员：/reset stop - 停止当前活动，不抽奖、不发放额度",
-			"管理员：/reset end - 提前截止当前活动并立即结算",
-			"管理员：/reset set duration <时长> - 设置下一轮活动有效期",
-			"管理员：/reset set winners <人数> - 设置下一轮抽取人数",
-			"管理员：/reset set lookback <时长> - 设置下一轮补偿回溯时间",
-			"管理员：/reset proxy <代理链接|off> - 设置 Codex Reset API 检测代理",
-		)
-	}
-	return strings.Join(lines, "\n")
 }

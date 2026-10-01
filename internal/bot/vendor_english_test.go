@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fsykk/new-api-bot/internal/model"
 	"github.com/fsykk/new-api-bot/internal/vendorstatus"
 )
 
@@ -49,12 +50,13 @@ func TestVendorChineseCommandsAndKeywordsAreNotAccepted(t *testing.T) {
 
 func TestVendorHelpAdvertisesEnglishCommandsOnly(t *testing.T) {
 	service, _, _, _, _ := testService(t)
-	text := helpText(service.cfg) + "\n" + vendorConfigHelp()
+	identity := model.QQIdentity{UserOpenID: "admin"}
+	text := service.helpTextFor(identity, "") + "\n" + service.helpTextFor(identity, "/vendor_config") + "\n" + service.helpTextFor(identity, "/vendor_config custom")
 	if regexp.MustCompile(`/[\p{Han}]+`).MatchString(text) {
 		t.Fatal("help still advertises Chinese command names")
 	}
 	for _, expected := range []string{
-		"/vendor_status", "/vendor_subscribe on|off", "/vendor_config",
+		"/vendor_status", "/vendor_subscribe", "/vendor_config",
 		"/vendor_config reset <key|all>", "custom add", "custom set",
 	} {
 		if !strings.Contains(text, expected) {

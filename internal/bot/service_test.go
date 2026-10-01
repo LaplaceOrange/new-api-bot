@@ -576,10 +576,11 @@ func TestNonCommandMessageIsIgnored(t *testing.T) {
 }
 
 func TestHelpOmitsDisabledFeatures(t *testing.T) {
-	text := helpText(config.Config{})
-	for _, command := range []string{"/usage chart", "/notify", "/admin report export", "/admin user"} {
-		if strings.Contains(text, command) {
-			t.Fatalf("disabled command %q appeared in help: %q", command, text)
+	for _, entry := range commandHelpEntries(config.Config{}) {
+		for _, command := range []string{"/checkin", "/usage chart", "/notify", "/admin report export", "/admin user", "/benefit", "/reset", "/confirm"} {
+			if entry.path == command || helpDescendant(entry.path, command) {
+				t.Fatalf("disabled command %q appeared in help: %#v", command, entry)
+			}
 		}
 	}
 }

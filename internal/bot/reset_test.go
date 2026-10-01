@@ -985,7 +985,7 @@ func TestDisabledResetJoinDoesNotHideResetCheck(t *testing.T) {
 	service, _, _, qqAPI, _ := testService(t)
 	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
 	service.process(context.Background(), groupEvent("g-reset", "admin", `/disable "reset join"`))
-	service.process(context.Background(), groupEvent("g-reset", "ordinary", "/help"))
+	service.process(context.Background(), groupEvent("g-reset", "ordinary", "/reset help"))
 	reply := lastReply(t, qqAPI)
 	if !strings.Contains(reply, "/reset check") {
 		t.Fatalf("reset check disappeared from help: %q", reply)
@@ -999,7 +999,7 @@ func TestDisabledResetLastOnlyHidesResetLastHelp(t *testing.T) {
 	service, _, _, qqAPI, _ := testService(t)
 	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
 	service.process(context.Background(), groupEvent("g-reset", "admin", `/disable "reset last"`))
-	service.process(context.Background(), groupEvent("g-reset", "ordinary", "/help"))
+	service.process(context.Background(), groupEvent("g-reset", "ordinary", "/reset help"))
 	reply := lastReply(t, qqAPI)
 	if strings.Contains(reply, "/reset last") {
 		t.Fatalf("disabled reset last remained in help: %q", reply)
@@ -1014,7 +1014,7 @@ func TestDisabledResetNewOnlyHidesResetNewHelp(t *testing.T) {
 	service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
 	createBinding(t, storage, "member:g-reset:admin", 43)
 	service.process(context.Background(), groupEvent("g-reset", "admin", `/disable "reset new"`))
-	service.process(context.Background(), groupEvent("g-reset", "ordinary", "/help"))
+	service.process(context.Background(), groupEvent("g-reset", "admin", "/reset help"))
 	reply := lastReply(t, qqAPI)
 	if strings.Contains(reply, "/reset new") {
 		t.Fatalf("disabled reset new remained in help: %q", reply)
@@ -1032,7 +1032,7 @@ func TestDisabledResetStopAndEndOnlyHideMatchingHelp(t *testing.T) {
 			service, _, _, qqAPI, _ := testService(t)
 			service.cfg.QQAdminOpenIDs["member:g-reset:admin"] = struct{}{}
 			service.process(context.Background(), groupEvent("g-reset", "admin", `/disable "reset `+command+`"`))
-			service.process(context.Background(), groupEvent("g-reset", "ordinary", "/help"))
+			service.process(context.Background(), groupEvent("g-reset", "admin", "/reset help"))
 			reply := lastReply(t, qqAPI)
 			if strings.Contains(reply, "/reset "+command) {
 				t.Fatalf("disabled command remained in help: %q", reply)

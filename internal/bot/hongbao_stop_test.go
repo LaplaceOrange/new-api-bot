@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fsykk/new-api-bot/internal/model"
 )
 
 func TestHongbaoStopPreservesAwardsBlocksClaimsAndAllowsNextRound(t *testing.T) {
@@ -147,7 +149,7 @@ func TestHongbaoStopMissingAndCompletedPackets(t *testing.T) {
 	if !strings.Contains(lastReply(t, qqAPI), "已全部领取，无需停止") || !reflect.DeepEqual(before, after) || api.quotaAdds != 1 {
 		t.Fatal("completed packet was changed by stop")
 	}
-	if !strings.Contains(service.filteredHelpText(), "/hongbao stop") || !strings.Contains(hongbaoUsage(), "/hongbao stop") {
+	if !strings.Contains(service.helpTextFor(model.QQIdentity{UserOpenID: "admin"}, "/hongbao"), "/hongbao stop") || !strings.Contains(hongbaoUsage(), "/hongbao stop") {
 		t.Fatal("missing stop help")
 	}
 }

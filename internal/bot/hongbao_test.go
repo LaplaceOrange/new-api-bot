@@ -326,14 +326,14 @@ func TestRandomHongbaoQuotaConservation(t *testing.T) {
 
 func TestHongbaoHelpAndDisableRule(t *testing.T) {
 	service, storage, api, qqAPI, _ := testService(t)
-	if !strings.Contains(service.filteredHelpText(), "/hongbao new <总额度> <数量> [分组限制 ...]") {
+	if !strings.Contains(service.helpTextFor(model.QQIdentity{UserOpenID: "admin"}, "/hongbao"), "/hongbao new <总额度> <数量> [分组限制 ...]") {
 		t.Fatal("missing help")
 	}
 	if err := storage.PutCommandRule(model.CommandRule{Keyword: "hongbao", Enabled: false}); err != nil {
 		t.Fatal(err)
 	}
 	service.commandRules.Store(nil)
-	if strings.Contains(service.filteredHelpText(), "hongbao") {
+	if strings.Contains(service.helpTextFor(model.QQIdentity{UserOpenID: "admin"}, ""), "hongbao") {
 		t.Fatal("disabled command still in help")
 	}
 	service.process(context.Background(), groupEvent("g", "admin", "/hongbao new 1 1"))

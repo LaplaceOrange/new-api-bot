@@ -62,7 +62,7 @@
 | `/vendor_config <key> <value>` | 管理员 | 持久化修改任一适用配置并热加载；只读管理员不能修改 |
 | `/vendor_config help` | 管理员 | 查看全部配置键、参数和自定义源管理用法 |
 | `/vendor_config reset <key\|all>` | 管理员 | 清除命令覆盖，恢复部署默认；不会清除事故送达状态 |
-| `/help` | 任意 | 查看指令说明 |
+| `/help` | 任意 | 按当前用户权限查看一级命令及说明 |
 | `/enable list`、`/disable list` | 任意 | 查看明确启用或禁用的命令关键词 |
 | `/enable "<关键词>"` | 管理员 | 恢复包含指定关键词的命令 |
 | `/disable "<关键词>"` | 管理员 | 静默忽略包含指定关键词的命令，并从 `/help` 隐藏匹配项 |
@@ -105,7 +105,9 @@
 | `/reset set lookback <时长>` | 管理员 | 设置获奖者在活动开始前的用量补偿回溯时间，默认 `24h` |
 | `/reset proxy <代理链接或off>` | 管理员 | 设置仅用于访问 Codex Reset timeline API 的 HTTP/SOCKS5 代理，凭据加密保存 |
 
-除 `/help`、`/whoami`、`/bind`、`/vendor_status`、`/reset check`、`/reset last`、`/enable list`、`/disable list` 以及管理员的 `/vendor_config`、`/vendor_subscribe`、`/enable`、`/disable`、`/checkin reset`、`/hongbao new`、`/hongbao stop` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
+帮助按层级展示，并始终过滤无权限、功能关闭或命中禁用关键词的命令：`/help` 只列出一级命令，普通用户不显示管理员专用命令，管理员显示其可用的全部一级命令，只读管理员只显示查询类操作。在命令末尾添加 `help` 可查看当前用法和直属下一级命令，例如 `/checkin help`、`/admin help`、`/admin user help`、`/reset set help`。每级帮助末尾会提示如何查看下一级；叶子命令显示详细用法。参数不构成命令层级，帮助查询无需绑定，也不会执行对应操作。
+
+除 `/help`、各级命令的 `help` 查询、`/whoami`、`/bind`、`/vendor_status`、`/reset check`、`/reset last`、`/enable list`、`/disable list` 以及管理员的 `/vendor_config`、`/vendor_subscribe`、`/enable`、`/disable`、`/checkin reset`、`/hongbao new`、`/hongbao stop` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
 
 ### 额度红包
 

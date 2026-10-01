@@ -161,28 +161,3 @@ func (s *Service) matchDisabledCommand(content string) (string, bool) {
 	}
 	return "", false
 }
-
-func (s *Service) filteredHelpText() string {
-	text := helpText(s.cfg)
-	keywords, err := s.disabledCommandKeywords()
-	if err != nil {
-		s.logger.Error("读取禁用命令关键词失败；返回未过滤帮助", "error", err)
-		return text
-	}
-	lines := strings.Split(text, "\n")
-	filtered := make([]string, 0, len(lines))
-	for _, line := range lines {
-		normalized := normalizeCommandFilter(line)
-		hidden := false
-		for _, keyword := range keywords {
-			if strings.Contains(normalized, keyword) {
-				hidden = true
-				break
-			}
-		}
-		if !hidden {
-			filtered = append(filtered, line)
-		}
-	}
-	return strings.Join(filtered, "\n")
-}

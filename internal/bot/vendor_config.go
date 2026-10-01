@@ -52,7 +52,7 @@ func (s *Service) handleVendorConfig(ctx context.Context, event qq.MessageEvent,
 		args[0] = strings.ToLower(args[0])
 	}
 	if len(args) == 1 && args[0] == "help" {
-		return s.replyChunked(ctx, event, vendorConfigHelp(), 1500)
+		return s.replyHelp(ctx, event, s.helpTextFor(identity, "/vendor_config"))
 	}
 	if len(args) == 0 || len(args) == 1 && isVendorShow(args[0]) {
 		cfg, err := s.vendorConfigSnapshot()
@@ -398,33 +398,6 @@ func validateVendorCustomSources(sources []vendorstatus.CustomSource) ([]vendors
 	cfg := vendorstatus.DefaultConfig()
 	cfg.CustomStatuspageSources = sources
 	return sources, cfg.Validate()
-}
-
-func vendorConfigHelp() string {
-	lines := []string{
-		"厂商配置（管理员，无需绑定；只读管理员只能查询）：",
-		"/vendor_config show [key] - 显示当前有效设置",
-		"/vendor_config <key> <value> - 持久化修改",
-		"/vendor_config reset <key|all> - 清除命令覆盖，恢复部署配置",
-		"全部配置项：",
-	}
-	for _, option := range vendorstatus.Options {
-		suffix := option.Example
-		if option.ReadOnly {
-			suffix = "只读，本项目固定值"
-		}
-		lines = append(lines, option.Key+"： "+suffix+"（"+option.Label+"）")
-	}
-	lines = append(lines,
-		"来源开关：/vendor_config sources.<id> on|off；也支持 sources <id> on|off",
-		"内置 ID："+strings.Join(vendorstatus.SourceIDs, "、"),
-		`自定义源：custom add "<name>" <url> [on|off]；custom remove "<name>"`,
-		`自定义字段：custom set "<name>" name|base_url|enabled <value>`,
-		"翻译模型也可用原配置名 translation_provider_id。",
-		`值含空格请加双引号；"" 表示清空。优先级：命令覆盖 > 环境变量 > JSON > 内置默认。`,
-		"enabled on|off 即时启停后台；已有查询沿用启动时快照，后续查询使用新设置。",
-	)
-	return strings.Join(lines, "\n")
 }
 
 func (s *Service) vendorConfigOverview(cfg vendorstatus.Config) string {
