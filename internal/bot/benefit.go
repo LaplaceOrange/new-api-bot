@@ -209,6 +209,7 @@ func (s *Service) runBenefitWorker(ctx context.Context) {
 }
 
 func (s *Service) checkBenefitLifecycle(parent context.Context) {
+	s.retryHongbaoSummaries(parent)
 	s.benefitMu.Lock()
 	defer s.benefitMu.Unlock()
 	now := time.Now()

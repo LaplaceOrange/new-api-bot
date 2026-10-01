@@ -107,6 +107,7 @@ type Service struct {
 	notifyMu                sync.Mutex
 	groupLastNotify         map[string]time.Time
 	benefitMu               sync.Mutex
+	hongbaoGroups           keyedLocker[string]
 	lastPruneAt             time.Time
 	chartSemaphore          chan struct{}
 	commandRulesMu          sync.Mutex
@@ -451,6 +452,8 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		}
 	case "/bind":
 		err = s.handleBind(ctx, event, canonical, fields)
+	case "/hongbao":
+		err = s.handleHongbao(ctx, event, canonical, identity, fields)
 	case "/reset":
 		if len(fields) >= 2 && (strings.EqualFold(fields[1], "check") || strings.EqualFold(fields[1], "last")) {
 			err = s.handleReset(ctx, event, canonical, identity, fields)
@@ -1593,7 +1596,7 @@ func readOnlyAdminWriteCommand(command string, fields []string) bool {
 		return arg != "list"
 	case "/bind":
 		return arg != "status"
-	case "/unbind", "/checkin", "/notify", "/welcome", "/benefit", "/recall":
+	case "/unbind", "/checkin", "/notify", "/welcome", "/benefit", "/hongbao", "/recall":
 		if command == "/notify" && arg == "status" {
 			return false
 		}
@@ -1635,6 +1638,10 @@ type groupMessageSender interface {
 	SendGroupText(context.Context, string, string, string) (qq.SentMessage, error)
 }
 
+type sequencedGroupMessageSender interface {
+	SendGroupTextWithSequence(context.Context, string, string, string, int) (qq.SentMessage, error)
+}
+
 func (s *Service) reply(ctx context.Context, event qq.MessageEvent, content string) error {
 	if event.EventType == "C2C_MESSAGE_CREATE" {
 		openID := event.Message.Author.UserOpenID
@@ -1650,14 +1657,30 @@ func (s *Service) reply(ctx context.Context, event qq.MessageEvent, content stri
 // endpoint when available and records it for /recall, otherwise falling back
 // to the legacy ReplyGroup path.
 func (s *Service) sendGroupReply(ctx context.Context, groupOpenID, replyTo, content string) error {
-	if sender, ok := s.qq.(groupMessageSender); ok {
-		sent, err := sender.SendGroupText(ctx, groupOpenID, replyTo, content)
-		if err == nil && sent.ID != "" {
-			_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: groupOpenID, MessageID: sent.ID, MessageIdx: sceneValue(sent.MessageScene.Ext, "msg_idx"), SentAt: time.Now()})
+	return s.sendGroupReplyWithSequence(ctx, groupOpenID, replyTo, content, 1)
+}
+
+func (s *Service) sendGroupReplyWithSequence(ctx context.Context, groupOpenID, replyTo, content string, sequence int) error {
+	var sent qq.SentMessage
+	var err error
+	if sender, ok := s.qq.(sequencedGroupMessageSender); ok {
+		sent, err = sender.SendGroupTextWithSequence(ctx, groupOpenID, replyTo, content, sequence)
+	} else {
+		// Legacy clients cannot send a second reply sequence. Use the existing
+		// independent group-message fallback rather than duplicate sequence 1.
+		if sequence > 1 {
+			replyTo = ""
 		}
-		return err
+		if sender, ok := s.qq.(groupMessageSender); ok {
+			sent, err = sender.SendGroupText(ctx, groupOpenID, replyTo, content)
+		} else {
+			return s.qq.ReplyGroup(ctx, groupOpenID, replyTo, content)
+		}
 	}
-	return s.qq.ReplyGroup(ctx, groupOpenID, replyTo, content)
+	if err == nil && sent.ID != "" {
+		_ = s.store.PutSentBotMessage(model.SentBotMessage{GroupOpenID: groupOpenID, MessageID: sent.ID, MessageIdx: sceneValue(sent.MessageScene.Ext, "msg_idx"), SentAt: time.Now()})
+	}
+	return err
 }
 
 // replyWithAutoRecall sends a reply and schedules an automatic group recall
@@ -1918,6 +1941,8 @@ func helpText(cfg config.Config) string {
 		"/unbind - 解除当前 QQ 身份绑定",
 		"/checkin - 签到并直接增加绑定账户额度",
 		"/checkin status - 查看签到状态",
+		"/hongbao - 领取当前群红包，每个账户每轮限领一次",
+		"管理员：/hongbao new <总金额> <个数> - 发放拼手气额度红包",
 		"管理员：/checkin reset - 重置当前周期所有用户的签到状态",
 		"/me - 查看账户与额度",
 		"/usage [时间长度] - 查看自己的用量，例如 /usage 7d",

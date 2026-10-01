@@ -217,10 +217,17 @@ func (c *Client) ReplyGroup(ctx context.Context, groupOpenID, messageID, content
 }
 
 func (c *Client) SendGroupText(ctx context.Context, groupOpenID, messageID, content string) (SentMessage, error) {
+	return c.SendGroupTextWithSequence(ctx, groupOpenID, messageID, content, 1)
+}
+
+func (c *Client) SendGroupTextWithSequence(ctx context.Context, groupOpenID, messageID, content string, sequence int) (SentMessage, error) {
+	if sequence < 1 {
+		return SentMessage{}, errors.New("回复消息序号必须大于 0")
+	}
 	body := map[string]any{"msg_type": 0, "content": content}
 	if messageID != "" {
 		body["msg_id"] = messageID
-		body["msg_seq"] = 1
+		body["msg_seq"] = sequence
 	}
 	var sent SentMessage
 	err := c.request(ctx, http.MethodPost, "/v2/groups/"+url.PathEscape(groupOpenID)+"/messages", body, &sent)

@@ -143,6 +143,29 @@ type BenefitBan struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+type HongbaoClaim struct {
+	CanonicalID string `json:"canonical_id"`
+	RawQuota    int64  `json:"raw_quota"`
+	Status      string `json:"status"`
+}
+
+// Remaining values exclude reserved claims, including writes awaiting confirmation.
+type Hongbao struct {
+	ID             string               `json:"id"`
+	GroupOpenID    string               `json:"group_openid"`
+	Actor          string               `json:"actor"`
+	QuotaPerUnit   int64                `json:"quota_per_unit"`
+	TotalQuota     int64                `json:"total_quota"`
+	TotalCount     int                  `json:"total_count"`
+	RemainingQuota int64                `json:"remaining_quota"`
+	RemainingCount int                  `json:"remaining_count"`
+	GrantedCount   int                  `json:"granted_count"`
+	Claims         map[int]HongbaoClaim `json:"claims"`
+	CreatedAt      time.Time            `json:"created_at"`
+	CompletedAt    time.Time            `json:"completed_at,omitempty"`
+	SummarySent    bool                 `json:"summary_sent"`
+}
+
 type CommandRule struct {
 	Keyword   string    `json:"keyword"`
 	Enabled   bool      `json:"enabled"`

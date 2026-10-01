@@ -55,6 +55,7 @@ var buckets = [][]byte{
 	[]byte("sent_bot_messages"),
 	[]byte("benefit_campaigns"),
 	[]byte("benefit_bans"),
+	[]byte("hongbao"),
 	[]byte("command_rules"),
 	[]byte("runtime_settings"),
 	[]byte("reset_settings"),
