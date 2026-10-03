@@ -34,6 +34,11 @@ var (
 const maxAuditRecords = 10_000
 
 var buckets = [][]byte{
+	llmConfigBucket,
+	llmGroupsBucket,
+	llmSessionsBucket,
+	llmJobsBucket,
+	llmRatesBucket,
 	rssSubscriptionsBucket,
 	rssGroupsBucket,
 	rssSeenBucket,

@@ -13,11 +13,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fsykk/new-api-bot/internal/llm"
 	"github.com/fsykk/new-api-bot/internal/rss"
 	"github.com/fsykk/new-api-bot/internal/vendorstatus"
 )
 
 type Config struct {
+	LLM                        llm.Config
 	QQAppID                    string
 	QQAppSecret                string
 	NewAPIBaseURL              string
@@ -109,6 +111,11 @@ func Load() (Config, error) {
 	}
 
 	var errs []error
+	var llmErr error
+	c.LLM, llmErr = llm.LoadEnvironment()
+	if llmErr != nil {
+		errs = append(errs, fmt.Errorf("LLM 配置无效: %w", llmErr))
+	}
 	require := func(name, value string) {
 		if value == "" {
 			errs = append(errs, fmt.Errorf("%s 为必填配置", name))

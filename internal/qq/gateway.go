@@ -48,6 +48,7 @@ type Payload struct {
 }
 
 type MessageEvent struct {
+	ReceivedAt  time.Time
 	EventType   string
 	Sequence    int64
 	Message     Message
@@ -56,6 +57,7 @@ type MessageEvent struct {
 }
 
 type Message struct {
+	Timestamp   json.RawMessage `json:"timestamp,omitempty"`
 	ID          string          `json:"id"`
 	Content     string          `json:"content"`
 	GroupOpenID string          `json:"group_openid"`
@@ -445,8 +447,8 @@ func (g *Gateway) connect(ctx context.Context, handler func(context.Context, Mes
 				}
 				continue
 			}
-			// QQ 当前生产环境的群消息事件名为 GROUP_MESSAGE_CREATE；
-			// 同时保留旧文档/旧环境使用的 GROUP_AT_MESSAGE_CREATE 兼容性。
+			// 全量群消息和仅 @机器人消息是不同事件；都接受指令，
+			// 普通文本的 @ 判定由 ChatContent 完成，不能视全量消息为 @。
 			if !isMessageCreateEvent(payload.T) {
 				commitPayload()
 				continue

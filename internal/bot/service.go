@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/fsykk/new-api-bot/internal/config"
+	"github.com/fsykk/new-api-bot/internal/llm"
 	"github.com/fsykk/new-api-bot/internal/mailer"
 	"github.com/fsykk/new-api-bot/internal/model"
 	"github.com/fsykk/new-api-bot/internal/newapi"
@@ -81,6 +82,13 @@ type queuedGatewayEvent struct {
 }
 
 type Service struct {
+	llmConfigMu             sync.Mutex
+	llmMu                   sync.Mutex
+	llmActive               map[string]context.CancelFunc
+	llmWake                 chan struct{}
+	llmClient               *llm.Client
+	llmCompleter            llm.Completer
+	llmSearcher             llm.Searcher
 	cfg                     config.Config
 	store                   *store.Store
 	secure                  *secure.Box
@@ -150,6 +158,7 @@ func New(cfg config.Config, storage *store.Store, box *secure.Box, newAPI NewAPI
 		cfg: cfg, store: storage, secure: box, newAPI: newAPI, qq: qqAPI, mailer: sender, logger: logger,
 		queue: make(chan queuedGatewayEvent, cfg.GatewayQueueSize), workersDone: make(chan struct{}), notifyStop: make(chan struct{}), dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}), inboxWake: make(chan struct{}, 1), lifecycleCtx: context.Background(), inflight: make(map[string]struct{}), groupLastNotify: make(map[string]time.Time), chartSemaphore: make(chan struct{}, 1), resetSettleWake: make(chan struct{}, 1), now: time.Now, randomCheckinMultiplier: randomCheckinMultiplier, randomCheckinMaxCredit: randomCheckinMaxCredit,
 	}
+	service.initLLM()
 	if cfg.ResetEnabled {
 		service.resetRadar = resetradar.NewScanner(cfg.ResetHTTPTimeout, cfg.ResetSignalMaxAge)
 	}
@@ -173,6 +182,8 @@ func (s *Service) Start(ctx context.Context) {
 		return
 	}
 	s.lifecycleCtx = ctx
+	s.workers.Add(1)
+	go s.runLLMDispatcher(ctx)
 	if s.cfg.RSSEnabled && s.rssClient != nil {
 		s.workers.Add(1)
 		go func() {
@@ -252,6 +263,7 @@ func (s *Service) StopContext(ctx context.Context) error {
 		close(s.dispatchStop)
 	})
 	if !s.started.Load() {
+		s.llmClient.Close()
 		s.queueCloseOnce.Do(func() { close(s.queue) })
 		if s.rssClient != nil {
 			s.rssClient.Close()
@@ -287,6 +299,9 @@ func (s *Service) backgroundCommandContext(parent context.Context, timeout time.
 }
 
 func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) bool {
+	if event.ReceivedAt.IsZero() {
+		event.ReceivedAt = s.now()
+	}
 	group := firstNonEmpty(event.Message.GroupOpenID, event.Member.GroupOpenID, event.JoinRequest.GroupOpenID)
 	if group != "" {
 		if err := s.store.ObserveGroup(group); err != nil {
@@ -294,12 +309,23 @@ func (s *Service) HandleGateway(ctx context.Context, event qq.MessageEvent) bool
 		}
 	}
 	if event.Message.ID != "" {
-		content := strings.TrimSpace(event.Message.Content)
-		if content == "" || !strings.HasPrefix(content, "/") {
+		content, accepted := qq.ChatContent(event, s.cfg.QQAppID)
+		if content == "" || !accepted {
 			s.logger.Debug("忽略非指令 QQ 消息", "event", event.EventType, "content_length", utf8.RuneCountInString(content))
 			return true
 		}
-		if len(content) > maxCommandBytes {
+		if !strings.HasPrefix(content, "/") {
+			content = "/chat " + content
+		}
+		event.Message.Content = content
+		limit := maxCommandBytes
+		if strings.EqualFold(strings.Fields(content)[0], "/chat") {
+			limit += len("/chat ")
+		}
+		if strings.EqualFold(strings.Fields(content)[0], "/llm_config") {
+			limit = 20 << 10
+		}
+		if len(content) > limit {
 			event.Message.Content = "/__command_too_long"
 			event.Message.Mentions = nil
 			event.Message.Elements = nil
@@ -447,13 +473,32 @@ func (s *Service) process(parent context.Context, event qq.MessageEvent) {
 		s.handleGroupJoinRequest(ctx, event)
 		return
 	}
-	content := strings.TrimSpace(event.Message.Content)
-	if content == "" || !strings.HasPrefix(content, "/") {
+	content, accepted := qq.ChatContent(event, s.cfg.QQAppID)
+	if content == "" || !accepted {
 		s.logger.Debug("忽略非指令 QQ 消息",
 			"event", event.EventType,
 			"content_length", utf8.RuneCountInString(content),
 			"starts_with_slash", strings.HasPrefix(content, "/"),
 		)
+		return
+	}
+	if !strings.HasPrefix(content, "/") {
+		content = "/chat " + content
+	}
+	entry := strings.ToLower(strings.Fields(content)[0])
+	if entry == "/chat" || entry == "/llm_config" {
+		if !s.llmCommandAllowed(content) {
+			return
+		}
+		var err error
+		if entry == "/chat" {
+			err = s.handleChat(ctx, event, content)
+		} else {
+			err = s.handleLLMConfig(ctx, event, content)
+		}
+		if err != nil {
+			s.logger.Error("处理 LLM 指令失败", "command", entry)
+		}
 		return
 	}
 	// 兼容用户按帮助文本输入 <参数> 且未额外添加空格的情况。
@@ -1671,6 +1716,10 @@ func readOnlyAdminWriteCommand(command string, fields []string) bool {
 		arg = strings.ToLower(strings.TrimSpace(fields[1]))
 	}
 	switch command {
+	case "/llm_config":
+		return llmConfigWrite(fields)
+	case "/chat":
+		return arg == "on" || arg == "off" || arg == "reset"
 	case "/rss":
 		return arg == "add" || arg == "remove" || arg == "pause" || arg == "resume" || arg == "interval"
 	case "/vendor_config":

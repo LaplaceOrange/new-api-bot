@@ -193,6 +193,7 @@ func commandHelpEntries(cfg config.Config) []helpEntry {
 		helpEntry{"/vendor_config group_whitelist del", "<group_openid>", "删除告警群白名单（remove 的别名）", true, false},
 		helpEntry{"/vendor_config group_whitelist clear", "", "清空告警群白名单", true, false},
 	)
+	entries = append(entries, llmHelpEntries()...)
 	return entries
 }
 

@@ -8,7 +8,7 @@
 
 ## 功能
 
-- QQ 群聊 @ 消息，使用 WebSocket Gateway 接收事件；仅处理并回复以 `/` 开头的指令消息。
+- 使用 WebSocket Gateway 接收 QQ 消息；处理 `/` 指令，可选开启 `/chat` 和群内 @机器人文本对话，单聊普通文本仍忽略。
 - QQ Access Token 自动刷新、心跳、Resume、断线重连与消息去重。
 - 一个 QQ 主身份与一个 New API 用户 ID 的双向唯一绑定。
 - SMTP 邮箱验证码，每个 QQ 身份和目标账户每小时默认最多发送两封。
@@ -23,6 +23,106 @@
 - 完整接入全球厂商状态监控：20 个官方状态源、自定义 Statuspage、历史补报、按群重试、采集健康通知、五主题 PNG 和可缓存的 AI 双语翻译。
 - bbolt 单文件持久化、AES-256-GCM 敏感数据加密、JSON 结构化日志。
 - `/healthz` 和 `/readyz` 健康检查。
+- 可配置人格的 LLM 多轮文本对话、四种联网搜索后端及权限校验的只读业务工具；独立有界任务队列、限额、加密历史和崩溃去重。
+
+## LLM 对话
+
+默认关闭，不内置模型名、API Key、机器人名字或人格。统一 Key 所属账户承担模型调用费用，**不会额外扣除发言者绑定账户的额度**。只有已绑定用户可发起对话；管理员配置及群开关无需个人绑定。
+
+部署配置示例：
+
+```dotenv
+LLM_ENABLED=true
+LLM_BASE_URL=https://example.com/v1
+LLM_API_KEY=<单独创建的普通模型Key>
+LLM_MODEL=<支持function calling的模型>
+LLM_SYSTEM_PROMPT=
+LLM_SEARCH_BACKEND=off
+```
+
+管理员也可通过命令配置，下一轮对话热生效：
+
+```text
+/llm_config set base_url https://example.com/v1
+/llm_config set api_key "<普通模型Key>"          # 仅管理员单聊
+/llm_config set model "<支持function calling的模型>"
+/llm_config set system_prompt "<你自己的完整人格提示词>"
+/llm_config set enabled on
+/chat on                                    # 在目标群内操作
+```
+
+`system_prompt` 可在引号内包含真实换行和尖括号；`/llm_config set system_prompt ""` 取消人格提示。程序只提供工具真实性与权限边界的运行约束，不内置固定角色。人格提示词不能授予额外工具权限、切换执行身份或允许管理写操作。
+
+### 命令与上下文
+
+| 指令 | 权限及行为 |
+| --- | --- |
+| `/chat <内容>` | 已绑定用户；保留多行及代码文本；群内 @机器人普通文本等价触发 |
+| `/chat help` | 查询帮助，不要求绑定；只有完整子命令才作为管理命令，普通问题末尾的 `help` 不改变语义 |
+| `/chat status` | 已绑定用户；查看当前场景开关、接口就绪状态、模型、搜索及剩余次数 |
+| `/chat on`、`/chat off` | 可写 Bot 管理员；仅作用于当前群，群默认关闭 |
+| `/chat reset` | 清空当前会话；群内仅可写管理员，单聊用户清空自己的历史 |
+| `/llm_config show [key]` | 管理员查询；密钥只显示是否配置 |
+| `/llm_config set <key> <value>` | 可写管理员；密钥仅允许在单聊设置 |
+| `/llm_config reset <key\|all>` | 清除命令覆盖，恢复环境默认；不清除历史或群开关 |
+| `/llm_config help` | 管理员查询配置用法 |
+
+配置键与 `.env.example` 的 `LLM_*` 字段逐一对应：去掉 `LLM_` 并转小写，例如 `history_turns`、`search_backend`、`minute_limit`。命令覆盖 > 环境配置 > 内置资源预算；所有命令配置（含人格和密钥）加密保存在 bbolt。相关预算必须始终保持有效；降低分段大小前应先降低总回复大小。
+
+群内普通聊天历史共享，并用本地生成的发言者标签区分用户；单聊历史按身份隔离。默认最近20个完整轮次、32 KiB JSON、闲置24小时过期；历史正文使用 `BOT_DATA_KEY` 加密。清空采用会话版本控制，在途请求不会写回旧历史。涉及业务工具的群聊轮次不写入共享历史，**当前回复仍会被所有群成员看到**，私人查询建议使用单聊。单聊业务历史及复述它的后续轮次按当前绑定账户隔离；撤销管理员权限后不再向模型提供管理员业务历史。
+
+现有业务指令始终优先，不把 `/me`、`/usage` 等交给模型。`/disable "chat"` 同时静默关闭命令和 @对话；禁用某个业务命令也会限制对应工具。
+
+自然 @对话使用 QQ 的 `GROUP_AT_MESSAGE_CREATE` 事件。`GROUP_MESSAGE_CREATE` 是全量模式事件，其正文可能已去除 @前缀且 mentions 不含机器人；无法可靠判定目标时只接受显式 `/chat`，不会把群内所有普通聊天都发给模型。两个事件收到同一条 `/chat` 时只生成一次答案。
+
+### 联网搜索
+
+管理员选择一个当前后端，其他后端配置继续保留；默认关闭，没有自动跨服务回退：
+
+```text
+# Tavily
+/llm_config set tavily_key "<Tavily Key>"      # 单聊
+/llm_config set search_backend tavily
+
+# 自建 SearXNG：实例必须在 settings.yml 中开放 JSON 格式
+/llm_config set searxng_url https://searx.example.com
+/llm_config set search_backend searxng
+
+# Bing：通过 SerpApi 的 Bing 引擎
+/llm_config set bing_key "<SerpApi Key>"       # 单聊
+/llm_config set search_backend bing_serpapi
+
+# 原生联网模型：单独调用，不转发主对话或业务工具结果
+/llm_config set search_model_url https://example.com/v1
+/llm_config set search_model_key "<搜索模型Key>" # 单聊
+/llm_config set search_model "<支持web_search_options的模型>"
+/llm_config set search_backend model_native
+
+# 关闭联网
+/llm_config set search_backend off
+```
+
+Tavily 默认地址为 `https://api.tavily.com/search`，SerpApi 默认地址为 `https://serpapi.com/search.json`，可分别通过 `tavily_url`、`bing_url` 配置兼容服务。原生搜索要求 Chat Completions 的 `web_search_options` 及 `url_citation` annotations；仅仅支持普通 Chat Completions 不代表支持联网。
+
+搜索只接收独立查询词，最多返回5条有界摘要，不抓取结果网页全文；最终回复附实际来源。搜索不可用、无来源或失败时明确说明，不伪造联网成功。含业务数据的本轮及单聊业务历史上下文不能继续调用搜索服务，请另开独立问题（必要时先 `/chat reset`）。
+
+### 只读工具权限
+
+普通用户可查询本人的账户/余额、用量、调用日志摘要、分组模型、订阅、签到状态，以及现有普通用户可查的全站汇总/排行。管理员额外可查其他用户、管理用量报告、脱敏绑定列表和签到统计；只读管理员可使用查询工具，但不能修改配置及群开关。
+
+当前群可查询 RSS 订阅和重置活动；可查询机器人健康及带采集时间的厂商快照。厂商工具读取最近持久化监控结果，不重新抓取或渲染，缺少或过期数据不代表正常。RSS/重置/签到工具受对应功能开关约束。
+
+每次工具执行和最终回复前重新核对当前发言者的绑定、目标及权限，不信任模型提供的身份。工具不返回邮箱明文、密钥、验证码、日志请求正文、内部错误详情；没有加减额度、签到发放、取消订阅、封禁、修改配置等写工具。
+
+### 预算与恢复
+
+默认每用户滚动60秒6次、上海时区自然日100次，全局并发2，同一会话串行，队列上限32（含未完成任务）；每轮最多6次工具调用，生成总预算120秒，单次工具请求20秒。仅准入成功的对话计次，模型失败仍计次；重复事件、帮助、状态、配置和被拒请求不重复收费计次。
+
+默认输出2000 tokens，最终最多6000字符，每段1500字符，最多4次递增 `msg_seq` 的被动回复，保留原消息 ID，不依赖主动消息权限。来源计入长度预算；发送失败停止后续段，不重新生成答案。排队到被动回复时效之外的任务会过期，不调用模型；排队等待不计入生成120秒，但受消息回复期限限制。
+
+任务与答案加密持久化：重启恢复未开始任务，已保存答案直接使用；模型调用或消息发送的结果在崩溃时未知，则标记 `uncertain`，不自动再次调用或发送，以避免重复费用/重复消息。历史及终态任务定期清理；群关闭取消待执行任务及在途请求。LLM 故障不影响既有 `/healthz`、`/readyz` 就绪标准。
+
+测试使用本地模拟接口，不依赖真实模型、搜索 Key 或 QQ 发送权限。实际服务是否支持工具协议/原生搜索，须用部署凭据另行联调。
 
 ## 指令
 
@@ -107,7 +207,7 @@
 
 帮助按层级展示，并始终过滤无权限、功能关闭或命中禁用关键词的命令：`/help` 只列出一级命令，普通用户不显示管理员专用命令，管理员显示其可用的全部一级命令，只读管理员只显示查询类操作。在命令末尾添加 `help` 可查看当前用法和直属下一级命令，例如 `/checkin help`、`/admin help`、`/admin user help`、`/reset set help`。每级帮助末尾会提示如何查看下一级；叶子命令显示详细用法。参数不构成命令层级，帮助查询无需绑定，也不会执行对应操作。
 
-除 `/help`、各级命令的 `help` 查询、`/whoami`、`/bind`、`/vendor_status`、`/reset check`、`/reset last`、`/enable list`、`/disable list` 以及管理员的 `/vendor_config`、`/vendor_subscribe`、`/enable`、`/disable`、`/checkin reset`、`/hongbao new`、`/hongbao stop` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
+除 `/help`、各级命令的 `help` 查询、`/whoami`、`/bind`、`/vendor_status`、`/reset check`、`/reset last`、`/enable list`、`/disable list` 以及管理员的 `/llm_config`、`/chat on`、`/chat off`、`/vendor_config`、`/vendor_subscribe`、`/enable`、`/disable`、`/checkin reset`、`/hongbao new`、`/hongbao stop` 管理操作外，所有指令都要求执行者已经绑定。管理员指令还要求执行者命中 `QQ_ADMIN_OPENIDS`。
 
 ### 额度红包
 
@@ -365,7 +465,7 @@ QQ 已接收消息但响应超时、或发送成功后检查点写入前进程�
 ## 准备 QQ 机器人
 
 1. 在 QQ 开放平台创建机器人，记录 AppID 和 AppSecret/ClientSecret。
-2. 开通群聊消息能力，并允许 `GROUP_MESSAGE_CREATE`（兼容旧名 `GROUP_AT_MESSAGE_CREATE`）及 `GROUP_MEMBER_ADD` 对应事件。
+2. 开通群聊消息能力，订阅 `GROUP_AT_MESSAGE_CREATE`（@对话）、可选全量 `GROUP_MESSAGE_CREATE`（显式指令）及 `GROUP_MEMBER_ADD` 对应事件。
 3. 如需入群自动审批，将机器人设置为目标群管理员，并确保开放平台向 Gateway 投递 `GROUP_JOIN_REQUEST`；该事件与群/C2C 消息使用同一个 `GROUP_AND_C2C_EVENT (1<<25)` Intent。
 4. 群聊中需要 @ 机器人后发送指令；官方事件会自动移除消息开头的机器人 @ 前缀。
 5. QQ API v2 不提供数字 QQ 号。启动机器人后执行 `/whoami`，将输出的 OpenID 写入 `QQ_ADMIN_OPENIDS`。
